@@ -8,6 +8,7 @@
 
 把 `.ttl`、`.owl`、`.rdf`、`.jsonld`、`.nt`、`.n3` 等 RDF / 本体文件从"一屏文本"变成可交互的节点-关系图——零依赖、本地解析、不上传任何数据。
 
+[![CI](https://github.com/a158070653-hash/dsh-ontology-viewer/actions/workflows/ci.yml/badge.svg)](https://github.com/a158070653-hash/dsh-ontology-viewer/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%3E%3D22-brightgreen.svg)](package.json)
 [![Platform](https://img.shields.io/badge/DSH-Web%20profile-4d6bfe.svg)](https://github.com/deepseek-ai/deepseek-harness)
@@ -15,6 +16,8 @@
 </div>
 
 ---
+
+**相关文档**：[接入笔记（如何写同类插件）](docs/integration.md) · [参与贡献](CONTRIBUTING.md) · [更新日志](CHANGELOG.md)
 
 ## 目录
 
@@ -171,7 +174,10 @@ dsh-ontology-viewer/
 ├─ examples/             # 5 个可直接点开的示例本体
 ├─ tests/                # 46 个 Node 单元测试
 ├─ scripts/              # i18n 覆盖检查、端到端统计与压力脚本
-├─ .github/workflows/    # CI：构建一致性 + 测试
+├─ docs/integration.md   # 接入笔记：DSH 文件预览插件怎么写
+├─ CONTRIBUTING.md       # 贡献指南（构建、约定、PR 检查清单）
+├─ CHANGELOG.md
+├─ .github/workflows/    # CI：构建一致性 + 测试 + i18n
 ├─ icon.svg
 └─ LICENSE
 ```
@@ -188,7 +194,7 @@ npm run i18n        # 校验视图文案 key 与中英词典一致
 npm run stats       # 示例文件与压力用例的端到端统计
 ```
 
-提交前请跑 `npm run check`，并提交更新后的 `client.js`——它是安装后真正被浏览器加载的文件。
+提交前请跑 `npm run check`，并提交更新后的 `client.js`——它是安装后真正被浏览器加载的文件。贡献流程与代码约定见 [CONTRIBUTING.md](CONTRIBUTING.md)；想了解这两个宿主扩展点的完整契约（`ctx.documentPreviews` / `ctx.betterSidebar` / Client 模块格式），见 [docs/integration.md](docs/integration.md)。
 
 维护约定：
 
@@ -240,6 +246,10 @@ npm run stats       # 示例文件与压力用例的端到端统计
 - Deterministic layout (fixed seed, mulberry32), host theme tokens only, zh/en UI.
 
 Install: `dsh plugin --profile <profile> add https://github.com/a158070653-hash/dsh-ontology-viewer.git` (`web` for the standard web deployment, `desktop` for the desktop app), then refresh the DSH page. Try the files in [`examples/`](examples).
+
+## 参与贡献
+
+欢迎 issue / PR。改动流程、代码约定和 PR 检查清单见 [CONTRIBUTING.md](CONTRIBUTING.md)；写同类插件可参考 [docs/integration.md](docs/integration.md)。
 
 ## License
 
