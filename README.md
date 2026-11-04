@@ -70,13 +70,21 @@ dsh plugin --profile <profile> add https://github.com/a158070653-hash/dsh-ontolo
 
 这条命令会 clone 仓库、按 `files` 打包安装，并把 `dsh-ontology-viewer` 追加进该 profile 的 `dsh.profile.bundles`——不需要再手动改 profile 配置。
 
-**方式二：本地开发安装（link，改代码即时生效）**
+**方式二：预构建 tarball（Release 资产，免构建授权）**
+
+每次发版都会把 `npm pack` 产物作为固定文件名 `dsh-ontology-viewer.tgz` 挂到 Release 上：
+
+```bash
+dsh plugin --profile <profile> add https://github.com/a158070653-hash/dsh-ontology-viewer/releases/latest/download/dsh-ontology-viewer.tgz
+```
+
+**方式三：本地开发安装（link，改代码即时生效）**
 
 ```bash
 dsh plugin --profile <profile> add link:<本仓库绝对路径>
 ```
 
-**方式三：先克隆再安装**
+**方式四：先克隆再安装**
 
 ```bash
 git clone https://github.com/a158070653-hash/dsh-ontology-viewer.git
@@ -182,6 +190,7 @@ dsh-ontology-viewer/
 ├─ docs/integration.md   # 接入笔记：DSH 文件预览插件怎么写
 ├─ CONTRIBUTING.md       # 贡献指南（构建、约定、PR 检查清单）
 ├─ CHANGELOG.md
+├─ assets/icon-180.png   # 插件市场用的 180×180 位图图标（由 icon.svg 同几何渲染）
 ├─ .github/workflows/    # CI：构建一致性 + 测试 + i18n
 ├─ icon.svg
 └─ LICENSE
@@ -197,6 +206,7 @@ npm run build:check # 校验 client.js 与 src/ 一致（CI 用）
 npm run check       # 语法 + 构建一致性 + 测试
 npm run i18n        # 校验视图文案 key 与中英词典一致
 npm run stats       # 示例文件与压力用例的端到端统计
+npm run pack:release # 生成发版用 dsh-ontology-viewer.tgz（固定文件名，挂 Release）
 ```
 
 提交前请跑 `npm run check`，并提交更新后的 `client.js`——它是安装后真正被浏览器加载的文件。贡献流程与代码约定见 [CONTRIBUTING.md](CONTRIBUTING.md)；想了解这两个宿主扩展点的完整契约（`ctx.documentPreviews` / `ctx.betterSidebar` / Client 模块格式），见 [docs/integration.md](docs/integration.md)。

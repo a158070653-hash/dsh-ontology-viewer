@@ -13,3 +13,6 @@ coverage/
 Thumbs.db
 .idea/
 .vscode/
+
+# Generated release tarball (attach to a GitHub Release, never commit)
+*.tgz

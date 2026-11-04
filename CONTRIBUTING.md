@@ -55,6 +55,20 @@ test: 覆盖 N-Quads 图名
 - [ ] 大文件/坏文件行为有上限与降级提示
 - [ ] PR 描述写清动机、行为变化和验证方式
 
+## 发版流程
+
+1. 更新 `CHANGELOG.md` 与 `package.json` 的 `version`。
+2. `npm run check`，然后提交并打 tag：`git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin main vX.Y.Z`。
+3. 生成预构建包并挂到 Release（资产名固定为不带版本号的 `dsh-ontology-viewer.tgz`，否则 `latest/download/` 链接下次发版就会 404）：
+
+   ```bash
+   npm run pack:release
+   gh release create vX.Y.Z --title "vX.Y.Z" --notes-file CHANGELOG.md
+   gh release upload vX.Y.Z dsh-ontology-viewer.tgz --clobber
+   ```
+
+4. 若插件市场条目的 `tarball:` 指向 `releases/latest/download/dsh-ontology-viewer.tgz`，无需改动。
+
 ## 视觉验证说明
 
 本项目作者环境没有浏览器控制能力，界面截图无法自动生成。视觉类改动请在 PR 中附截图（明暗主题各一张更好），这会直接帮助维护者 review。
