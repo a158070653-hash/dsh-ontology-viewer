@@ -1,0 +1,15 @@
+@prefix ex: <http://example.org/> .
+@prefix foaf: <http://xmlns.com/foaf/0.1/> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@base <http://example.org/> .
+
+# A small person graph exercising lists, blank nodes and literal forms.
+ex:alice a foaf:Person ;
+  foaf:name "Alice" , "Alice Liddell"@en-GB ;
+  ex:age 30 ;
+  ex:score 9.5 ;
+  ex:ratio 1.2e3 ;
+  ex:active true ;
+  ex:knows ex:bob , [ foaf:name "Bob" ] ;
+  ex:address [ ex:city "Oxford" ; ex:zip "OX1" ] ;
+  ex:aliases ( "Al" "Liddell" ) .

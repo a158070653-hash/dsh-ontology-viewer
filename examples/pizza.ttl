@@ -1,0 +1,90 @@
+@prefix : <http://example.org/pizza#> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+# 一个小型披萨本体：类层次、对象属性、数据属性、个体与字面量。
+:  a  owl:Ontology ;
+   rdfs:label "Pizza Ontology (demo)"@en ;
+   rdfs:comment "用于演示 dsh-ontology-viewer 的示例本体。"@zh .
+
+:Pizza  a  owl:Class ;
+        rdfs:label "Pizza"@en ;
+        rdfs:label "披萨"@zh ;
+        rdfs:comment "一张完整的披萨。"@zh .
+
+:NamedPizza  a  owl:Class ;
+             rdfs:subClassOf :Pizza ;
+             rdfs:label "Named Pizza"@en ;
+             rdfs:label "具名披萨"@zh .
+
+:Topping  a  owl:Class ;
+          rdfs:label "Topping"@en ;
+          rdfs:label "配料"@zh .
+
+:VegetableTopping  a  owl:Class ;
+                   rdfs:subClassOf :Topping ;
+                   rdfs:label "Vegetable Topping"@en ;
+                   rdfs:label "蔬菜配料"@zh .
+
+:CheeseTopping  a  owl:Class ;
+                rdfs:subClassOf :Topping ;
+                rdfs:label "Cheese Topping"@en ;
+                rdfs:label "芝士配料"@zh .
+
+:hasTopping  a  owl:ObjectProperty ;
+             rdfs:domain :Pizza ;
+             rdfs:range :Topping ;
+             rdfs:label "has topping"@en ;
+             rdfs:label "配料"@zh .
+
+:hasBase  a  owl:ObjectProperty ;
+          rdfs:domain :Pizza ;
+          rdfs:range :PizzaBase ;
+          rdfs:label "has base"@en ;
+          rdfs:label "饼底"@zh .
+
+:PizzaBase  a  owl:Class ;
+            rdfs:label "Pizza Base"@en ;
+            rdfs:label "饼底"@zh .
+
+:price  a  owl:DatatypeProperty ;
+        rdfs:domain :NamedPizza ;
+        rdfs:range xsd:decimal ;
+        rdfs:label "price"@en ;
+        rdfs:label "价格"@zh .
+
+:calories  a  owl:DatatypeProperty ;
+           rdfs:domain :Topping ;
+           rdfs:range xsd:integer ;
+           rdfs:label "calories"@en ;
+           rdfs:label "热量"@zh .
+
+:Margherita  a  :NamedPizza ;
+             rdfs:label "Margherita"@en ;
+             rdfs:label "玛格丽特"@zh ;
+             :hasBase :ThinBase ;
+             :hasTopping :Tomato, :Mozzarella ;
+             :price "12.50"^^xsd:decimal ;
+             rdfs:seeAlso <https://en.wikipedia.org/wiki/Pizza_margherita> .
+
+:ThinBase  a  :PizzaBase ;
+           rdfs:label "Thin base"@en ;
+           rdfs:label "薄底"@zh .
+
+:Tomato  a  :VegetableTopping ;
+         rdfs:label "Tomato"@en ;
+         rdfs:label "番茄"@zh ;
+         :calories 18 .
+
+:Mozzarella  a  :CheeseTopping ;
+             rdfs:label "Mozzarella"@en ;
+             rdfs:label "马苏里拉"@zh ;
+             :calories 280 .
+
+# 内联空白节点示例：一个没有独立 IRI 的营养信息块。
+:Mozzarella  :nutrition [ :fat 22.4 ; :protein 22.2 ] .
+
+:fat  a  owl:DatatypeProperty ; rdfs:label "fat"@en ; rdfs:range xsd:decimal .
+:protein  a  owl:DatatypeProperty ; rdfs:label "protein"@en ; rdfs:range xsd:decimal .

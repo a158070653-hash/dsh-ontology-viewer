@@ -1,0 +1,5 @@
+# dsh-ontology-viewer 的挂载声明：把 Host 半侧行插入 profile 配置树。
+# 真正的界面由 package.json 的 dsh.client 声明的 Client 模块提供。
+- insert:
+    - id: dsh-ontology-viewer
+      name: dsh-ontology-viewer

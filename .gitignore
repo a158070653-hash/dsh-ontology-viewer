@@ -1,0 +1,15 @@
+# Dependencies (the plugin has none at runtime; this keeps stray installs out of git)
+node_modules/
+package-lock.json
+pnpm-lock.yaml
+yarn.lock
+
+# Build/test scratch
+coverage/
+*.log
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

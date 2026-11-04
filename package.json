@@ -1,0 +1,68 @@
+{
+  "name": "dsh-ontology-viewer",
+  "version": "1.0.0",
+  "description": "Ontology graph viewer for DeepSeek Harness: open .ttl / .owl / .rdf / .jsonld / .nt files and see the RDF graph as an interactive node-link diagram.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "src",
+    "build",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node build/build.mjs",
+    "build:check": "node build/build.mjs --check",
+    "test": "node --test \"tests/*.test.mjs\"",
+    "check": "node --check client.js && node build/build.mjs --check && node --test \"tests/*.test.mjs\"",
+    "i18n": "node scripts/check-i18n.mjs",
+    "stats": "node scripts/pipeline-check.mjs"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "ontology",
+    "rdf",
+    "turtle",
+    "owl",
+    "json-ld",
+    "knowledge-graph",
+    "graph-visualization"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/a158070653-hash/dsh-ontology-viewer.git"
+  },
+  "homepage": "https://github.com/a158070653-hash/dsh-ontology-viewer#readme",
+  "bugs": {
+    "url": "https://github.com/a158070653-hash/dsh-ontology-viewer/issues"
+  },
+  "author": "a158070653-hash",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": []
+    }
+  },
+  "icon": "./icon.svg"
+}

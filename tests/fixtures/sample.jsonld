@@ -1,0 +1,30 @@
+{
+  "@context": {
+    "@base": "http://example.org/",
+    "@vocab": "http://example.org/vocab#",
+    "foaf": "http://xmlns.com/foaf/0.1/",
+    "Person": "foaf:Person",
+    "name": { "@id": "foaf:name", "@language": "en" },
+    "age": { "@id": "foaf:age", "@type": "http://www.w3.org/2001/XMLSchema#integer" },
+    "knows": { "@id": "foaf:knows", "@type": "@id" }
+  },
+  "@graph": [
+    {
+      "@id": "alice",
+      "@type": "Person",
+      "name": "Alice",
+      "age": "30",
+      "knows": "bob",
+      "bio": { "@value": "Bonjour", "@language": "fr" },
+      "address": {
+        "street": "1 Main St",
+        "city": "Oxford"
+      }
+    },
+    {
+      "@id": "bob",
+      "@type": "Person",
+      "name": "Bob"
+    }
+  ]
+}

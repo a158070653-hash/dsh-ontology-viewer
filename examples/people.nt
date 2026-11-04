@@ -1,0 +1,24 @@
+# N-Triples 示例：一个很小的组织关系图。
+# 每行一条三元组，以 . 结尾；<...> 内是绝对 IRI。
+<http://example.org/people#Alice> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://xmlns.com/foaf/0.1/Person> .
+<http://example.org/people#Alice> <http://xmlns.com/foaf/0.1/name> "Alice Zhang" .
+<http://example.org/people#Alice> <http://xmlns.com/foaf/0.1/nick> "\u963F\u91CC\u65AF"@zh .
+<http://example.org/people#Alice> <http://xmlns.com/foaf/0.1/mbox> <mailto:alice@example.org> .
+<http://example.org/people#Alice> <http://example.org/people#worksFor> <http://example.org/people#Acme> .
+<http://example.org/people#Alice> <http://xmlns.com/foaf/0.1/knows> <http://example.org/people#Bob> .
+<http://example.org/people#Alice> <http://example.org/people#knows> <http://example.org/people#Carol> .
+<http://example.org/people#Bob> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://xmlns.com/foaf/0.1/Person> .
+<http://example.org/people#Bob> <http://xmlns.com/foaf/0.1/name> "Bob Li" .
+<http://example.org/people#Bob> <http://example.org/people#worksFor> <http://example.org/people#Acme> .
+<http://example.org/people#Bob> <http://xmlns.com/foaf/0.1/knows> <http://example.org/people#Carol> .
+<http://example.org/people#Carol> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://xmlns.com/foaf/0.1/Person> .
+<http://example.org/people#Carol> <http://xmlns.com/foaf/0.1/name> "Carol Wang" .
+<http://example.org/people#Carol> <http://example.org/people#worksFor> <http://example.org/people#Beta> .
+<http://example.org/people#Acme> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://xmlns.com/foaf/0.1/Organization> .
+<http://example.org/people#Acme> <http://xmlns.com/foaf/0.1/name> "Acme Inc." .
+<http://example.org/people#Beta> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://xmlns.com/foaf/0.1/Organization> .
+<http://example.org/people#Beta> <http://xmlns.com/foaf/0.1/name> "Beta LLC" .
+<http://example.org/people#Beta> <http://example.org/people#partOf> <http://example.org/people#Acme> .
+_:blank1 <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://xmlns.com/foaf/0.1/Document> .
+_:blank1 <http://xmlns.com/foaf/0.1/title> "Org chart export" .
+_:blank1 <http://xmlns.com/foaf/0.1/primaryTopic> <http://example.org/people#Acme> .

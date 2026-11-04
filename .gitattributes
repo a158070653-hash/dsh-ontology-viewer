@@ -1,0 +1,9 @@
+# Keep the repository byte-identical across platforms: the generated client.js
+# must stay LF so `node build/build.mjs --check` passes after a fresh clone.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.woff binary
+*.woff2 binary

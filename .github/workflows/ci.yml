@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Syntax check the generated Client module
+        run: node --check client.js
+      - name: client.js is in sync with src/
+        run: node build/build.mjs --check
+      - name: Unit tests
+        run: node --test "tests/*.test.mjs"
+      - name: i18n key coverage
+        run: node scripts/check-i18n.mjs

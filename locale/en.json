@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Ontology Graph Viewer",
+    "description": "Open .ttl, .owl, .rdf, .jsonld, .nt and .n3 ontology files and render their RDF triples as an interactive graph: hover to highlight neighbours, drag to move nodes, scroll to zoom, click a node to inspect its IRI, type and literals."
+  }
+}

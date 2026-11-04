@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Ontology graph viewer">
+  <!-- Original artwork: an RDF node-link diagram with a hollow "viewer" lens node. -->
+  <rect x="0" y="0" width="64" height="64" rx="14" fill="#1b2a52"/>
+  <g stroke="#7ea2ff" stroke-width="2.4" stroke-linecap="round">
+    <path d="M18 22 L32 14"/>
+    <path d="M18 22 L20 43"/>
+    <path d="M20 43 L40 47"/>
+    <path d="M32 14 L44 30"/>
+    <path d="M44 30 L40 47"/>
+    <path d="M32 14 L20 43" stroke-opacity="0.45"/>
+  </g>
+  <g fill="#7ea2ff">
+    <circle cx="18" cy="22" r="4.6"/>
+    <circle cx="32" cy="14" r="4.6"/>
+    <circle cx="20" cy="43" r="4.6"/>
+    <circle cx="40" cy="47" r="4.6"/>
+  </g>
+  <circle cx="44" cy="30" r="7.4" fill="none" stroke="#ffd166" stroke-width="2.6"/>
+  <circle cx="44" cy="30" r="2.2" fill="#ffd166"/>
+</svg>

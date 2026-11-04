@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE rdf:RDF [ <!ENTITY sample "ignored"> ]>
+<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+         xmlns:foaf="http://xmlns.com/foaf/0.1/"
+         xmlns:ex="http://example.org/"
+         xml:base="http://example.org/">
+  <foaf:Person rdf:about="alice">
+    <foaf:name xml:lang="en">Alice</foaf:name>
+    <ex:age rdf:datatype="http://www.w3.org/2001/XMLSchema#integer">30</ex:age>
+    <ex:knows rdf:resource="bob"/>
+    <ex:address rdf:parseType="Resource">
+      <ex:city>Oxford</ex:city>
+    </ex:address>
+    <ex:aliases rdf:parseType="Collection">
+      <rdf:Description><ex:label>Al</ex:label></rdf:Description>
+      <rdf:Description><ex:label>Liddell</ex:label></rdf:Description>
+    </ex:aliases>
+  </foaf:Person>
+</rdf:RDF>

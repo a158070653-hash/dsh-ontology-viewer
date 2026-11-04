@@ -1,0 +1,87 @@
+{
+  "@context": {
+    "@vocab": "http://example.org/course#",
+    "schema": "http://schema.org/",
+    "ex": "http://example.org/course#",
+    "name": "schema:name",
+    "teacher": { "@id": "ex:teacher", "@type": "@id" },
+    "enrolled": { "@id": "ex:enrolled", "@type": "@id", "@container": "@set" },
+    "credits": { "@id": "ex:credits", "@type": "http://www.w3.org/2001/XMLSchema#integer" },
+    "title": "schema:name"
+  },
+  "@id": "ex:course-graph",
+  "@type": "ex:Catalog",
+  "name": "课程目录",
+  "@graph": [
+    {
+      "@id": "ex:Course",
+      "@type": "http://www.w3.org/2002/07/owl#Class",
+      "title": "Course"
+    },
+    {
+      "@id": "ex:Person",
+      "@type": "http://www.w3.org/2002/07/owl#Class",
+      "title": "Person"
+    },
+    {
+      "@id": "ex:teacher",
+      "@type": "http://www.w3.org/2002/07/owl#ObjectProperty",
+      "title": "teacher"
+    },
+    {
+      "@id": "ex:enrolled",
+      "@type": "http://www.w3.org/2002/07/owl#ObjectProperty",
+      "title": "enrolled"
+    },
+    {
+      "@id": "ex:credits",
+      "@type": "http://www.w3.org/2002/07/owl#DatatypeProperty",
+      "title": "credits"
+    },
+    {
+      "@id": "ex:KnowledgeGraph",
+      "@type": "ex:Course",
+      "title": "知识图谱导论",
+      "credits": 3,
+      "teacher": { "@id": "ex:Zhang" },
+      "enrolled": [{ "@id": "ex:Alice" }, { "@id": "ex:Bruno" }]
+    },
+    {
+      "@id": "ex:OntologyEngineering",
+      "@type": "ex:Course",
+      "title": "本体工程",
+      "credits": 4,
+      "teacher": { "@id": "ex:Zhang" },
+      "enrolled": [{ "@id": "ex:Ling" }]
+    },
+    {
+      "@id": "ex:Zhang",
+      "@type": "ex:Person",
+      "title": "张老师",
+      "http://schema.org/knows": { "@id": "ex:Ling" }
+    },
+    {
+      "@id": "ex:Alice",
+      "@type": "ex:Person",
+      "title": "Alice",
+      "http://schema.org/affiliation": {
+        "@type": "http://schema.org/Organization",
+        "name": "示例大学"
+      }
+    },
+    {
+      "@id": "ex:Bruno",
+      "@type": "ex:Person",
+      "title": "Bruno",
+      "http://schema.org/description": {
+        "@value": "Visiting student from Turin",
+        "@language": "en"
+      }
+    },
+    {
+      "@id": "ex:Ling",
+      "@type": "ex:Person",
+      "title": "凌同学"
+    }
+  ]
+}
