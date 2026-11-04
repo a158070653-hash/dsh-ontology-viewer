@@ -54,19 +54,23 @@
 
 ## 安装
 
-> 前置：DSH（Web / Desktop）。插件通过 bundle 机制安装，安装后刷新页面生效。
+> 前置：DSH 的 Web 类 profile（标准 `web` 部署或桌面版）。插件是标准 bundle：安装会同时写入依赖与 `dsh.profile.bundles`，装完刷新页面生效。
 
 **方式一：从 GitHub 安装（推荐）**
 
-`<profile>` 换成你正在用的 profile 名：标准 Web 部署通常是 `web`，DSH 桌面版通常是 `desktop`（可在 `~/.dsh/profiles/` 下看到已有名字）。
+`<profile>` 换成你正在用的 profile 名：标准 Web 部署通常是 `web`，DSH 桌面版通常是 `desktop`（`~/.dsh/profiles/` 下能看到已有名字）。
 
 ```bash
+# 跟随 main
 dsh plugin --profile <profile> add https://github.com/a158070653-hash/dsh-ontology-viewer.git
+
+# 或锁定发布版本
+dsh plugin --profile <profile> add https://github.com/a158070653-hash/dsh-ontology-viewer.git#v1.0.0
 ```
 
-也可以在 DSH 的插件管理界面（设置 → 插件）里把仓库地址作为安装目标，效果相同。
+这条命令会 clone 仓库、按 `files` 打包安装，并把 `dsh-ontology-viewer` 追加进该 profile 的 `dsh.profile.bundles`——不需要再手动改 profile 配置。
 
-**方式二：本地开发安装（link）**
+**方式二：本地开发安装（link，改代码即时生效）**
 
 ```bash
 dsh plugin --profile <profile> add link:<本仓库绝对路径>
@@ -82,6 +86,7 @@ dsh plugin --profile <profile> add link:<克隆下来的绝对路径>
 **可选增强**：安装 [dsh-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) 后，底部文件树的入口也会生效，并显示 `.ttl/.owl/...` 的图谱图标。不装也能用——插件会退化为只注册 DSH 自带预览。
 
 安装完成后刷新一次 DSH 页面（Client 模块只在页面加载时注册）。设置 → 插件里可以看到「本体图谱查看器」，可随时停用。
+
 
 ## 使用
 
@@ -224,10 +229,11 @@ npm run stats       # 示例文件与压力用例的端到端统计
 
 仓库内已验证（可复现）：
 
-- 46 个 Node 单元测试全绿：解析器 18、图模型 17、5 个真实示例文件的端到端 7、打包接线 4；
-- `npm run build:check` 通过，`client.js` 与 `src/` 一致；`node --check client.js` 通过；产物无残留 `import`/`export`；
+- 46 个 Node 单元测试全绿：解析器 18、图模型 17、5 个真实示例文件的端到端 7、打包接线 4；CI（GitHub Actions）在 Node 22 上跑同一套检查；
+- 干净 clone 后 `npm run build:check` 通过（`client.js` 与 `src/` 字节一致，`.gitattributes` 固定 LF）；`node --check client.js` 通过；产物无残留 `import`/`export`；
 - 用 fake `ctx` 加载**打包后的** `client.js` 并执行 `apply`，确认四类注册（document preview 元数据、`sidebar.right.tab.document` 正文、better-sidebar viewer/icon、locale 词典）符合契约；
-- 在 DSH 实例中安装后：Host 行 `fiberPhase: active`，Client 侧 `sidebar.right.tab.document` 槽位出现 `dsh-ontology-viewer/graph` 且 `active: true`——说明 Client 模块确实在浏览器中加载并执行了。
+- 从 GitHub 安装（隔离的临时 profile 实测）：`dsh plugin --profile <p> add <仓库地址>` 成功，依赖以 `github:` 形式装入手，`dsh.profile.bundles` 自动追加 `dsh-ontology-viewer`，`dsh --dump-config` 能看到本插件的 bundle 行；
+- 在真实 DSH 实例中安装后：Host 行 `fiberPhase: active`，Client 侧 `sidebar.right.tab.document` 槽位出现 `dsh-ontology-viewer/graph` 且 `active: true`——说明 Client 模块确实在浏览器中加载并执行了。
 
 尚未验证（作者环境无浏览器控制权限，无法截图）：
 
