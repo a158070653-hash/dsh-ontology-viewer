@@ -243,6 +243,7 @@ npm run pack:release # 生成发版用 dsh-ontology-viewer.tgz（固定文件名
 - 干净 clone 后 `npm run build:check` 通过（`client.js` 与 `src/` 字节一致，`.gitattributes` 固定 LF）；`node --check client.js` 通过；产物无残留 `import`/`export`；
 - 用 fake `ctx` 加载**打包后的** `client.js` 并执行 `apply`，确认四类注册（document preview 元数据、`sidebar.right.tab.document` 正文、better-sidebar viewer/icon、locale 词典）符合契约；
 - 从 GitHub 安装（隔离的临时 profile 实测）：`dsh plugin --profile <p> add <仓库地址>` 成功，依赖以 `github:` 形式装入手，`dsh.profile.bundles` 自动追加 `dsh-ontology-viewer`，`dsh --dump-config` 能看到本插件的 bundle 行；
+- 从 Release 的预构建 tarball 安装（隔离的临时 profile 实测）：`dsh plugin --profile <p> add https://github.com/a158070653-hash/dsh-ontology-viewer/releases/latest/download/dsh-ontology-viewer.tgz` 成功，bundle 同样自动登记；
 - 在真实 DSH 实例中安装后：Host 行 `fiberPhase: active`，Client 侧 `sidebar.right.tab.document` 槽位出现 `dsh-ontology-viewer/graph` 且 `active: true`——说明 Client 模块确实在浏览器中加载并执行了。
 
 尚未验证（作者环境无浏览器控制权限，无法截图）：
