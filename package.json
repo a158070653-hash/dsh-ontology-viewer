@@ -52,7 +52,7 @@
   "author": "a158070653-hash",
   "license": "Apache-2.0",
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "dsh": {
     "bundle": {
@@ -66,3 +66,4 @@
   },
   "icon": "./icon.svg"
 }
+

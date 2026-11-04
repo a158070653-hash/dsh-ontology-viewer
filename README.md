@@ -9,7 +9,7 @@
 把 `.ttl`、`.owl`、`.rdf`、`.jsonld`、`.nt`、`.n3` 等 RDF / 本体文件从"一屏文本"变成可交互的节点-关系图——零依赖、本地解析、不上传任何数据。
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Node](https://img.shields.io/badge/node-%3E%3D20-brightgreen.svg)](package.json)
+[![Node](https://img.shields.io/badge/node-%3E%3D22-brightgreen.svg)](package.json)
 [![Platform](https://img.shields.io/badge/DSH-Web%20profile-4d6bfe.svg)](https://github.com/deepseek-ai/deepseek-harness)
 
 </div>
@@ -51,20 +51,29 @@
 
 ## 安装
 
-> 前置：DSH（Web profile）。插件通过 bundle 机制安装，安装后刷新页面生效。
+> 前置：DSH（Web / Desktop）。插件通过 bundle 机制安装，安装后刷新页面生效。
 
 **方式一：从 GitHub 安装（推荐）**
 
+`<profile>` 换成你正在用的 profile 名：标准 Web 部署通常是 `web`，DSH 桌面版通常是 `desktop`（可在 `~/.dsh/profiles/` 下看到已有名字）。
+
 ```bash
-dsh plugin --profile web add https://github.com/a158070653-hash/dsh-ontology-viewer.git
+dsh plugin --profile <profile> add https://github.com/a158070653-hash/dsh-ontology-viewer.git
 ```
 
-或用 DSH 的插件管理界面 / `plugin_manager` 工具安装同一仓库地址。
+也可以在 DSH 的插件管理界面（设置 → 插件）里把仓库地址作为安装目标，效果相同。
 
 **方式二：本地开发安装（link）**
 
 ```bash
-dsh plugin --profile web add link:<本仓库绝对路径>
+dsh plugin --profile <profile> add link:<本仓库绝对路径>
+```
+
+**方式三：先克隆再安装**
+
+```bash
+git clone https://github.com/a158070653-hash/dsh-ontology-viewer.git
+dsh plugin --profile <profile> add link:<克隆下来的绝对路径>
 ```
 
 **可选增强**：安装 [dsh-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) 后，底部文件树的入口也会生效，并显示 `.ttl/.owl/...` 的图谱图标。不装也能用——插件会退化为只注册 DSH 自带预览。
@@ -170,7 +179,7 @@ dsh-ontology-viewer/
 ## 开发
 
 ```bash
-# 依赖：Node.js >= 20；无需 npm install（零运行时依赖）
+# 依赖：Node.js >= 22（`--test` 的 glob 参数自 v22 起支持）；无需 npm install（零运行时依赖）
 npm test            # 46 个单元测试
 npm run build       # 由 src/ 重新生成 client.js
 npm run build:check # 校验 client.js 与 src/ 一致（CI 用）
@@ -230,8 +239,9 @@ npm run stats       # 示例文件与压力用例的端到端统计
 - Hover to highlight neighbours, drag to pin nodes, wheel to zoom, click a node for its IRI, `rdf:type`, literals and edge counts; search, focus mode, re-layout.
 - Deterministic layout (fixed seed, mulberry32), host theme tokens only, zh/en UI.
 
-Install: `dsh plugin --profile web add https://github.com/a158070653-hash/dsh-ontology-viewer.git`, then refresh the DSH page. Try the files in [`examples/`](examples).
+Install: `dsh plugin --profile <profile> add https://github.com/a158070653-hash/dsh-ontology-viewer.git` (`web` for the standard web deployment, `desktop` for the desktop app), then refresh the DSH page. Try the files in [`examples/`](examples).
 
 ## License
 
 [Apache-2.0](LICENSE).
+
