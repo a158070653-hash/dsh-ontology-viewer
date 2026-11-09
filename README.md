@@ -9,6 +9,7 @@
 把 `.ttl`、`.owl`、`.rdf`、`.jsonld`、`.nt`、`.n3` 等 RDF / 本体文件从"一屏文本"变成可交互的节点-关系图——零依赖、本地解析、不上传任何数据。
 
 [![CI](https://github.com/a158070653-hash/dsh-ontology-viewer/actions/workflows/ci.yml/badge.svg)](https://github.com/a158070653-hash/dsh-ontology-viewer/actions/workflows/ci.yml)
+[![Awesome DSH Plugin](https://awesome-dsh-plugin.com/badge.svg)](https://awesome-dsh-plugin.com)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%3E%3D22-brightgreen.svg)](package.json)
 [![Platform](https://img.shields.io/badge/DSH-Web%20profile-4d6bfe.svg)](https://github.com/deepseek-ai/deepseek-harness)

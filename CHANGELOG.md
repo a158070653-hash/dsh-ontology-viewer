@@ -2,6 +2,11 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)；版本号对应 `package.json` 的 `version`。
 
+## 未发布
+
+- 收录进 [awesome-dsh-plugin](https://awesome-dsh-plugin.com)（分类 Docs & Rendering）：市场页 <https://awesome-dsh-plugin.com/p/a158070653-hash/dsh-ontology-viewer/>，条目 PR [#12890](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/pull/12890) 已合并（2026-11-07）。
+- README 顶部加市场徽章。
+
 ## 1.0.0
 
 首个公开版本。
