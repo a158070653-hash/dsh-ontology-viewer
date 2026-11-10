@@ -46,10 +46,12 @@
 - **两个入口，随装随用**
   - DSH 自带右侧栏文档预览（Files 页签）：本体文件默认渲染为图谱，仍可下拉切回宿主纯文本。
   - [dsh-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) 已安装时：它的文件树里点这些文件直接打开图谱页签，并显示图谱文件图标。
-- **四种序列化本地解析**：Turtle / N-Triples / RDF-XML(OWL) / JSON-LD，按后缀判断 + 内容嗅探，坏文件保留已解析部分并给出行号提示。
+- **四种序列化本地解析**：Turtle / N-Triples / RDF-XML(OWL) / JSON-LD，按后缀判断 + 内容嗅探；坏文件保留已解析部分，诊断按类型聚合（命名图被忽略、远程上下文跳过、RDF/XML 具体化未实现等），不再静默丢语义。
 - **为"看本体"设计的建模**：字面量不进图（挂在节点详情里）、平行边合并计数、`rdf:first/rest` 列表管道不画成边、节点按类/属性/个体/空白节点/外部引用着色区分。
-- **可交互**：缩放、平移、拖拽节点、悬停高亮邻居、搜索跳转、焦点模式、节点详情（完整 IRI、类型、字面量、入/出边/度数）、一键重新布局 / 适配视图。
-- **确定性布局**：固定种子 + mulberry32 伪随机，同样输入永远同样画面；不跑持续物理动画，不烧 CPU。
+- **可探索的图谱**：按节点类型 / 关系类型 / 关系方向过滤；从选中节点做 1–5 跳邻域探索（出边/入边/双向，支持预算截断后继续展开）；一键回到完整视图；所有过滤只影响显示，不改 RDF 数据。
+- **可交互**：缩放、平移、拖拽节点、悬停高亮邻居、搜索结果列表选择、按谓词分组的入/出边详情、一键重新布局 / 适配视图；点击关系端点可在图内定位。
+- **显示预算清晰可见**：解析三元组、图模型节点/字面量、SVG 绘制边分层预算；发生裁剪时显示"保留 X / 上限 Y"或"已绘制 X / 共 Y"，并给出原因。
+- **确定性布局 + 后台计算**：固定种子 + mulberry32 伪随机，同样输入永远同样画面；解析/建模/布局优先在 Blob Web Worker 中完成，Worker 不可用时降级为主线程分片布局并明确提示。
 - **贴合宿主**：只用 `--dsw-alias-*` 主题令牌，明暗主题自适应；文案走 DSH locale（中/英），可随语言切换。
 - **零运行时依赖**：解析器、图模型、渲染全部自带；不引入 d3/cytoscape 等库，不请求网络。
 
@@ -113,27 +115,28 @@ dsh plugin --profile <profile> add link:<克隆下来的绝对路径>
 | 悬停节点 | 高亮 1 跳邻居与相连边，其余淡出 |
 | 拖动节点 / 拖动空白处 | 手动摆位 / 平移画布 |
 | 滚轮 | 以光标为锚点缩放（15%–400%） |
-| 单击节点 | 右侧详情面板：完整 IRI、`rdf:type`、字面量属性表、出/入边与度数 |
-| 搜索框 | 按标签或 IRI 匹配，`Enter` 跳到第一个命中，`Esc` 清空 |
-| 「只看选中节点周围」 | 焦点模式，只画选中节点的 1 跳子图 |
+| 单击节点 | 右侧详情面板：完整 IRI、`rdf:type`、字面量属性表、按谓词分组的出/入边（可折叠、可显示更多）、度数 |
+| 搜索框 | 结果列表（最多 500 条匹配、展示前 20 条），方向键选择、`Enter` 确认、`Esc` 清空 |
+| 「过滤」 | 按节点类型、关系类型、相对选中节点的方向过滤；显示可见/总数，支持清除恢复 |
+| 「邻域探索」 | 从选中节点展开 1–5 跳，支持出/入/双向；预算截断时可继续展开，可一键回到完整视图 |
 | 「重新布局」/「适配视图」 | 重新计算布局 / 缩放到整图 |
 | 「标签」 | 节点文字开关（大图默认只在高缩放级别显示标签） |
-| 点击邻居类型 IRI | 在图内跳转并居中该节点（若存在） |
+| 点击关系端点 / 邻居类型 IRI | 在图内选中并居中该节点（若存在） |
 
 ## 支持的格式
 
 | 后缀 | 解析器 | 覆盖范围 |
 | --- | --- | --- |
-| `.ttl` `.turtle` `.n3` `.trig` | Turtle | `@prefix`/`PREFIX`、`@base`、`;` 与 `,` 列表、空白节点 `[ ]`、集合 `( )`、语言标签、`^^` 类型、数字/布尔简写、`\u` 转义；TriG 的图标签忽略、内部三元组保留 |
-| `.nt` `.nq` | N-Triples | 每行一条语句、`\u` 转义、空白节点；`.nq` 的第 4 列图名丢弃 |
-| `.rdf` `.owl` `.xml` | RDF/XML | `rdf:about`/`rdf:ID`/`rdf:nodeID`、`rdf:resource`、`rdf:parseType`（Resource/Literal/Collection）、`rdf:li`、`xml:base`/`xml:lang`、xmlns 前缀解析 |
-| `.jsonld` | JSON-LD | `@context`（前缀 / term / `@vocab` / `@base`）、`@graph`、`@id`、`@type`、`@value` + `@language`、`@container`（`@set`/`@list`/`@language`/`@index`） |
+| `.ttl` `.turtle` `.n3` `.trig` | Turtle | `@prefix`/`PREFIX`、`@base`、`;` 与 `,` 列表、空白节点 `[ ]`、集合 `( )`、语言标签、`^^` 类型、数字/布尔简写、`\u` 转义；TriG 的图标签不产生命名图语义（产生 `named-graph-ignored` 诊断）、内部三元组保留 |
+| `.nt` `.nq` | N-Triples | 每行一条语句、`\u` 转义、空白节点；`.nq` 的第 4 列图名忽略并产生诊断 |
+| `.rdf` `.owl` `.xml` | RDF/XML | `rdf:about`/`rdf:ID`/`rdf:nodeID`、`rdf:resource`、`rdf:parseType`（Resource/Literal/Collection）、`rdf:li`、`xml:base`/`xml:lang`、xmlns 前缀解析；未实现的具体化/parseType 会给出分类诊断 |
+| `.jsonld` | JSON-LD | `@context`（前缀 / term / `@vocab` / `@base`）、`@graph`（含顶层 `@graph` 兄弟键）、`@id`、`@type`、`@value` + `@language`、`@container`（`@set`/`@list`/`@language`/`@index`）；`@reverse` 等不支持结构会给出分类诊断 |
 
 **故意不接管 `.json`**：普通 JSON 文件仍然走宿主的代码/JSON 查看器，只有 `.jsonld` 后缀进入图谱。
 
 格式未知时按内容嗅探：`{` / `[` → JSON-LD，`<?xml` / `<rdf:` → RDF/XML，`@prefix` / `PREFIX` → Turtle。
 
-解析永不抛异常：坏文件返回已解析的三元组 + 带行号的 `warnings` / `errors`，在视图顶部「解析提示」条里展示。
+解析永不抛异常：坏文件返回已解析的三元组 + 带行号的原始消息，并在视图顶部「解析提示」条里按分类 code 聚合展示（同一类只列次数与最多 3 条样本）；内置上限防止警告洪泛、超深嵌套与超长字面量拖垮页面。相对 IRI 的 Base 来自真实资源地址（原生预览的 `resourceAddress` / better-sidebar 的路径），再由文档内 `@base` / `xml:base` / JSON-LD `@base` 覆盖；没有可用地址时保留原 IRI 并给出 `base-unavailable` 诊断，不再用显示文件名伪造身份。
 
 ## 实现原理
 
@@ -148,9 +151,12 @@ flowchart LR
   end
   DP --> BODY[OntologyPanel]
   BS --> BODY
-  BODY --> PARSE["rdf-parse.js<br/>parseOntology(text)"]
-  PARSE --> MODEL["graph-model.js<br/>buildGraph + layoutGraph"]
-  MODEL --> VIEW["graph-view.js<br/>SVG + 交互"]
+  BODY --> JOB["ontology-job.js<br/>代际/取消/降级调度"]
+  JOB -->|Worker 可用| WORKER["Blob Web Worker<br/>parseOntology + buildGraph + layoutGraph"]
+  JOB -->|降级| PARSE["rdf-parse.js<br/>parseOntology(text)"]
+  WORKER --> MODEL["graph-model.js<br/>buildGraph + layoutGraph"]
+  PARSE --> MODEL
+  MODEL --> VIEW["graph-view*.js<br/>过滤 → 探索 → 绘制预算 → SVG + 交互"]
   VIEW --> USER[可交互图谱]
 ```
 
@@ -165,10 +171,15 @@ flowchart LR
 
 - 字面量不进图 → 图只画实体与关系，避免被字符串淹没。
 - 平行边合并并计数；`rdf:first` / `rdf:rest` 不画成边。
-- 上限：解析 12 万三元组、展示 1500 节点（按度数保留，超出提示「输入已截断」）、源文件 12 MB。
-- 自带示例实测：每个文件 1–12 ms 完成解析+建图+布局；2 万条语句（6 万三元组）合成压力用例约 320 ms（解析排在首帧之后，不阻塞白屏）。
-- 1200–1500 节点布局约 0.2 s（Node 实测），浏览器同量级。
-- 不做：`.omn`（Manchester 语法）、RDFa、远程 `@context`；JSON-LD 的 `@reverse`/`@included`/`@nest` 与 keyword 别名不展开（给警告）；RDF/XML 的 `rdf:ID` 具体化未实现。
+- 分层预算（超出时都有可见提示，不静默裁剪）：
+  - 解析：12 万三元组（达到上限后所有格式停止解析）；
+  - 建模：1500 节点（按度数保留）、每节点 60 条字面量、单条字面量 16384 字符；
+  - 绘制：默认最多 6000 条边（选中/搜索命中/高度数优先），SVG 元素量受此约束；
+  - 探索：每跳 300 个新增节点 / 800 条边，最多 5 跳，预算截断后可继续展开；
+  - 源文件：12 MiB，按 **UTF-8 字节**计算（原生预览入口；better-sidebar 入口受其宿主 5 MiB 读取阈值限制）。
+- 解析/建模/布局优先在后台 Worker 执行；Worker 不可用时降级为主线程分片布局（只让布局非阻塞，解析/建模仍同步）并收紧预算、明确提示。降级模式的预算是 6 万三元组 / 800 节点 / 3000 绘制边。
+- `npm run bench` 提供小型/中型/接近上限/高密度/异常五类夹具的分阶段基准（解析、建图、320/1000 次迭代布局、图规模、内存、序列化成本）。仓库内记录的基准结果见 `openspec/changes/archive/2026-11-10-enhance-ontology-graph-core/verification.md`。
+- 不做：`.omn`（Manchester 语法）、RDFa、远程 `@context`；JSON-LD 的 `@reverse`/`@included`/`@nest` 等结构不展开（给分类诊断）；RDF/XML 的 `rdf:ID` 具体化未实现（给诊断）；不做 OWL 推理。
 
 ## 目录结构
 
@@ -179,20 +190,25 @@ dsh-ontology-viewer/
 ├─ index.js              # Host 半侧（空实现，只为可开关）
 ├─ client.js             # 构建产物：浏览器 Client 模块（勿手改）
 ├─ src/
-│  ├─ rdf-parse.js       # Turtle / N-Triples / RDF-XML / JSON-LD 解析（零依赖，2620 行）
-│  ├─ graph-model.js     # 三元组 → 图模型 + 确定性布局（827 行）
-│  ├─ graph-view.js      # React + SVG 交互视图，主题令牌配色（899 行）
-│  └─ main.js            # apply(ctx)：注册两个扩展点 + 加载状态外壳（486 行）
-├─ build/build.mjs       # 单文件 Client 模块构建
-├─ locale/{en,zh}.json   # 插件清单里的标题/描述
-├─ examples/             # 5 个可直接点开的示例本体
-├─ tests/                # 46 个 Node 单元测试
-├─ scripts/              # i18n 覆盖检查、端到端统计与压力脚本
-├─ docs/integration.md   # 接入笔记：DSH 文件预览插件怎么写
-├─ CONTRIBUTING.md       # 贡献指南（构建、约定、PR 检查清单）
+│  ├─ rdf-parse.js          # Turtle / N-Triples / RDF-XML / JSON-LD 解析（零依赖，诊断与上限）
+│  ├─ graph-model.js        # 三元组 → 图模型；过滤/探索/绘制预算/布局任务
+│  ├─ ontology-job.js       # 计算任务状态机、Worker 客户端、主线程降级调度
+│  ├─ worker-entry.js       # Worker 侧入口（仅构建期内嵌，不进入主闭包）
+│  ├─ graph-view-style.js   # CSS、常量、kind 元数据
+│  ├─ graph-view-controls.js# 过滤/探索/搜索/工具栏
+│  ├─ graph-view-details.js # 节点详情与连接分组
+│  ├─ graph-view.js         # SVG 编排、缩放拖拽、状态与提示
+│  └─ main.js               # apply(ctx)：注册两个扩展点 + 任务外壳
+├─ build/build.mjs          # 单文件 Client 模块构建（含内嵌 Worker 源）
+├─ locale/{en,zh}.json      # 插件清单里的标题/描述
+├─ examples/                # 5 个可直接点开的示例本体
+├─ tests/                   # Node 单元测试（解析/模型/任务/视图状态/示例/打包）
+├─ scripts/                 # i18n 覆盖检查、端到端统计、性能基准
+├─ docs/integration.md      # 接入笔记：DSH 文件预览插件怎么写
+├─ CONTRIBUTING.md          # 贡献指南（构建、约定、PR 检查清单）
 ├─ CHANGELOG.md
-├─ assets/icon-180.png   # 插件市场用的 180×180 位图图标（由 icon.svg 同几何渲染）
-├─ .github/workflows/    # CI：构建一致性 + 测试 + i18n
+├─ assets/icon-180.png      # 插件市场用的 180×180 位图图标（由 icon.svg 同几何渲染）
+├─ .github/workflows/       # CI：构建一致性 + 测试 + i18n
 ├─ icon.svg
 └─ LICENSE
 ```
@@ -201,12 +217,13 @@ dsh-ontology-viewer/
 
 ```bash
 # 依赖：Node.js >= 22（`--test` 的 glob 参数自 v22 起支持）；无需 npm install（零运行时依赖）
-npm test            # 46 个单元测试
-npm run build       # 由 src/ 重新生成 client.js
+npm test            # 当前全部单元测试
+npm run build       # 由 src/ 重新生成 client.js（含内嵌 Worker 源）
 npm run build:check # 校验 client.js 与 src/ 一致（CI 用）
 npm run check       # 语法 + 构建一致性 + 测试
-npm run i18n        # 校验视图文案 key 与中英词典一致
+npm run i18n        # 校验全部 UI 模块文案 key 与中英词典一致
 npm run stats       # 示例文件与压力用例的端到端统计
+npm run bench       # 五类夹具的分阶段性能基准（opt-in，不进 CI）
 npm run pack:release # 生成发版用 dsh-ontology-viewer.tgz（固定文件名，挂 Release）
 ```
 
@@ -228,7 +245,10 @@ npm run pack:release # 生成发版用 dsh-ontology-viewer.tgz（固定文件名
 答：检查文件后缀是否在上面支持列表里；或刷新页面让 Client 模块重新加载；或在预览头部下拉框里选择「本体图谱」。
 
 **问：图谱太大/太慢？**  
-答：超过 1500 节点会按度数截断并提示；可以先用搜索或「只看选中节点周围」聚焦局部。解析上限是 12 万三元组。
+答：超过分层预算会按确定性规则裁剪并明确提示（解析 12 万三元组、1500 节点、绘制 6000 条边）；可以先用搜索、过滤或「邻域探索」聚焦局部。解析/建模/布局优先在后台 Worker 中执行；Worker 不可用时自动降级为主线程分片布局并按提示收紧预算。
+
+**问：为什么两个入口能打开的文件大小不同？**
+答：原生预览入口受插件自身 12 MiB（UTF-8 字节）解析上限约束；better-sidebar 入口受其宿主 5 MiB 读取阈值约束，超过后宿主只提供文件大小。插件不修改宿主或其它插件的读取配置，只如实提示当前入口的上限。
 
 **问：能改默认打开方式吗？**  
 答：插件注册的渲染器优先级是 `extension` 档，默认排在宿主纯文本前面。想固定用文本，在预览头部下拉框选择一次即可（按文件标签记忆）。
@@ -240,9 +260,10 @@ npm run pack:release # 生成发版用 dsh-ontology-viewer.tgz（固定文件名
 
 仓库内已验证（可复现）：
 
-- 46 个 Node 单元测试全绿：解析器 18、图模型 17、5 个真实示例文件的端到端 7、打包接线 4；CI（GitHub Actions）在 Node 22 上跑同一套检查；
-- 干净 clone 后 `npm run build:check` 通过（`client.js` 与 `src/` 字节一致，`.gitattributes` 固定 LF）；`node --check client.js` 通过；产物无残留 `import`/`export`；
+- 当前全部 Node 单元测试通过（解析 / 图模型 / 计算任务 / 视图状态 / 5 个真实示例文件的端到端 / 打包接线；数量随演进，以 `npm test` 为准）；CI（GitHub Actions）在 Node 22 上跑同一套检查；
+- 干净 clone 后 `npm run build:check` 通过（`client.js` 与 `src/` 字节一致，`.gitattributes` 固定 LF）；`node --check client.js` 通过；产物无残留 `import`/`export`，内嵌 Worker 源随构建确定性生成；
 - 用 fake `ctx` 加载**打包后的** `client.js` 并执行 `apply`，确认四类注册（document preview 元数据、`sidebar.right.tab.document` 正文、better-sidebar viewer/icon、locale 词典）符合契约；
+- `npm run bench` 可在相同机器上对比改造前后的解析/建图/布局/序列化成本（本仓库 Change 的基准记录见 `openspec/changes/archive/2026-11-10-enhance-ontology-graph-core/verification.md`）；
 - 从 GitHub 安装（隔离的临时 profile 实测）：`dsh plugin --profile <p> add <仓库地址>` 成功，依赖以 `github:` 形式装入手，`dsh.profile.bundles` 自动追加 `dsh-ontology-viewer`，`dsh --dump-config` 能看到本插件的 bundle 行；
 - 从 Release 的预构建 tarball 安装（隔离的临时 profile 实测）：`dsh plugin --profile <p> add https://github.com/a158070653-hash/dsh-ontology-viewer/releases/latest/download/dsh-ontology-viewer.tgz` 成功，bundle 同样自动登记；
 - 在真实 DSH 实例中安装后：Host 行 `fiberPhase: active`，Client 侧 `sidebar.right.tab.document` 槽位出现 `dsh-ontology-viewer/graph` 且 `active: true`——说明 Client 模块确实在浏览器中加载并执行了。
@@ -250,7 +271,8 @@ npm run pack:release # 生成发版用 dsh-ontology-viewer.tgz（固定文件名
 尚未验证（作者环境无浏览器控制权限，无法截图）：
 
 - 图谱在页面中的实际视觉呈现、深/浅主题下的对比度、不同窗口宽度下的布局；
-- 点到真实文件时的最终画面。
+- 点到真实文件时的最终画面；
+- 本次 `enhance-ontology-graph-core` 改造中新增的过滤、多跳探索、详情分组、搜索列表、Worker 真机路径与降级提示——这些只完成了代码与自动化测试，**未做真实 DSH 页面验收**，验收步骤见 Change 的 `verification.md`。
 
 如果你发现视觉问题，欢迎提 issue，附上文件片段和截图；改 `src/graph-view.js` 的 `CSS` 常量后 `npm run build` 即可。
 
@@ -259,8 +281,9 @@ npm run pack:release # 生成发版用 dsh-ontology-viewer.tgz（固定文件名
 **dsh-ontology-viewer** is a plugin for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). Open `.ttl`, `.owl`, `.rdf`, `.jsonld`, `.nt`, `.n3` files from the file tree and the right-sidebar preview renders their RDF triples as an interactive force-directed graph instead of raw text.
 
 - Two surfaces: DSH's built-in document preview (`ctx.documentPreviews` + `sidebar.right.tab.document`) and [dsh-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) file viewers (optional).
-- Parsers for Turtle / N-Triples / RDF-XML / JSON-LD, with no runtime dependencies and no network access.
-- Hover to highlight neighbours, drag to pin nodes, wheel to zoom, click a node for its IRI, `rdf:type`, literals and edge counts; search, focus mode, re-layout.
+- Parsers for Turtle / N-Triples / RDF-XML / JSON-LD, with no runtime dependencies and no network access; semantic losses are reported as grouped diagnostics instead of being silently dropped.
+- Hover to highlight neighbours, drag to pin nodes, wheel to zoom, click a node for its IRI, `rdf:type`, literals and predicate-grouped relations; filter by node/relation type and direction, explore 1–5 hop neighbourhoods, search with a selectable result list, re-layout.
+- Layer-aware budgets (triples / nodes / literals / drawn edges) are always visible; parse, model and layout prefer a Blob Web Worker and degrade to chunked main-thread layout with a clear notice and tighter budgets when unavailable.
 - Deterministic layout (fixed seed, mulberry32), host theme tokens only, zh/en UI.
 
 Install: `dsh plugin --profile <profile> add https://github.com/a158070653-hash/dsh-ontology-viewer.git` (`web` for the standard web deployment, `desktop` for the desktop app), then refresh the DSH page. Try the files in [`examples/`](examples).

@@ -7,6 +7,19 @@
  *
  * The input contract is the parsed-RDF shape produced by src/rdf-parse.js:
  *   { prefixes, base, triples: [{ s, p, o, oKind, lang?, dt? }], stats, warnings }
+ *
+ * Export surface (additive; the first seven keep their V1.0.0 signatures and
+ * defaults, see design §10):
+ *   buildGraph, shortenIri, localName, matchNodes, subgraph, neighborhood,
+ *   layoutGraph,
+ *   filterGraph, applyEdgeBudget, exploreNeighborhood, connectionGroups,
+ *   createLayoutTask, budgetRecord.
+ *
+ * Data layers (design §1.5) that callers must state when they read them:
+ *   L1 fullGraph      -- buildGraph output, read by search/details/exploration/totals
+ *   L2 filteredGraph  -- filterGraph projection, read by exploration start
+ *   L3 exploredGraph  -- exploreNeighborhood output, read for exploration counts
+ *   L4 drawnGraph     -- applyEdgeBudget projection, read ONLY by rendering
  */
 
 const RDF_NS = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#'
@@ -81,6 +94,30 @@ function compareStrings(a, b) {
   return a < b ? -1 : 1
 }
 
+/**
+ * Structured budget record. Every truncation level reports the same
+ * `{ total, kept, truncated, reason }` shape (design §1.5 / §8.2) so the UI can
+ * derive counts and notices from one representation. `truncated` is a number
+ * (kept vs total delta), `reason` is null when nothing was dropped.
+ *
+ * @param {number} total
+ * @param {number} kept
+ * @param {string} [reason]
+ * @returns {{total: number, kept: number, truncated: number, reason: string|null}}
+ */
+export function budgetRecord(total, kept, reason) {
+  const totalValue = typeof total === 'number' && Number.isFinite(total) && total > 0 ? Math.floor(total) : 0
+  let keptValue = typeof kept === 'number' && Number.isFinite(kept) && kept > 0 ? Math.floor(kept) : 0
+  if (keptValue > totalValue) keptValue = totalValue
+  const truncated = totalValue - keptValue
+  return {
+    total: totalValue,
+    kept: keptValue,
+    truncated,
+    reason: truncated > 0 ? (typeof reason === 'string' && reason ? reason : 'budget') : null,
+  }
+}
+
 function emptyStats() {
   return {
     triples: 0,
@@ -92,11 +129,9 @@ function emptyStats() {
     individuals: 0,
     blanks: 0,
     droppedNodes: 0,
+    droppedEdges: 0,
+    droppedLiterals: 0,
   }
-}
-
-function emptyGraph(warnings) {
-  return { nodes: [], edges: [], stats: emptyStats(), warnings: Array.isArray(warnings) ? warnings : [] }
 }
 
 /**
@@ -110,6 +145,35 @@ function resolveObjectKind(triple, value) {
   if (value.startsWith(BLANK_PREFIX)) return 'blank'
   if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(value) && !/\s/.test(value)) return 'iri'
   return 'literal'
+}
+
+/**
+ * Resolve graph-level source metadata (spec "源位置预留", design §1.4).
+ *
+ * `options.source` is the authoritative explicit input; otherwise the parsed
+ * document is consulted defensively (`resourceAddress` first, then a
+ * resource-derived `base`). A document-declared `@base` is not a resource
+ * address and must not be reported as one. Missing values are empty strings,
+ * never a fabricated address or display name.
+ *
+ * @param {any} opts buildGraph options
+ * @param {any} input parsed document
+ * @returns {{address: string, displayName: string, format: string}}
+ */
+function resolveGraphSource(opts, input) {
+  const explicit = isObject(opts.source) ? opts.source : {}
+  let address = ''
+  if (typeof explicit.address === 'string') address = explicit.address
+  else if (typeof input.resourceAddress === 'string') address = input.resourceAddress
+  else if (typeof input.base === 'string' && input.baseSource !== 'document') address = input.base
+  let displayName = ''
+  if (typeof explicit.displayName === 'string') displayName = explicit.displayName
+  else if (typeof input.displayName === 'string') displayName = input.displayName
+  else if (typeof input.fileName === 'string') displayName = input.fileName
+  let format = ''
+  if (typeof explicit.format === 'string') format = explicit.format
+  else if (typeof input.format === 'string') format = input.format
+  return { address, displayName, format }
 }
 
 /**
@@ -129,19 +193,35 @@ function resolveObjectKind(triple, value) {
  * `node.literals`. rdf:first / rdf:rest triples are list plumbing and are
  * dropped from the graph (they still count in `stats.triples`).
  *
+ * Budgets (all optional, all structured, none silent):
+ *   - maxNodes (default 1200): highest total degree first, id as stable tie-break.
+ *   - maxLiteralsPerNode (default 60): per-node literal statements kept.
+ *   - maxEdges (default off): model-level distinct edge budget. Kept edges are
+ *     ordered by combined parallel `count` desc, full-graph degree sum desc,
+ *     then (source, predicate, target) lexicographic; output order stays the
+ *     first-occurrence order so ids remain stable.
+ *   - maxLiteralLength (default off): single literal value `length` cap; a
+ *     truncated value is marked with `literal.truncated = true`.
+ *
  * @param {{triples?: any[], prefixes?: Record<string, string>}} parsed
- * @param {{maxNodes?: number, maxLiteralsPerNode?: number}} [options]
- * @returns {{nodes: any[], edges: any[], stats: any, warnings: string[]}}
+ * @param {{maxNodes?: number, maxLiteralsPerNode?: number, maxEdges?: number,
+ *          maxLiteralLength?: number,
+ *          source?: {address?: string, displayName?: string, format?: string}}} [options]
+ * @returns {{nodes: any[], edges: any[], stats: any, warnings: string[],
+ *            truncation: any, source: {address: string, displayName: string, format: string}}}
  */
 export function buildGraph(parsed, options) {
   const opts = isObject(options) ? options : {}
   const maxNodes = positiveInteger(opts.maxNodes, 1200)
   const maxLiterals = positiveInteger(opts.maxLiteralsPerNode, 60)
+  const maxLiteralLength = optionalPositiveInteger(opts.maxLiteralLength)
+  const maxEdges = optionalPositiveInteger(opts.maxEdges)
 
   const input = isObject(parsed) ? parsed : {}
   const triples = Array.isArray(input.triples) ? input.triples : []
   const prefixes = isObject(input.prefixes) ? input.prefixes : {}
   const warnings = []
+  const source = resolveGraphSource(opts, input)
 
   /** id -> { id, types, literals, out, in, label, labelRank } */
   const records = new Map()
@@ -151,9 +231,8 @@ export function buildGraph(parsed, options) {
   const subclassNodes = new Set()
   /** "s\0p\0o" -> collapsed edge draft */
   const edgeDrafts = new Map()
-  /** literal statements retained per subject after capping */
-  let literalCount = 0
-  let truncatedLiterals = false
+  /** literal value truncations applied because of maxLiteralLength */
+  let truncatedValues = 0
 
   function ensureRecord(id) {
     let record = records.get(id)
@@ -179,12 +258,20 @@ export function buildGraph(parsed, options) {
       if (LIST_PREDICATES.has(predicate)) continue
       const record = ensureRecord(subject)
       const rank = labelRank(predicate)
+      let value = objectText
+      let valueTruncated = false
+      if (maxLiteralLength > 0 && value.length > maxLiteralLength) {
+        value = value.slice(0, maxLiteralLength)
+        valueTruncated = true
+        truncatedValues += 1
+      }
       const literal = {
         p: predicate,
-        value: objectText,
+        value,
         order: record.literals.length,
         rank,
       }
+      if (valueTruncated) literal.truncated = true
       if (typeof triple.dt === 'string' && triple.dt) literal.dt = triple.dt
       if (typeof triple.lang === 'string' && triple.lang) literal.lang = triple.lang
       record.literals.push(literal)
@@ -192,7 +279,7 @@ export function buildGraph(parsed, options) {
       // node label; only ranks 0..3 are label predicates.
       if (rank <= 3 && rank < record.labelRank) {
         record.labelRank = rank
-        record.label = objectText
+        record.label = value
       }
       continue
     }
@@ -201,13 +288,13 @@ export function buildGraph(parsed, options) {
 
     const object = objectText
     if (!object) continue
-    const source = ensureRecord(subject)
-    const target = ensureRecord(object)
-    source.out += 1
-    target.in += 1
+    const sourceRecord = ensureRecord(subject)
+    const targetRecord = ensureRecord(object)
+    sourceRecord.out += 1
+    targetRecord.in += 1
 
     if (predicate === RDF_TYPE) {
-      if (!source.types.includes(object)) source.types.push(object)
+      if (!sourceRecord.types.includes(object)) sourceRecord.types.push(object)
       if (objectKind === 'iri') usedAsType.add(object)
     } else if (predicate === RDFS_SUBCLASSOF) {
       subclassNodes.add(subject)
@@ -221,6 +308,11 @@ export function buildGraph(parsed, options) {
     } else {
       draft.count += 1
     }
+  }
+
+  function degreeOf(id) {
+    const record = records.get(id)
+    return record === undefined ? 0 : record.out + record.in
   }
 
   // Rank before capping: highest degree first, id as a stable tie-breaker.
@@ -240,10 +332,44 @@ export function buildGraph(parsed, options) {
     )
   }
 
-  // Keep only edges whose endpoints survived capping.
-  const edges = []
+  // Keep only edges whose endpoints survived capping, then optionally apply
+  // the model-level distinct-edge budget.
+  const totalEdgeCandidates = edgeDrafts.size
+  const retainedDrafts = []
   for (const draft of edgeDrafts.values()) {
     if (!keptIds.has(draft.source) || !keptIds.has(draft.target)) continue
+    retainedDrafts.push(draft)
+  }
+  const droppedByNodeLimit = totalEdgeCandidates - retainedDrafts.length
+  let keptDrafts = retainedDrafts
+  let droppedByBudget = 0
+  if (maxEdges > 0 && retainedDrafts.length > maxEdges) {
+    // Deterministic priority: parallel count first, then full-graph degree
+    // sum, then the canonical (source, predicate, target) key.
+    const rankedEdges = retainedDrafts.slice()
+    rankedEdges.sort((a, b) => {
+      if (a.count !== b.count) return b.count - a.count
+      const degreeA = degreeOf(a.source) + degreeOf(a.target)
+      const degreeB = degreeOf(b.source) + degreeOf(b.target)
+      if (degreeA !== degreeB) return degreeB - degreeA
+      return compareStrings(a.source, b.source) ||
+        compareStrings(a.p, b.p) ||
+        compareStrings(a.target, b.target)
+    })
+    const keptSet = new Set(rankedEdges.slice(0, maxEdges))
+    keptDrafts = retainedDrafts.filter((draft) => keptSet.has(draft))
+    droppedByBudget = retainedDrafts.length - keptDrafts.length
+    warnings.push(
+      'Graph edge limit reached: kept ' + keptDrafts.length + ' of ' +
+      retainedDrafts.length + ' edges, dropped ' + droppedByBudget + '.'
+    )
+  }
+  const keptDraftSet = new Set(keptDrafts)
+
+  // Emit edges in first-occurrence order so ids stay stable across budgets.
+  const edges = []
+  for (const draft of edgeDrafts.values()) {
+    if (!keptDraftSet.has(draft)) continue
     let kind = 'object'
     if (draft.p === RDF_TYPE) kind = 'type'
     else if (draft.p === RDFS_SUBCLASSOF) kind = 'subclass'
@@ -274,6 +400,10 @@ export function buildGraph(parsed, options) {
   const nodes = []
   const stats = emptyStats()
   stats.triples = triples.length || Number(input.stats && input.stats.tripleCount) || 0
+  let literalCandidates = 0
+  let keptLiteralCount = 0
+  let droppedLiteralCount = 0
+  let truncatedLiteralNodes = 0
 
   for (const record of keptRecords) {
     const out = outEdges.get(record.id) || 0
@@ -288,8 +418,16 @@ export function buildGraph(parsed, options) {
 
     // Labels first, then rdfs:comment, then the rest in document order.
     record.literals.sort((a, b) => a.rank - b.rank || a.order - b.order)
-    if (record.literals.length > maxLiterals) truncatedLiterals = true
-    const literals = record.literals.slice(0, maxLiterals).map((literal) => {
+    const totalForNode = record.literals.length
+    literalCandidates += totalForNode
+    const keptLiterals = record.literals.slice(0, maxLiterals)
+    const droppedForNode = totalForNode - keptLiterals.length
+    if (droppedForNode > 0) {
+      truncatedLiteralNodes += 1
+      droppedLiteralCount += droppedForNode
+    }
+    keptLiteralCount += keptLiterals.length
+    const literals = keptLiterals.map((literal) => {
       const item = {
         p: literal.p,
         pLabel: shortenIri(literal.p, prefixes),
@@ -297,13 +435,13 @@ export function buildGraph(parsed, options) {
       }
       if (literal.dt) item.dt = literal.dt
       if (literal.lang) item.lang = literal.lang
+      if (literal.truncated) item.truncated = true
       return item
     })
 
     const rawLocal = localName(record.id)
     const local = rawLocal || record.id
     const label = record.label || local
-    literalCount += literals.length
 
     if (kind === 'class') stats.classes += 1
     else if (kind === 'property') stats.properties += 1
@@ -321,19 +459,44 @@ export function buildGraph(parsed, options) {
       literals,
       outEdges: out,
       inEdges: incoming,
+      // Reserved source location: always null in this change (spec
+      // "源位置预留"); never inferred from filenames or document order.
+      literalsTruncated: droppedForNode,
+      source: null,
     })
   }
 
-  if (truncatedLiterals) {
+  if (truncatedLiteralNodes > 0) {
     warnings.push('Literal properties were truncated to ' + maxLiterals + ' per node.')
+  }
+  if (truncatedValues > 0) {
+    warnings.push('Literal values were truncated to ' + maxLiteralLength + ' characters.')
   }
 
   stats.nodes = nodes.length
   stats.edges = edges.length
-  stats.literals = literalCount
+  stats.literals = keptLiteralCount
   stats.droppedNodes = droppedNodes
+  stats.droppedEdges = totalEdgeCandidates - edges.length
+  stats.droppedLiterals = droppedLiteralCount
 
-  return { nodes, edges, stats, warnings }
+  const truncation = {
+    nodes: budgetRecord(ranked.length, keptRecords.length, 'max-nodes'),
+    literals: Object.assign(
+      budgetRecord(literalCandidates, keptLiteralCount, 'max-literals-per-node'),
+      {
+        perNodeLimit: maxLiterals,
+        truncatedNodes: truncatedLiteralNodes,
+        valueTruncated: truncatedValues,
+      },
+    ),
+    edges: Object.assign(
+      budgetRecord(totalEdgeCandidates, edges.length, droppedByBudget > 0 ? 'max-edges' : 'node-limit'),
+      { droppedByNodeLimit, droppedByBudget },
+    ),
+  }
+
+  return { nodes, edges, stats, warnings, truncation, source }
 }
 
 /**
@@ -502,6 +665,590 @@ export function neighborhood(graph, nodeId, depth) {
 }
 
 // ---------------------------------------------------------------------------
+// Filter projection (L2, design §4)
+// ---------------------------------------------------------------------------
+
+/**
+ * Pure display projection over the retained full graph (L1). Never mutates the
+ * input graph or the parsed data, never re-parses.
+ *
+ * Criteria semantics (design §4.2):
+ *   - `kinds`: node kind allow-list (class/property/individual/blank/external);
+ *     empty/absent = all kinds.
+ *   - `predicates`: edge predicate allow-list; empty/absent = all predicates.
+ *   - `direction`: direction relative to `anchorId`, applied to direct relation
+ *     edges only (1 hop): `'out'` keeps edges whose source is the anchor,
+ *     `'in'` edges whose target is the anchor, `'both'` edges touching the
+ *     anchor in either direction. This is a projection filter, not a traversal:
+ *     multi-hop expansion belongs to `exploreNeighborhood`, which applies the
+ *     direction again on every hop (so the filter layer must not pre-compute a
+ *     reachability cone). Without a usable anchor, or when no direction is
+ *     provided at all, the direction condition is inert (spec "无锚点时方向条件
+ *     不生效").
+ *   - `anchorId`: the selected node; it is always retained, even when it fails
+ *     the kind filter, so the selection context cannot vanish.
+ *
+ * When a relation filter is active (predicates or a direction), nodes that have
+ * no retained incident edge are dropped, except the anchor -- relation filtering
+ * making isolated nodes disappear is expected behaviour (design §4.2). A pure
+ * kind filter keeps matching nodes connected or not.
+ *
+ * The result is `{ nodes, edges, stats, hidden, graph }` where `graph` is the
+ * same projection shaped like a graph model (design names this `{ graph, stats,
+ * hidden }`; the flat fields are kept for direct use). `hidden` reports total
+ * hidden counts plus independent marginal counts by kind / predicate / direction
+ * (the marginals can overlap; totals are exact).
+ *
+ * @param {any} graph full (L1) or filtered (L2/L3) graph model
+ * @param {{kinds?: string[], predicates?: string[], direction?: 'both'|'out'|'in', anchorId?: string}} criteria
+ * @param {any} [_options] reserved
+ */
+export function filterGraph(graph, criteria, _options) {
+  const input = isObject(graph) ? graph : {}
+  const spec = isObject(criteria) ? criteria : {}
+  const allNodes = Array.isArray(input.nodes) ? input.nodes : []
+  const allEdges = Array.isArray(input.edges) ? input.edges : []
+
+  const kindSet = new Set(Array.isArray(spec.kinds) ? spec.kinds.filter((kind) => typeof kind === 'string') : [])
+  const predicateSet = new Set(Array.isArray(spec.predicates) ? spec.predicates.filter((predicate) => typeof predicate === 'string') : [])
+  const directionSpecified = spec.direction === 'out' || spec.direction === 'in' || spec.direction === 'both'
+  const requestedDirection = spec.direction === 'out' || spec.direction === 'in' ? spec.direction : 'both'
+  const anchorId = typeof spec.anchorId === 'string' ? spec.anchorId : ''
+  const hasAnchor = anchorId !== '' && allNodes.some((node) => isObject(node) && node.id === anchorId)
+  // Direction filtering only runs when the caller explicitly asks for it and an
+  // anchor exists. With an anchor all three directions are meaningful --
+  // including 'both', which keeps the anchor's direct in+out relations.
+  const directionActive = hasAnchor && directionSpecified
+  const kindsActive = kindSet.size > 0
+  const predicatesActive = predicateSet.size > 0
+  const relationActive = predicatesActive || directionActive
+
+  function nodeAllowed(node) {
+    if (!kindsActive) return true
+    return kindSet.has(node.kind)
+  }
+
+  const keptNodeIds = new Set()
+  const keptNodes = []
+  for (const node of allNodes) {
+    if (!isObject(node) || typeof node.id !== 'string') continue
+    if (node.id === anchorId || nodeAllowed(node)) {
+      keptNodeIds.add(node.id)
+      keptNodes.push(node)
+    }
+  }
+
+  function edgeAllowed(edge) {
+    if (!predicatesActive) return true
+    return predicateSet.has(edge.p)
+  }
+
+  const predicateEdges = allEdges.filter((edge) =>
+    isObject(edge) &&
+    keptNodeIds.has(edge.source) &&
+    keptNodeIds.has(edge.target) &&
+    edgeAllowed(edge))
+
+  // Direction filters direct relation edges relative to the anchor (1 hop).
+  // The filter layer never traverses: multi-hop expansion belongs to
+  // exploreNeighborhood, which re-applies the direction on every hop.
+  let finalEdges = predicateEdges
+  if (directionActive) {
+    finalEdges = predicateEdges.filter((edge) => {
+      if (requestedDirection === 'out') return edge.source === anchorId
+      if (requestedDirection === 'in') return edge.target === anchorId
+      return edge.source === anchorId || edge.target === anchorId
+    })
+  }
+
+  let finalNodes = keptNodes
+  if (relationActive) {
+    const incident = new Set()
+    for (const edge of finalEdges) {
+      incident.add(edge.source)
+      incident.add(edge.target)
+    }
+    finalNodes = keptNodes.filter((node) => node.id === anchorId || incident.has(node.id))
+  }
+
+  const stats = statsFor(finalNodes, finalEdges, input.stats && input.stats.triples)
+  stats.totalNodes = allNodes.length
+  stats.totalEdges = allEdges.length
+
+  let hiddenByKindNodes = 0
+  for (const node of allNodes) {
+    if (!isObject(node) || typeof node.id !== 'string' || node.id === anchorId) continue
+    if (!nodeAllowed(node)) hiddenByKindNodes += 1
+  }
+  let hiddenByPredicateEdges = 0
+  for (const edge of allEdges) {
+    if (!isObject(edge)) continue
+    if (!edgeAllowed(edge)) hiddenByPredicateEdges += 1
+  }
+  let hiddenByDirectionEdges = 0
+  if (directionActive) {
+    for (const edge of allEdges) {
+      if (!isObject(edge)) continue
+      if (!edgeAllowed(edge)) continue
+      if (!keptNodeIds.has(edge.source) || !keptNodeIds.has(edge.target)) continue
+      let incident
+      if (requestedDirection === 'out') incident = edge.source === anchorId
+      else if (requestedDirection === 'in') incident = edge.target === anchorId
+      else incident = edge.source === anchorId || edge.target === anchorId
+      if (!incident) hiddenByDirectionEdges += 1
+    }
+  }
+
+  const hidden = {
+    nodes: allNodes.length - finalNodes.length,
+    edges: allEdges.length - finalEdges.length,
+    byKind: { nodes: hiddenByKindNodes },
+    byPredicate: { edges: hiddenByPredicateEdges },
+    byDirection: { edges: hiddenByDirectionEdges },
+  }
+
+  const projectedGraph = {
+    nodes: finalNodes,
+    edges: finalEdges,
+    stats,
+    warnings: Array.isArray(input.warnings) ? input.warnings.slice() : [],
+    source: isObject(input.source) ? input.source : null,
+    truncation: isObject(input.truncation) ? input.truncation : null,
+  }
+
+  return { nodes: finalNodes, edges: finalEdges, stats, hidden, graph: projectedGraph }
+}
+
+// ---------------------------------------------------------------------------
+// Draw budget (L4, design §8 / spec "绘制预算")
+// ---------------------------------------------------------------------------
+
+/**
+ * Deterministic drawing projection: keep at most `maxEdges` distinct edges
+ * (optionally bounded further by `maxElements`, where one element is one node
+ * plus one edge). The result is display-only: search, exploration, details and
+ * totals must keep reading the retained full graph (L1).
+ *
+ * Priority (design §8.3): edges incident to `priorityIds` (selected node /
+ * search hit) first, then higher parallel `count`, then edge id lexicographic.
+ * Output keeps the input edge order so z-order stays stable.
+ *
+ * @param {any} graph
+ * @param {{maxEdges?: number, maxElements?: number, priorityIds?: string[]}} [budget]
+ * @returns {{nodes: any[], edges: any[], stats: {keptEdges: number, hiddenEdges: number, totalEdges: number},
+ *            truncation: {edges: any}, displayOnly: true}}
+ */
+export function applyEdgeBudget(graph, budget) {
+  const input = isObject(graph) ? graph : {}
+  const spec = isObject(budget) ? budget : {}
+  const allNodes = Array.isArray(input.nodes) ? input.nodes : []
+  const allEdges = Array.isArray(input.edges) ? input.edges : []
+  const requestedMaxEdges = optionalPositiveInteger(spec.maxEdges)
+  const requestedMaxElements = optionalPositiveInteger(spec.maxElements)
+  const prioritySet = new Set(Array.isArray(spec.priorityIds) ? spec.priorityIds.filter((id) => typeof id === 'string') : [])
+
+  let limit = Infinity
+  let reason = null
+  if (requestedMaxEdges > 0) {
+    limit = requestedMaxEdges
+    reason = 'max-edges'
+  }
+  if (requestedMaxElements > 0) {
+    // One element per node plus one per edge is the approximate SVG cost.
+    const elementLimit = Math.max(0, requestedMaxElements - allNodes.length)
+    if (elementLimit < limit) {
+      limit = elementLimit
+      reason = 'max-elements'
+    }
+  }
+
+  const total = allEdges.length
+  let keptEdges = allEdges
+  if (Number.isFinite(limit) && total > limit) {
+    const ranked = allEdges.map((edge, index) => ({ edge, index }))
+    ranked.sort((a, b) => {
+      const aPriority = isPriorityEdge(a.edge, prioritySet) ? 0 : 1
+      const bPriority = isPriorityEdge(b.edge, prioritySet) ? 0 : 1
+      if (aPriority !== bPriority) return aPriority - bPriority
+      const aCount = isObject(a.edge) && Number.isFinite(a.edge.count) ? a.edge.count : 0
+      const bCount = isObject(b.edge) && Number.isFinite(b.edge.count) ? b.edge.count : 0
+      if (aCount !== bCount) return bCount - aCount
+      const aId = isObject(a.edge) && typeof a.edge.id === 'string' ? a.edge.id : ''
+      const bId = isObject(b.edge) && typeof b.edge.id === 'string' ? b.edge.id : ''
+      return compareStrings(aId, bId) || a.index - b.index
+    })
+    const keptIndexes = new Set(ranked.slice(0, limit).map((entry) => entry.index))
+    keptEdges = allEdges.filter((edge, index) => keptIndexes.has(index))
+  }
+
+  const truncation = {
+    edges: budgetRecord(total, keptEdges.length, reason === null ? 'max-edges' : reason),
+  }
+  return {
+    nodes: allNodes,
+    edges: keptEdges,
+    stats: {
+      keptEdges: keptEdges.length,
+      hiddenEdges: total - keptEdges.length,
+      totalEdges: total,
+    },
+    truncation,
+    displayOnly: true,
+  }
+}
+
+function isPriorityEdge(edge, prioritySet) {
+  if (prioritySet.size === 0 || !isObject(edge)) return false
+  return prioritySet.has(edge.source) || prioritySet.has(edge.target)
+}
+
+// ---------------------------------------------------------------------------
+// Multi-hop exploration (L3, design §5 / spec "多跳探索与展开预算")
+// ---------------------------------------------------------------------------
+
+function edgeIdentity(edge) {
+  return stringValue(edge.source) + '\u0000' + stringValue(edge.p) + '\u0000' + stringValue(edge.target)
+}
+
+function cursorExtension(cursor) {
+  let value = NaN
+  if (typeof cursor === 'number' && Number.isFinite(cursor)) value = cursor
+  else if (isObject(cursor)) {
+    if (Number.isFinite(cursor.extension)) value = cursor.extension
+    else if (Number.isFinite(cursor.extensions)) value = cursor.extensions
+  }
+  if (!Number.isFinite(value) || value < 0) return 0
+  return Math.min(1000, Math.floor(value))
+}
+
+/**
+ * Budgeted BFS over an already-filtered graph (L2/L3). Hidden/filtered-away
+ * nodes are simply absent, so they can never act as stepping stones.
+ *
+ *   - depth: clamped to 1..5 (hard cap); request > 5 reports `depthCapped`.
+ *   - direction: applies to every hop (out edges / in edges / both).
+ *   - predicates: predicate allow-list applied on every hop.
+ *   - neighbour order: predicate IRI first, then neighbour node id (deterministic).
+ *   - budget: `perHopNodes` new nodes per hop, `maxEdges` global distinct edges.
+ *   - cursor: a deterministic effective-budget extension `{ extension: k }`.
+ *     Continuing with the returned cursor increases the effective budgets
+ *     (base * (k + 1)), so a continued result is always a superset of the
+ *     previous result with no duplicate nodes/edges; identical input + cursor
+ *     gives an identical result.
+ *
+ * Result: `{ nodes, edges, nodeIds, stats, truncation, truncated, nextCursor,
+ * nextBudget, depthCapped, reachedDepthLimit }`. `stats` carries `nodes`,
+ * `edges`, `hops`, `depth`, `totalNodes`, `totalEdges`, `perHopNodes`,
+ * `maxEdges`, `extension`, `depthLimit`; `truncation.{nodes,edges}` are
+ * `{ total, kept, truncated, reason }` records where `total` is the unbudgeted
+ * expansion available within the requested depth (so the UI can show "已展开
+ * X / 共 Y"). `truncated` is true when a budget cut the expansion or the
+ * requested depth exceeded the hard cap; `nextCursor` is non-null only for
+ * budget truncation.
+ *
+ * @param {any} graph
+ * @param {{startId?: string, depth?: number, direction?: 'out'|'in'|'both',
+ *          predicates?: string[], budget?: {perHopNodes?: number, maxEdges?: number},
+ *          cursor?: number|{extension?: number}}} [options]
+ */
+export function exploreNeighborhood(graph, options) {
+  const input = isObject(graph) ? graph : {}
+  const opts = isObject(options) ? options : {}
+  const allNodes = Array.isArray(input.nodes) ? input.nodes : []
+  const allEdges = Array.isArray(input.edges) ? input.edges : []
+  const nodeById = new Map()
+  for (const node of allNodes) {
+    if (isObject(node) && typeof node.id === 'string' && !nodeById.has(node.id)) nodeById.set(node.id, node)
+  }
+
+  const requestedDepth = Number.isFinite(opts.depth) ? Math.floor(opts.depth) : 1
+  const depth = Math.max(1, Math.min(5, requestedDepth))
+  const depthCapped = requestedDepth > 5
+  const direction = opts.direction === 'out' || opts.direction === 'in' ? opts.direction : 'both'
+  const predicateSet = new Set(Array.isArray(opts.predicates)
+    ? opts.predicates.filter((predicate) => typeof predicate === 'string')
+    : [])
+  const budgetOptions = isObject(opts.budget) ? opts.budget : {}
+  const basePerHopNodes = positiveInteger(budgetOptions.perHopNodes, 300)
+  const baseMaxEdges = positiveInteger(budgetOptions.maxEdges, 800)
+  const extension = cursorExtension(opts.cursor)
+  const perHopNodes = basePerHopNodes * (1 + extension)
+  const maxEdges = baseMaxEdges * (1 + extension)
+
+  const stats = {
+    nodes: 0,
+    edges: 0,
+    hops: 0,
+    depth,
+    requestedDepth,
+    totalNodes: nodeById.size,
+    totalEdges: allEdges.length,
+    perHopNodes,
+    maxEdges,
+    extension,
+    depthLimit: 5,
+  }
+
+  const startId = typeof opts.startId === 'string' ? opts.startId : ''
+  if (!nodeById.has(startId)) {
+    return {
+      nodes: [],
+      edges: [],
+      nodeIds: [],
+      stats,
+      truncation: {
+        nodes: budgetRecord(0, 0, null),
+        edges: budgetRecord(0, 0, null),
+      },
+      truncated: false,
+      nextCursor: null,
+      nextBudget: null,
+      depthCapped,
+      reachedDepthLimit: false,
+    }
+  }
+
+  const outAdjacency = new Map()
+  const inAdjacency = new Map()
+  for (const id of nodeById.keys()) {
+    outAdjacency.set(id, [])
+    inAdjacency.set(id, [])
+  }
+  for (const edge of allEdges) {
+    if (!isObject(edge)) continue
+    if (!nodeById.has(edge.source) || !nodeById.has(edge.target)) continue
+    if (predicateSet.size > 0 && !predicateSet.has(edge.p)) continue
+    const p = stringValue(edge.p)
+    outAdjacency.get(edge.source).push({ edge, p, other: edge.target })
+    inAdjacency.get(edge.target).push({ edge, p, other: edge.source })
+  }
+
+  function byPredicateThenNode(a, b) {
+    return compareStrings(a.p, b.p) || compareStrings(a.other, b.other)
+  }
+  for (const list of outAdjacency.values()) list.sort(byPredicateThenNode)
+  for (const list of inAdjacency.values()) list.sort(byPredicateThenNode)
+
+  function candidatesFor(currentId) {
+    if (direction === 'out') return outAdjacency.get(currentId) || []
+    if (direction === 'in') return inAdjacency.get(currentId) || []
+    const outgoing = outAdjacency.get(currentId) || []
+    const incoming = inAdjacency.get(currentId) || []
+    if (outgoing.length === 0) return incoming
+    if (incoming.length === 0) return outgoing
+    const merged = outgoing.concat(incoming)
+    merged.sort(byPredicateThenNode)
+    const seen = new Set()
+    const unique = []
+    for (const candidate of merged) {
+      const key = edgeIdentity(candidate.edge)
+      if (seen.has(key)) continue
+      seen.add(key)
+      unique.push(candidate)
+    }
+    return unique
+  }
+
+  function runBfs(perHopLimit, edgeLimit) {
+    const included = new Set([startId])
+    const nodeOrder = [startId]
+    const includedEdges = []
+    const seenEdgeKeys = new Set()
+    let frontier = [startId]
+    let hops = 0
+    let truncated = false
+    let stopReason = null
+
+    for (let hop = 1; hop <= depth && stopReason === null; hop += 1) {
+      const nextFrontier = []
+      let addedInHop = 0
+      outer: for (const current of frontier) {
+        const candidates = candidatesFor(current)
+        for (const candidate of candidates) {
+          const key = edgeIdentity(candidate.edge)
+          const neighborId = candidate.other
+          if (included.has(neighborId)) {
+            if (seenEdgeKeys.has(key)) continue
+            if (includedEdges.length >= edgeLimit) {
+              truncated = true
+              stopReason = 'max-edges'
+              break outer
+            }
+            seenEdgeKeys.add(key)
+            includedEdges.push(candidate.edge)
+            continue
+          }
+          if (addedInHop >= perHopLimit) {
+            truncated = true
+            stopReason = 'per-hop-nodes'
+            break outer
+          }
+          if (includedEdges.length >= edgeLimit) {
+            truncated = true
+            stopReason = 'max-edges'
+            break outer
+          }
+          included.add(neighborId)
+          nodeOrder.push(neighborId)
+          nextFrontier.push(neighborId)
+          addedInHop += 1
+          seenEdgeKeys.add(key)
+          includedEdges.push(candidate.edge)
+        }
+      }
+      if (stopReason !== null) {
+        hops = hop
+        break
+      }
+      if (nextFrontier.length === 0) {
+        hops = hop - 1
+        break
+      }
+      hops = hop
+      frontier = nextFrontier
+    }
+
+    return { nodeOrder, edges: includedEdges, hops, truncated, stopReason }
+  }
+
+  const budgeted = runBfs(perHopNodes, maxEdges)
+  // Only pay for the unbudgeted reference run when a budget actually cut the
+  // expansion; it supplies the "已展开 X / 共 Y" totals without changing the
+  // deterministic budgeted result.
+  const unbudgeted = budgeted.truncated ? runBfs(Infinity, Infinity) : budgeted
+
+  const nodes = budgeted.nodeOrder.map((id) => nodeById.get(id))
+  stats.nodes = nodes.length
+  stats.edges = budgeted.edges.length
+  stats.hops = budgeted.hops
+
+  const truncation = {
+    nodes: budgetRecord(unbudgeted.nodeOrder.length, nodes.length, budgeted.stopReason),
+    edges: budgetRecord(unbudgeted.edges.length, budgeted.edges.length, budgeted.stopReason),
+  }
+
+  const nextCursor = budgeted.truncated ? { extension: extension + 1 } : null
+  const reachedDepthLimit = depth >= 5 && budgeted.hops >= 5
+  return {
+    nodes,
+    edges: budgeted.edges,
+    nodeIds: budgeted.nodeOrder,
+    stats,
+    truncation,
+    truncated: budgeted.truncated || depthCapped,
+    nextCursor,
+    nextBudget: nextCursor,
+    depthCapped,
+    reachedDepthLimit,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Detail connection groups (design §6 / spec "详情连接分组")
+// ---------------------------------------------------------------------------
+
+/**
+ * Group a node's outgoing/incoming edges by predicate for the detail panel.
+ * Read-only, deterministic, computed on demand from the retained full graph
+ * (never from the draw-budget projection).
+ *
+ * Group order: `rdf:type` first, then group edge count descending, then
+ * predicate IRI lexicographic. Items within a group are ordered by neighbour
+ * node id. Each group keeps at most `maxPerGroup` items (default 10) and
+ * reports `hidden` = count - items.length so the panel can offer "show more"
+ * by re-calling with a larger `maxPerGroup`.
+ *
+ * @param {any} graph
+ * @param {string} nodeId
+ * @param {{maxPerGroup?: number}} [options]
+ * @returns {{out: any[], in: any[], summary: {outEdges: number, inEdges: number, degree: number}}}
+ */
+export function connectionGroups(graph, nodeId, options) {
+  const input = isObject(graph) ? graph : {}
+  const opts = isObject(options) ? options : {}
+  const allNodes = Array.isArray(input.nodes) ? input.nodes : []
+  const allEdges = Array.isArray(input.edges) ? input.edges : []
+  const maxPerGroup = positiveInteger(opts.maxPerGroup, 10)
+  const nodeById = new Map()
+  for (const node of allNodes) {
+    if (isObject(node) && typeof node.id === 'string' && !nodeById.has(node.id)) nodeById.set(node.id, node)
+  }
+
+  if (typeof nodeId !== 'string' || !nodeById.has(nodeId)) {
+    return { out: [], in: [], summary: { outEdges: 0, inEdges: 0, degree: 0 } }
+  }
+
+  const outGroups = new Map()
+  const inGroups = new Map()
+
+  function addEdge(groupMap, predicate, neighborId, edge) {
+    let group = groupMap.get(predicate)
+    if (group === undefined) {
+      group = {
+        predicate,
+        label: stringValue(edge.label) || localName(predicate) || predicate,
+        count: 0,
+        neighbors: new Map(),
+      }
+      groupMap.set(predicate, group)
+    }
+    group.count += 1
+    if (group.neighbors.has(neighborId)) return
+    const neighbor = nodeById.get(neighborId)
+    group.neighbors.set(neighborId, {
+      id: neighborId,
+      label: stringValue(neighbor && neighbor.label) || localName(neighborId) || neighborId,
+      kind: neighbor && typeof neighbor.kind === 'string' ? neighbor.kind : 'external',
+    })
+  }
+
+  let outEdges = 0
+  let inEdges = 0
+  for (const edge of allEdges) {
+    if (!isObject(edge)) continue
+    const predicate = typeof edge.p === 'string' ? edge.p : ''
+    if (edge.source === nodeId) {
+      outEdges += 1
+      addEdge(outGroups, predicate, edge.target, edge)
+    }
+    if (edge.target === nodeId) {
+      inEdges += 1
+      addEdge(inGroups, predicate, edge.source, edge)
+    }
+  }
+
+  function finalize(groupMap) {
+    const groups = []
+    for (const group of groupMap.values()) {
+      const items = Array.from(group.neighbors.values())
+        .sort((a, b) => compareStrings(a.id, b.id))
+      const keptItems = items.slice(0, maxPerGroup)
+      groups.push({
+        predicate: group.predicate,
+        label: group.label,
+        count: group.count,
+        items: keptItems,
+        hidden: Math.max(0, group.count - keptItems.length),
+      })
+    }
+    groups.sort((a, b) => {
+      const aType = a.predicate === RDF_TYPE ? 0 : 1
+      const bType = b.predicate === RDF_TYPE ? 0 : 1
+      if (aType !== bType) return aType - bType
+      if (a.count !== b.count) return b.count - a.count
+      return compareStrings(a.predicate, b.predicate)
+    })
+    return groups
+  }
+
+  return {
+    out: finalize(outGroups),
+    in: finalize(inGroups),
+    summary: { outEdges, inEdges, degree: outEdges + inEdges },
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Layout
 // ---------------------------------------------------------------------------
 
@@ -509,6 +1256,13 @@ function positiveInteger(value, fallback) {
   if (typeof value !== 'number' || !Number.isFinite(value)) return fallback
   const integer = Math.floor(value)
   return integer > 0 ? integer : fallback
+}
+
+/** Positive integer or 0 meaning "budget disabled". */
+function optionalPositiveInteger(value) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return 0
+  const integer = Math.floor(value)
+  return integer > 0 ? integer : 0
 }
 
 function numberOption(value, fallback) {
@@ -542,26 +1296,21 @@ function hashUnit(a, b, c) {
   return (value >>> 0) / 4294967296
 }
 
+const layoutNow = typeof performance !== 'undefined' && performance && typeof performance.now === 'function'
+  ? function now() { return performance.now() }
+  : function now() { return Date.now() }
+
 /**
- * Deterministic force-directed layout in a width x height box.
- *
- * The graph is split into connected components, components are seeded on a
- * grid of cells (so they cannot collapse onto each other), and each cell gets
- * a phyllotaxis seed. A Fruchterman-Reingold style pass then runs with:
- *   - attractive forces along edges,
- *   - repulsive forces between nodes (exact for small graphs, deterministic
- *     sampling for large ones so 1200 nodes stay interactive),
- *   - a weak pull towards the component's grid cell centre,
- *   - a linear cooling schedule and a per-iteration displacement cap.
- * The result is finally scaled and centred into the padded box.
- *
- * Same graph + same seed => byte-identical positions.
+ * Prepare the deterministic layout state shared by `layoutGraph` and
+ * `createLayoutTask`: split connected components, seed them on a grid of
+ * cells, and allocate all force-pass buffers. Only seeding consumes the seeded
+ * PRNG, so stepping the force pass later cannot change the result.
  *
  * @param {any} graph
- * @param {{width?: number, height?: number, iterations?: number, seed?: number, padding?: number}} [options]
- * @returns {{id: string, x: number, y: number, vx: number, vy: number}[]}
+ * @param {any} options
+ * @returns {any} layout state
  */
-export function layoutGraph(graph, options) {
+function prepareLayout(graph, options) {
   const opts = isObject(options) ? options : {}
   const width = Math.max(1, numberOption(opts.width, 900))
   const height = Math.max(1, numberOption(opts.height, 600))
@@ -585,9 +1334,11 @@ export function layoutGraph(graph, options) {
   }
 
   const count = ids.length
-  if (count === 0) return []
+  if (count === 0) {
+    return { empty: true, single: false, count: 0, ids, width, height, iterations: 0, seed, padding }
+  }
   if (count === 1) {
-    return [{ id: ids[0], x: width / 2, y: height / 2, vx: 0, vy: 0 }]
+    return { empty: false, single: true, count: 1, ids, width, height, iterations: 0, seed, padding }
   }
 
   const adjacency = []
@@ -664,16 +1415,61 @@ export function layoutGraph(graph, options) {
     }
   }
 
-  // --- force pass -----------------------------------------------------------
   const exactRepulsion = count <= 420
   const sampleCount = Math.min(count - 1, 28)
-  const repulsionScale = exactRepulsion ? 1 : (count - 1) / sampleCount
-  const edgeStride = usableEdges.length > 30000 ? Math.ceil(usableEdges.length / 30000) : 1
-  const dispX = new Float64Array(count)
-  const dispY = new Float64Array(count)
-  const startTemperature = ideal * 0.9
 
-  for (let iteration = 0; iteration < iterations; iteration += 1) {
+  return {
+    empty: false,
+    single: false,
+    count,
+    ids,
+    width,
+    height,
+    iterations,
+    seed,
+    padding,
+    usableEdges,
+    componentOf,
+    centerX,
+    centerY,
+    xs,
+    ys,
+    exactRepulsion,
+    sampleCount,
+    repulsionScale: exactRepulsion ? 1 : (count - 1) / sampleCount,
+    edgeStride: usableEdges.length > 30000 ? Math.ceil(usableEdges.length / 30000) : 1,
+    dispX: new Float64Array(count),
+    dispY: new Float64Array(count),
+    startTemperature: ideal * 0.9,
+    ideal,
+  }
+}
+
+/**
+ * Run the Fruchterman-Reingold style force pass for iterations [from, to).
+ * The body is the single source of truth shared by the one-shot layout and the
+ * stepped layout task, which is what makes them mathematically identical.
+ */
+function runLayoutIterations(state, from, to) {
+  const count = state.count
+  const xs = state.xs
+  const ys = state.ys
+  const usableEdges = state.usableEdges
+  const edgeStride = state.edgeStride
+  const ideal = state.ideal
+  const componentOf = state.componentOf
+  const centerX = state.centerX
+  const centerY = state.centerY
+  const dispX = state.dispX
+  const dispY = state.dispY
+  const exactRepulsion = state.exactRepulsion
+  const sampleCount = state.sampleCount
+  const repulsionScale = state.repulsionScale
+  const startTemperature = state.startTemperature
+  const seed = state.seed
+  const iterations = state.iterations
+
+  for (let iteration = from; iteration < to; iteration += 1) {
     dispX.fill(0)
     dispY.fill(0)
 
@@ -782,8 +1578,18 @@ export function layoutGraph(graph, options) {
       if (Number.isFinite(nextY)) ys[i] = nextY
     }
   }
+}
 
-  // --- fit into the padded box ---------------------------------------------
+/** Scale and centre the solved coordinates into the padded box. */
+function finalizeLayout(state) {
+  const count = state.count
+  const xs = state.xs
+  const ys = state.ys
+  const ids = state.ids
+  const width = state.width
+  const height = state.height
+  const padding = state.padding
+
   let minX = Infinity
   let maxX = -Infinity
   let minY = Infinity
@@ -824,4 +1630,93 @@ export function layoutGraph(graph, options) {
     result[i] = { id: ids[i], x, y, vx: 0, vy: 0 }
   }
   return result
+}
+
+function singlePoint(state) {
+  return [{ id: state.ids[0], x: state.width / 2, y: state.height / 2, vx: 0, vy: 0 }]
+}
+
+/**
+ * Deterministic force-directed layout in a width x height box.
+ *
+ * The graph is split into connected components, components are seeded on a
+ * grid of cells (so they cannot collapse onto each other), and each cell gets
+ * a phyllotaxis seed. A Fruchterman-Reingold style pass then runs with:
+ *   - attractive forces along edges,
+ *   - repulsive forces between nodes (exact for small graphs, deterministic
+ *     sampling for large ones so 1200 nodes stay interactive),
+ *   - a weak pull towards the component's grid cell centre,
+ *   - a linear cooling schedule and a per-iteration displacement cap.
+ * The result is finally scaled and centred into the padded box.
+ *
+ * Same graph + same seed => byte-identical positions.
+ *
+ * @param {any} graph
+ * @param {{width?: number, height?: number, iterations?: number, seed?: number, padding?: number}} [options]
+ * @returns {{id: string, x: number, y: number, vx: number, vy: number}[]}
+ */
+export function layoutGraph(graph, options) {
+  const state = prepareLayout(graph, options)
+  if (state.empty) return []
+  if (state.single) return singlePoint(state)
+  runLayoutIterations(state, 0, state.iterations)
+  return finalizeLayout(state)
+}
+
+/**
+ * Chunked, cancellable layout task used when layout must not block the main
+ * thread (design §3.4). It shares `prepareLayout` / `runLayoutIterations` /
+ * `finalizeLayout` with `layoutGraph`, so running it to completion yields
+ * mathematically identical positions (same seed, iteration order and sampling
+ * decisions; a Node test asserts deep equality).
+ *
+ * @param {any} graph
+ * @param {{width?: number, height?: number, iterations?: number, seed?: number, padding?: number}} [options]
+ * @returns {{step: (maxMillis?: number) => {done: boolean, progress: number, canceled?: boolean},
+ *            result: () => any[]|null, cancel: () => void}}
+ */
+export function createLayoutTask(graph, options) {
+  const state = prepareLayout(graph, options)
+  let next = 0
+  let done = state.empty || state.single || state.iterations === 0
+  let positions = null
+  if (state.empty) positions = []
+  else if (state.single) positions = singlePoint(state)
+  else if (done) positions = finalizeLayout(state)
+  let progress = done ? 1 : 0
+  let canceled = false
+
+  function step(maxMillis) {
+    if (canceled) return { done: true, progress: 1, canceled: true }
+    if (done) return { done: true, progress: 1 }
+    const budget = typeof maxMillis === 'number' && Number.isFinite(maxMillis) ? maxMillis : 8
+    const started = layoutNow()
+    while (next < state.iterations) {
+      runLayoutIterations(state, next, next + 1)
+      next += 1
+      if (budget <= 0) break
+      if (layoutNow() - started >= budget) break
+    }
+    progress = Math.min(1, next / state.iterations)
+    if (next >= state.iterations) {
+      positions = finalizeLayout(state)
+      done = true
+      progress = 1
+      return { done: true, progress }
+    }
+    return { done: false, progress }
+  }
+
+  function result() {
+    return positions
+  }
+
+  function cancel() {
+    canceled = true
+    done = true
+    progress = 1
+    positions = null
+  }
+
+  return { step, result, cancel }
 }

@@ -188,3 +188,93 @@ test('the bundle has no leftover module syntax', () => {
   assert.equal(/^\s*import\s/m.test(source), false, 'client.js must not contain ES module imports')
   assert.equal(source.includes('React.createElement'), true)
 })
+
+test('the bundle embeds the background worker source', () => {
+  const source = readFileSync(bundlePath, 'utf8')
+  assert.equal(source.includes('ONTOLOGY_WORKER_SOURCE'), true, 'client.js must embed the worker source constant')
+  assert.equal(source.includes('self.onmessage'), true, 'the embedded worker source must install a message handler')
+  assert.equal(source.includes('worker-entry.js'), true, 'the worker source is generated from src/worker-entry.js')
+  // The worker source is a string literal inside the factory, never a second request.
+  assert.equal(/importScripts\s*\(/.test(source), false, 'the worker must not load extra scripts')
+})
+
+test('locale dictionaries carry the new structured UI keys', () => {
+  const definition = loadBundle()
+  const plugin = definition.factory(() => fakeReact())
+  const { ctx, record } = recordingContext()
+  plugin.apply(ctx)
+  const { dictionaries } = record.localeNamespaces[0]
+  for (const locale of ['zh', 'en']) {
+    for (const key of ['viewer.filters', 'viewer.explore', 'viewer.truncation', 'state.degraded', 'diag.triple-limit']) {
+      assert.equal(typeof dictionaries[locale][key], 'string', `missing ${locale} ${key}`)
+    }
+  }
+})
+
+/** Extract the embedded worker source string from the built bundle. */
+function embeddedWorkerSource(source) {
+  const marker = 'const ONTOLOGY_WORKER_SOURCE = '
+  const start = source.indexOf(marker)
+  assert.ok(start >= 0, 'client.js must declare ONTOLOGY_WORKER_SOURCE')
+  const quote = source.indexOf('"', start + marker.length)
+  assert.ok(quote >= 0, 'worker source must be a JSON string literal')
+  let escaped = false
+  for (let index = quote + 1; index < source.length; index += 1) {
+    const character = source[index]
+    if (escaped) {
+      escaped = false
+    } else if (character === '\\') {
+      escaped = true
+    } else if (character === '"') {
+      return JSON.parse(source.slice(quote, index + 1))
+    }
+  }
+  throw new Error('unterminated ONTOLOGY_WORKER_SOURCE literal')
+}
+
+test('embedded worker source runs compute and relayout successfully', () => {
+  const workerSource = embeddedWorkerSource(readFileSync(bundlePath, 'utf8'))
+  assert.match(workerSource, /self\.onmessage/)
+  assert.equal(/^\s*export\s/m.test(workerSource), false)
+  assert.equal(/^\s*import\s/m.test(workerSource), false)
+
+  const outbox = []
+  const self = {
+    postMessage: (message) => outbox.push(message),
+    onmessage: null,
+  }
+  const sandbox = { self, console, TextDecoder, TextEncoder, Date, Math, JSON, Float64Array }
+  vm.createContext(sandbox)
+  vm.runInContext(workerSource, sandbox, { filename: 'ontology-worker.js' })
+  assert.equal(typeof self.onmessage, 'function', 'worker must install self.onmessage')
+
+  self.onmessage({
+    data: {
+      type: 'compute',
+      id: 'test-1',
+      text: '@prefix ex: <http://example.org/> . ex:a ex:b ex:c . ex:a ex:label "hello" .',
+      resourceAddress: 'file:///data/sample.ttl',
+      displayName: 'sample.ttl',
+      limits: { maxTriples: 1000, maxNodes: 100, maxEdges: 100, maxLiteralsPerNode: 10, maxLiteralLength: 4096, maxDepth: 64 },
+      layout: { width: 400, height: 300, seed: 1, iterations: 10 },
+    },
+  })
+
+  const graphMessage = outbox.find((message) => message.type === 'graph')
+  assert.ok(graphMessage, 'worker must answer with a graph message')
+  assert.equal(graphMessage.id, 'test-1')
+  assert.equal(graphMessage.graph.nodes.length, 2)
+  assert.equal(graphMessage.graph.source.address, 'file:///data/sample.ttl')
+  assert.equal(graphMessage.baseSource, 'resource')
+
+  const layoutMessage = outbox.find((message) => message.type === 'layout')
+  assert.ok(layoutMessage, 'worker must answer with a layout message')
+  assert.ok(layoutMessage.positions instanceof Float64Array)
+  assert.equal(layoutMessage.positions.length, graphMessage.graph.nodes.length * 2)
+
+  outbox.length = 0
+  self.onmessage({ data: { type: 'relayout', id: 'test-1', width: 500, height: 320, seed: 2, iterations: 10 } })
+  const relayout = outbox.find((message) => message.type === 'layout')
+  assert.ok(relayout, 'relayout must reuse the cached graph')
+  assert.equal(relayout.positions.length, graphMessage.graph.nodes.length * 2)
+})

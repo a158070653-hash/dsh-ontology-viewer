@@ -1,0 +1,40 @@
+schema: spec-driven
+
+context: |
+  dsh-ontology-viewer 是 DeepSeek Harness（DSH）的 Web 插件，当前版本 1.0.0（Apache-2.0），
+  把 .ttl / .owl / .rdf / .jsonld / .nt / .n3 等 RDF / 本体文件在右侧栏渲染为可交互的只读图谱。
+  技术栈：Node.js >= 22；零运行时依赖；浏览器端单文件 Client 模块（src/*.js 经 build/build.mjs 拼成 client.js）；
+  React + SVG；手写 RDF 解析器与确定性力导向布局。
+  宿主扩展点：ctx.documentPreviews + sidebar.right.tab.document（DSH 原生预览，必需）；
+  ctx.betterSidebar（dsh-better-sidebar，可选）。
+  开发环境：DSH 创造模式；插件以 link: 方式安装在本机 desktop profile；DSH 工作区根可能与 Git 仓库根不同，
+  执行 OpenSpec 命令前先 cd 到 Git 仓库根。
+  硬约束：保持只读展示定位、零运行时依赖、现有解析格式与 DSH 原生预览兼容；
+  不修改 DSH 核心或全局 profile；不自动发版。
+
+rules:
+  proposal:
+    - 说明动机、可观察的行为变化，以及受影响的解析、建模、渲染、DSH 集成或构建范围。
+    - 明确 out of scope，尤其是版本发布、插件重装、归档与 UI 重设计。
+    - 不得把计划中的能力写成已实现；涉及新格式或新宿主扩展点时必须附代码或运行时证据。
+  design:
+    - 优先复用现有模块边界与 DSH 扩展点，并说明至少一个替代方案及其取舍。
+    - DSH API、Slot、Service、注册参数必须有运行时或当前有效文档依据；无法确认时标注待核验并停止实施。
+    - 涉及 client.js 生成方式、零运行时依赖、主题令牌、i18n 与确定性布局的决策必须写明。
+  specs:
+    - 使用 spec-driven 格式；requirement 用 SHALL 或 MUST 描述可观察行为，scenario 用 WHEN 与 THEN。
+    - 只写本次 change 的 delta，不复制主规格，不写未来扩展。
+    - capability 路径保持稳定且语义聚焦，不新建宽泛的 catch-all capability。
+  tasks:
+    - 按可独立验证的步骤拆分，覆盖源码修改、构建、测试、i18n 与必要的人工验收。
+    - 禁止创建 Archive 任务；归档只在人工明确要求后单独执行。
+    - 不把执行结果预先写成已完成；未运行的验证必须标注。
+
+operations:
+  apply:
+    guidance:
+      - 实施前读取 openspec/specs 与相关源码、测试，确认需求与当前真实行为一致。
+      - 修改 src/ 后运行 npm run build 并检查 client.js 与源码一致；不得手改 client.js。
+      - 按改动范围运行 npm run check 与 npm run i18n；未执行的验证不得声称通过。
+      - 需求与现有代码、已确认规格、DSH 运行时 API 或依赖关系冲突时停止实施并上报证据与方案，等待人工决策。
+      - 不自动修改 package.json 版本、不自动发布、不自动归档。

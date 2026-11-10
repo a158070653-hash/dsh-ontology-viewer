@@ -29,6 +29,10 @@ const ONTO_XSD_DOUBLE = ONTO_XSD_NS + 'double'
 const ONTO_XSD_BOOLEAN = ONTO_XSD_NS + 'boolean'
 const ONTO_XML_NS = 'http://www.w3.org/XML/1998/namespace'
 const ONTO_DEFAULT_MAX_TRIPLES = 100000
+const ONTO_DEFAULT_MAX_LITERAL_LENGTH = 16384
+const ONTO_DEFAULT_MAX_DEPTH = 256
+const ONTO_DEFAULT_MAX_DIAGNOSTICS = 200
+const ONTO_DIAGNOSTIC_SAMPLE_LIMIT = 3
 
 /* ------------------------------------------------------------------ */
 /* Small generic helpers                                              */
@@ -80,6 +84,13 @@ function ontoRdfMaxTriples(value) {
   return Math.floor(number)
 }
 
+function ontoRdfLimit(value, fallback) {
+  if (value === undefined || value === null) return fallback
+  const number = typeof value === 'number' ? value : Number(value)
+  if (!isFinite(number) || number < 0) return fallback
+  return Math.floor(number)
+}
+
 function ontoRdfIsAbsoluteIri(value) {
   return typeof value === 'string' && /^[A-Za-z][A-Za-z0-9+.-]*:/.test(value)
 }
@@ -89,7 +100,14 @@ function ontoRdfNormalizeIri(value, base, builder, line) {
   if (value.slice(0, 2) === '_:') return value
   if (ontoRdfIsAbsoluteIri(value)) return value
   if (base) return resolveIri(base, value)
-  if (builder) builder.warn('relative IRI "' + value + '" could not be resolved (no base)', line)
+  if (builder) {
+    builder.diagnose(
+      'base-unavailable',
+      'warning',
+      'relative IRI "' + value + '" could not be resolved (no base)',
+      line,
+    )
+  }
   return value
 }
 
@@ -116,14 +134,68 @@ function ontoRdfEncodeFilePath(path) {
     .replace(/\?/g, '%3F')
 }
 
-function ontoRdfFileBase(fileName) {
-  if (typeof fileName !== 'string' || fileName.trim() === '') return ''
-  let name = fileName.trim().replace(/\\/g, '/')
-  if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(name)) return name
-  if (name.slice(0, 5).toLowerCase() === 'file:') return name
-  if (name.charAt(0) === '/') return 'file://' + ontoRdfEncodeFilePath(name)
-  if (/^[A-Za-z]:\//.test(name)) return 'file:///' + ontoRdfEncodeFilePath(name)
-  return 'file:///' + ontoRdfEncodeFilePath(name)
+/* ------------------------------------------------------------------ */
+/* Resource address mapping (display name is never an identity)        */
+/* ------------------------------------------------------------------ */
+
+const ONTO_WINDOWS_DRIVE_PATH = /^[A-Za-z]:[\\/]/
+
+function ontoRdfStripFragment(value) {
+  const hash = value.indexOf('#')
+  return hash < 0 ? value : value.slice(0, hash)
+}
+
+/**
+ * Map a real resource address to an RDF base IRI, or null when it cannot be
+ * mapped reliably. `resourceAddress` is not guaranteed to be a file URI: the
+ * host may hand us an http(s) URL, a custom-scheme address, or a plain file
+ * path from a different integration. A display file name is a relative path
+ * and is therefore never mapped.
+ */
+function ontoRdfMapResourceAddress(address) {
+  if (typeof address !== 'string') return null
+  const value = address.trim()
+  if (value === '') return null
+  if (ONTO_WINDOWS_DRIVE_PATH.test(value)) {
+    return 'file:///' + ontoRdfEncodeFilePath(value.replace(/\\/g, '/'))
+  }
+  if (value.slice(0, 2) === '\\\\') {
+    return 'file://' + ontoRdfEncodeFilePath(value.replace(/\\/g, '/'))
+  }
+  if (value.charAt(0) === '/') {
+    return 'file://' + ontoRdfEncodeFilePath(value)
+  }
+  if (!ontoRdfIsAbsoluteIri(value)) return null
+  const parts = ontoRdfParseIri(value)
+  const scheme = typeof parts.scheme === 'string' ? parts.scheme.toLowerCase() : ''
+  if (scheme === 'http' || scheme === 'https' || scheme === 'file') {
+    return ontoRdfStripFragment(value)
+  }
+  // Custom schemes are used verbatim only when they form an absolute
+  // hierarchical URI; otherwise we refuse to guess and report no base.
+  if (parts.authority !== undefined || parts.path.charAt(0) === '/') {
+    return ontoRdfStripFragment(value)
+  }
+  return null
+}
+
+/**
+ * Initial base for one parse: document declarations may override it later.
+ * @returns {{ base: string, source: 'document'|'resource'|'none' }}
+ */
+function ontoRdfInitialBase(options) {
+  const opts = options || {}
+  if (opts.resourceAddress !== undefined && opts.resourceAddress !== null) {
+    const mapped = ontoRdfMapResourceAddress(opts.resourceAddress)
+    if (mapped) return { base: mapped, source: 'resource' }
+    return { base: '', source: 'none' }
+  }
+  // Legacy compatibility for library callers that passed a real path as
+  // `fileName`: only address-like values still contribute a base. A bare
+  // display name MUST NOT fabricate a `file:///` identity.
+  const legacy = ontoRdfMapResourceAddress(opts.fileName)
+  if (legacy) return { base: legacy, source: 'resource' }
+  return { base: '', source: 'none' }
 }
 
 /* ------------------------------------------------------------------ */
@@ -136,11 +208,20 @@ class OntoRdfBuilder {
     this.format = format
     this.text = typeof text === 'string' ? text : ''
     this.maxTriples = ontoRdfMaxTriples(opts.maxTriples)
+    this.maxLiteralLength = ontoRdfLimit(opts.maxLiteralLength, ONTO_DEFAULT_MAX_LITERAL_LENGTH)
+    this.maxDepth = ontoRdfLimit(opts.maxDepth, ONTO_DEFAULT_MAX_DEPTH)
+    this.maxDiagnostics = ontoRdfLimit(opts.maxDiagnostics, ONTO_DEFAULT_MAX_DIAGNOSTICS)
     this.triples = []
     this.prefixes = {}
     this.base = ''
+    this.baseSource = 'none'
     this.warnings = []
     this.errors = []
+    this.diagnostics = []
+    this.diagnosticIndex = Object.create(null)
+    this.rawMessageCount = 0
+    this.suppressedMessages = 0
+    this.suppressedSamples = []
     this.truncated = false
     this.blankCounter = 0
     this.usedBlankLabels = Object.create(null)
@@ -153,23 +234,75 @@ class OntoRdfBuilder {
     return ontoRdfLineAt(this.lineIndex, index)
   }
 
+  /** Append one raw message, honouring the retained-message cap. */
+  pushRaw(severity, message, line) {
+    const text = ontoRdfFormatDiagnostic(message, line)
+    if (this.rawMessageCount >= this.maxDiagnostics) {
+      this.suppressedMessages++
+      if (this.suppressedSamples.length < ONTO_DIAGNOSTIC_SAMPLE_LIMIT) {
+        this.suppressedSamples.push(text)
+      }
+      return
+    }
+    this.rawMessageCount++
+    if (severity === 'error') this.errors.push(text)
+    else this.warnings.push(text)
+  }
+
   warn(message, line) {
-    this.warnings.push(ontoRdfFormatDiagnostic(message, line))
+    this.pushRaw('warning', message, line)
   }
 
   error(message, line) {
-    this.errors.push(ontoRdfFormatDiagnostic(message, line))
+    this.pushRaw('error', message, line)
+  }
+
+  /**
+   * Record one classified diagnostic and its raw message. Aggregates by code:
+   * `count` accumulates every occurrence while `sample` keeps at most three.
+   */
+  diagnose(code, severity, message, line) {
+    const level = severity === 'error' ? 'error' : 'warning'
+    const text = ontoRdfFormatDiagnostic(message, line)
+    let entry = this.diagnosticIndex[code]
+    if (!entry) {
+      entry = { code: code, severity: level, message: message, count: 0, sample: [] }
+      this.diagnosticIndex[code] = entry
+      this.diagnostics.push(entry)
+    }
+    entry.count++
+    if (entry.sample.length < ONTO_DIAGNOSTIC_SAMPLE_LIMIT) entry.sample.push(text)
+    this.pushRaw(level, message, line)
+    return entry
   }
 
   add(subject, predicate, object, objectKind, datatype, language) {
     if (this.triples.length >= this.maxTriples) {
       if (!this.truncated) {
         this.truncated = true
-        this.warn('triple limit of ' + this.maxTriples + ' reached; remaining triples were skipped')
+        this.diagnose(
+          'triple-limit',
+          'warning',
+          'triple limit of ' + this.maxTriples + ' reached; remaining triples were skipped',
+        )
       }
       return false
     }
-    const triple = { s: subject, p: predicate, o: object, oKind: objectKind || 'iri' }
+    let term = object
+    let literalTruncated = false
+    if ((objectKind || 'iri') === 'literal' && typeof term === 'string' &&
+      term.length > this.maxLiteralLength) {
+      literalTruncated = true
+      this.diagnose(
+        'literal-limit',
+        'warning',
+        'literal value of ' + term.length + ' characters was truncated to ' +
+          this.maxLiteralLength + ' characters',
+      )
+      term = term.slice(0, this.maxLiteralLength)
+    }
+    const triple = { s: subject, p: predicate, o: term, oKind: objectKind || 'iri' }
+    if (literalTruncated) triple.literalTruncated = true
     if (datatype !== undefined) triple.dt = datatype
     if (language !== undefined) triple.lang = language
     this.triples.push(triple)
@@ -203,17 +336,35 @@ class OntoRdfBuilder {
       predicates.add(triple.p)
       objects.add(triple.o)
     }
+    if (this.suppressedMessages > 0) {
+      const message = this.suppressedMessages + ' diagnostic message' +
+        (this.suppressedMessages === 1 ? '' : 's') +
+        ' were suppressed after the limit of ' + this.maxDiagnostics
+      this.diagnostics.push({
+        code: 'diagnostics-truncated',
+        severity: 'warning',
+        message: message,
+        count: this.suppressedMessages,
+        sample: this.suppressedSamples.slice(),
+      })
+    }
     return {
       format: this.format,
       prefixes: this.prefixes,
-      base: this.base,
+      base: this.base || '',
+      baseSource: this.baseSource || 'none',
       triples: this.triples,
       stats: {
         tripleCount: this.triples.length,
         subjectCount: subjects.size,
         predicateCount: predicates.size,
         objectCount: objects.size,
+        truncated: this.truncated,
+        truncation: this.truncated
+          ? { reason: 'triple-limit', limit: this.maxTriples, kept: this.triples.length }
+          : null,
       },
+      diagnostics: this.diagnostics,
       warnings: this.warnings,
       errors: this.errors,
     }
@@ -484,8 +635,11 @@ class OntoTurtleParser {
     this.source = this.builder.text
     this.length = this.source.length
     this.pos = 0
-    this.base = ontoRdfFileBase(opts.fileName)
-    this.builder.base = this.base
+    const initial = ontoRdfInitialBase(opts)
+    this.base = initial.base
+    this.builder.base = initial.base
+    this.builder.baseSource = initial.source
+    this.depth = 0
     this.prefixes = this.builder.prefixes
     if (opts.prefixes && typeof opts.prefixes === 'object') {
       const keys = Object.keys(opts.prefixes)
@@ -657,7 +811,14 @@ class OntoTurtleParser {
     let value = iri
     if (!ontoRdfIsAbsoluteIri(value)) {
       if (this.base) value = resolveIri(this.base, value)
-      else this.builder.warn('prefix IRI "' + iri + '" is relative and no base is available', this.lineAt(index))
+      else {
+        this.builder.diagnose(
+          'base-unavailable',
+          'warning',
+          'prefix IRI "' + iri + '" is relative and no base is available',
+          this.lineAt(index),
+        )
+      }
     }
     this.prefixes[prefix] = value
   }
@@ -665,11 +826,93 @@ class OntoTurtleParser {
   setBase(iri, index) {
     let value = iri
     if (!ontoRdfIsAbsoluteIri(value)) {
-      if (this.base) value = resolveIri(this.base, value)
-      else this.builder.warn('@base "' + iri + '" is relative and no base is available', this.lineAt(index))
+      if (this.base) {
+        value = resolveIri(this.base, value)
+      } else {
+        this.builder.diagnose(
+          'base-unavailable',
+          'warning',
+          '@base "' + iri + '" is relative and no base is available',
+          this.lineAt(index),
+        )
+        return
+      }
     }
     this.base = value
     this.builder.base = value
+    if (value !== '') this.builder.baseSource = 'document'
+  }
+
+  /** Record that a TriG graph label was recognised and ignored. */
+  noteNamedGraph(label, index) {
+    const name = typeof label === 'string' && label !== '' ? label : 'anonymous graph'
+    this.builder.diagnose(
+      'named-graph-ignored',
+      'warning',
+      'named graph "' + name + '" was ignored; its triples were kept in the default graph',
+      this.lineAt(index),
+    )
+  }
+
+  /** Skip one balanced bracket construct without recursing (depth-limit escape). */
+  skipBalanced(openCharacter, closeCharacter) {
+    if (this.peek() !== openCharacter) return
+    this.pos++
+    let depth = 1
+    while (this.pos < this.length) {
+      const character = this.peek()
+      if (character === '\\') {
+        this.pos += 2
+        continue
+      }
+      if (character === '#') {
+        const newline = this.source.indexOf('\n', this.pos)
+        this.pos = newline < 0 ? this.length : newline + 1
+        continue
+      }
+      if (character === '"' || character === "'") {
+        const quote = character
+        const long = this.peek(1) === quote && this.peek(2) === quote
+        this.pos += long ? 3 : 1
+        while (this.pos < this.length) {
+          if (this.source[this.pos] === '\\') {
+            this.pos += 2
+            continue
+          }
+          if (long) {
+            if (this.source[this.pos] === quote && this.source[this.pos + 1] === quote &&
+              this.source[this.pos + 2] === quote) {
+              this.pos += 3
+              break
+            }
+          } else if (this.source[this.pos] === quote) {
+            this.pos++
+            break
+          }
+          this.pos++
+        }
+        continue
+      }
+      if (character === openCharacter) {
+        depth++
+      } else if (character === closeCharacter) {
+        depth--
+        this.pos++
+        if (depth === 0) return
+        continue
+      }
+      this.pos++
+    }
+  }
+
+  noteNestingLimit(index) {
+    this.builder.diagnose(
+      'nesting-limit',
+      'error',
+      'nesting depth limit of ' + this.builder.maxDepth +
+        ' reached; the nested branch was skipped',
+      this.lineAt(index),
+    )
   }
 
   /* ---------------------------- tokens ----------------------------- */
@@ -858,6 +1101,7 @@ class OntoTurtleParser {
         continue
       }
       this.parseTriples()
+      if (this.builder.truncated) break
       this.skipWhitespace()
       if (this.atEnd()) break
       if (this.peek() === '.') {
@@ -882,6 +1126,7 @@ class OntoTurtleParser {
       this.pos = end + 1
       this.skipWhitespace()
       if (this.peek() === '{') {
+        this.noteNamedGraph(this.source.slice(save, end + 1), save)
         this.pos++
         return true
       }
@@ -890,9 +1135,11 @@ class OntoTurtleParser {
     }
     if (this.peek() === '_' && this.peek(1) === ':') {
       this.pos += 2
+      const labelStart = save
       while (!this.atEnd() && !this.isNameDelimiter(this.peek())) this.pos++
       this.skipWhitespace()
       if (this.peek() === '{') {
+        this.noteNamedGraph(this.source.slice(labelStart, this.pos).trim(), save)
         this.pos++
         return true
       }
@@ -903,20 +1150,32 @@ class OntoTurtleParser {
     if (word.toLowerCase() === 'graph' && ontoRdfIsWhitespace(this.source[this.pos + word.length])) {
       this.pos += word.length
       this.skipWhitespace()
+      let label = ''
       if (this.peek() === '<') {
-        this.readIriReference()
-      } else if (this.peek() === '_' && this.peek(1) === ':') {
-        this.pos += 2
-        while (!this.atEnd() && !this.isNameDelimiter(this.peek())) this.pos++
-      } else {
-        const label = this.readNameToken()
-        if (!label.value) {
+        const labelStart = this.pos
+        const end = this.findIriEnd(labelStart)
+        if (end < 0) {
           this.pos = save
           return false
         }
+        this.readIriReference()
+        label = this.source.slice(labelStart, end + 1)
+      } else if (this.peek() === '_' && this.peek(1) === ':') {
+        const labelStart = this.pos
+        this.pos += 2
+        while (!this.atEnd() && !this.isNameDelimiter(this.peek())) this.pos++
+        label = this.source.slice(labelStart, this.pos)
+      } else {
+        const labelToken = this.readNameToken()
+        if (!labelToken.value) {
+          this.pos = save
+          return false
+        }
+        label = labelToken.value
       }
       this.skipWhitespace()
       if (this.peek() === '{') {
+        this.noteNamedGraph(label, save)
         this.pos++
         return true
       }
@@ -926,6 +1185,7 @@ class OntoTurtleParser {
     const token = this.readNameToken()
     this.skipWhitespace()
     if (token.value && this.peek() === '{') {
+      this.noteNamedGraph(token.value, save)
       this.pos++
       return true
     }
@@ -1054,6 +1314,7 @@ class OntoTurtleParser {
   parsePredicateObjectList(subject) {
     let found = false
     while (true) {
+      if (this.builder.truncated) break
       this.skipWhitespace()
       if (this.atEnd()) break
       const character = this.peek()
@@ -1076,9 +1337,9 @@ class OntoTurtleParser {
   parseObjectList(subject, predicate) {
     while (true) {
       const object = this.parseObject()
-      this.builder.add(subject, predicate, object.term, object.kind, object.dt, object.lang)
+      const added = this.builder.add(subject, predicate, object.term, object.kind, object.dt, object.lang)
       this.skipWhitespace()
-      if (this.peek() !== ',') break
+      if (!added || this.peek() !== ',') break
       this.pos++
       this.skipWhitespace()
     }
@@ -1086,45 +1347,67 @@ class OntoTurtleParser {
 
   parseBlankNodePropertyList() {
     const start = this.pos
-    this.pos++
-    const node = this.builder.freshBlank()
-    this.skipWhitespace()
-    if (this.peek() === ']') {
+    if (this.depth >= this.builder.maxDepth) {
+      this.noteNestingLimit(start)
+      this.skipBalanced('[', ']')
+      return this.builder.freshBlank()
+    }
+    this.depth++
+    try {
+      this.pos++
+      const node = this.builder.freshBlank()
+      this.skipWhitespace()
+      if (this.peek() === ']') {
+        this.pos++
+        return node
+      }
+      this.parsePredicateObjectList(node)
+      if (this.builder.truncated) return node
+      this.skipWhitespace()
+      if (this.peek() !== ']') this.fatal("expected ']' to close the blank node property list", this.pos)
       this.pos++
       return node
+    } finally {
+      this.depth--
     }
-    this.parsePredicateObjectList(node)
-    this.skipWhitespace()
-    if (this.peek() !== ']') this.fatal("expected ']' to close the blank node property list", this.pos)
-    this.pos++
-    return node
   }
 
   parseCollection() {
     const start = this.pos
-    this.pos++
-    this.skipWhitespace()
-    if (this.peek() === ')') {
-      this.pos++
+    if (this.depth >= this.builder.maxDepth) {
+      this.noteNestingLimit(start)
+      this.skipBalanced('(', ')')
       return ONTO_RDF_NIL
     }
-    const head = this.builder.freshBlank()
-    let current = head
-    while (true) {
-      const item = this.parseObject()
-      this.builder.add(current, ONTO_RDF_FIRST, item.term, item.kind, item.dt, item.lang)
+    this.depth++
+    try {
+      this.pos++
       this.skipWhitespace()
       if (this.peek() === ')') {
         this.pos++
-        this.builder.add(current, ONTO_RDF_REST, ONTO_RDF_NIL, 'iri')
-        break
+        return ONTO_RDF_NIL
       }
-      if (this.peek() === undefined) this.fatal('unterminated RDF collection', start)
-      const next = this.builder.freshBlank()
-      this.builder.add(current, ONTO_RDF_REST, next, 'blank')
-      current = next
+      const head = this.builder.freshBlank()
+      let current = head
+      while (true) {
+        const item = this.parseObject()
+        const added = this.builder.add(current, ONTO_RDF_FIRST, item.term, item.kind, item.dt, item.lang)
+        if (!added) return head
+        this.skipWhitespace()
+        if (this.peek() === ')') {
+          this.pos++
+          this.builder.add(current, ONTO_RDF_REST, ONTO_RDF_NIL, 'iri')
+          break
+        }
+        if (this.peek() === undefined) this.fatal('unterminated RDF collection', start)
+        const next = this.builder.freshBlank()
+        this.builder.add(current, ONTO_RDF_REST, next, 'blank')
+        current = next
+      }
+      return head
+    } finally {
+      this.depth--
     }
-    return head
   }
 }
 
@@ -1137,8 +1420,10 @@ class OntoNTriplesParser {
     const opts = options || {}
     this.builder = new OntoRdfBuilder('ntriples', ontoRdfNormalizeText(text), opts)
     this.source = this.builder.text
-    this.base = ontoRdfFileBase(opts.fileName)
-    this.builder.base = this.base
+    const initial = ontoRdfInitialBase(opts)
+    this.base = initial.base
+    this.builder.base = initial.base
+    this.builder.baseSource = initial.source
   }
 
   parse() {
@@ -1272,9 +1557,10 @@ class OntoNTriplesParser {
       else fail('expected an object')
 
       skip()
+      let graphLabel
       if (line[pos] === '<' || (line[pos] === '_' && line[pos + 1] === ':')) {
-        if (line[pos] === '<') readIri()
-        else readBlank()
+        if (line[pos] === '<') graphLabel = readIri()
+        else graphLabel = readBlank()
         skip()
       }
 
@@ -1285,6 +1571,14 @@ class OntoNTriplesParser {
         builder.warn('extra content after the statement was ignored', lineNumber)
       }
 
+      if (graphLabel !== undefined) {
+        builder.diagnose(
+          'named-graph-ignored',
+          'warning',
+          'graph term "' + graphLabel + '" was ignored; N-Quads datasets are not supported',
+          lineNumber,
+        )
+      }
       builder.add(subject, predicate, object.term, object.kind, object.dt, object.lang)
     } catch (error) {
       if (error && error.ontoRdfFatal) return
@@ -1351,34 +1645,46 @@ function ontoRdfXmlSplitName(qname) {
   return { prefix: qname.slice(0, colon), local: qname.slice(colon + 1) }
 }
 
-function ontoRdfXmlResolveNamespaces(element, inherited) {
-  const namespaces = Object.assign({}, inherited)
-  const keys = Object.keys(element.attrs)
-  for (let i = 0; i < keys.length; i++) {
-    const key = keys[i]
-    if (key === 'xmlns') {
-      if (element.attrs[key]) namespaces[''] = element.attrs[key]
-      else delete namespaces['']
-    } else if (key.slice(0, 6) === 'xmlns:') {
-      const prefix = key.slice(6)
-      if (element.attrs[key]) namespaces[prefix] = element.attrs[key]
-      else delete namespaces[prefix]
-    }
-  }
-  element.namespaces = namespaces
-  for (let i = 0; i < element.children.length; i++) {
-    ontoRdfXmlResolveNamespaces(element.children[i], namespaces)
-  }
-}
-
 class OntoRdfXmlParser {
   constructor(text, options) {
     const opts = options || {}
     this.builder = new OntoRdfBuilder('rdfxml', ontoRdfNormalizeText(text), opts)
     this.source = this.builder.text
-    this.fileBase = ontoRdfFileBase(opts.fileName)
-    this.builder.base = this.fileBase
+    const initial = ontoRdfInitialBase(opts)
+    this.initialBase = initial.base
+    this.initialBaseSource = initial.source
+    this.builder.base = initial.base
+    this.builder.baseSource = initial.source
+    this.depth = 0
     this.warnedReification = false
+    this.warnedMultipleObjectsSubjects = Object.create(null)
+  }
+
+  /** Resolve xmlns declarations iteratively so deep XML cannot overflow the stack. */
+  resolveNamespaces(root) {
+    const stack = [{ element: root, inherited: {}, depth: 0 }]
+    while (stack.length > 0) {
+      const frame = stack.pop()
+      const element = frame.element
+      const namespaces = Object.assign({}, frame.inherited)
+      const keys = Object.keys(element.attrs)
+      for (let i = 0; i < keys.length; i++) {
+        const key = keys[i]
+        if (key === 'xmlns') {
+          if (element.attrs[key]) namespaces[''] = element.attrs[key]
+          else delete namespaces['']
+        } else if (key.slice(0, 6) === 'xmlns:') {
+          const prefix = key.slice(6)
+          if (element.attrs[key]) namespaces[prefix] = element.attrs[key]
+          else delete namespaces[prefix]
+        }
+      }
+      element.namespaces = namespaces
+      if (frame.depth >= this.builder.maxDepth) continue
+      for (let i = element.children.length - 1; i >= 0; i--) {
+        stack.push({ element: element.children[i], inherited: namespaces, depth: frame.depth + 1 })
+      }
+    }
   }
 
   parse() {
@@ -1685,23 +1991,32 @@ class OntoRdfXmlParser {
 
   contextFor(element, parent) {
     let base = parent.base || ''
+    let baseSource = parent.baseSource || 'none'
     const xmlBase = this.getAttribute(element, ONTO_XML_NS + 'base')
     if (xmlBase !== undefined) {
       if (xmlBase === '') {
-        base = ''
+        // XML Base: an empty value keeps the base URI of the enclosing scope.
+        base = parent.base || ''
       } else if (ontoRdfIsAbsoluteIri(xmlBase)) {
         base = xmlBase
+        baseSource = 'document'
       } else if (base) {
         base = resolveIri(base, xmlBase)
+        baseSource = 'document'
       } else {
-        this.builder.warn('relative xml:base "' + xmlBase + '" has no base to resolve against', element.line)
-        base = xmlBase
+        this.builder.diagnose(
+          'base-unavailable',
+          'warning',
+          'relative xml:base "' + xmlBase + '" has no base to resolve against',
+          element.line,
+        )
+        base = ''
       }
     }
     let language = parent.language
     const xmlLang = this.getAttribute(element, ONTO_XML_NS + 'lang')
     if (xmlLang !== undefined) language = xmlLang === '' ? undefined : xmlLang.toLowerCase()
-    return { base: base, language: language }
+    return { base: base, language: language, baseSource: baseSource }
   }
 
   resolveTerm(value, base, line) {
@@ -1713,48 +2028,88 @@ class OntoRdfXmlParser {
       this.builder.warn('rdf:ID "' + value + '" is not a valid XML name', line)
     }
     if (!base) {
-      this.builder.warn('rdf:ID "' + value + '" cannot be resolved without a base IRI', line)
+      this.builder.diagnose(
+        'base-unavailable',
+        'warning',
+        'rdf:ID "' + value + '" cannot be resolved without a base IRI',
+        line,
+      )
       return '#' + value
     }
     return resolveIri(base, '#' + value)
   }
 
-  collectXmlPrefixes(element) {
-    const keys = Object.keys(element.attrs)
-    for (let i = 0; i < keys.length; i++) {
-      const key = keys[i]
-      if (key.slice(0, 6) !== 'xmlns:') continue
-      const prefix = key.slice(6)
-      const iri = element.attrs[key]
-      if (prefix && iri) this.builder.prefixes[prefix] = iri
-    }
-    for (let i = 0; i < element.children.length; i++) {
-      this.collectXmlPrefixes(element.children[i])
+  collectXmlPrefixes(root) {
+    const stack = [root]
+    while (stack.length > 0) {
+      const element = stack.pop()
+      const keys = Object.keys(element.attrs)
+      for (let i = 0; i < keys.length; i++) {
+        const key = keys[i]
+        if (key.slice(0, 6) !== 'xmlns:') continue
+        const prefix = key.slice(6)
+        const iri = element.attrs[key]
+        if (prefix && iri) this.builder.prefixes[prefix] = iri
+      }
+      for (let i = element.children.length - 1; i >= 0; i--) {
+        stack.push(element.children[i])
+      }
     }
   }
 
   mapDocument(root) {
-    ontoRdfXmlResolveNamespaces(root, {})
+    this.resolveNamespaces(root)
     this.collectXmlPrefixes(root)
     const iri = this.elementIri(root)
     if (!iri) {
       this.builder.error('cannot resolve the root element name <' + root.qname + '>', root.line)
       return
     }
-    const context = this.contextFor(root, { base: this.fileBase, language: undefined })
+    const context = this.contextFor(root, {
+      base: this.initialBase,
+      language: undefined,
+      baseSource: this.initialBaseSource,
+    })
     if (iri === ONTO_RDF_NS + 'RDF') {
       this.builder.base = context.base || ''
+      this.builder.baseSource = context.baseSource || 'none'
       for (let i = 0; i < root.children.length; i++) {
+        if (this.builder.truncated) break
         this.mapNodeElement(root.children[i], context)
       }
     } else {
       this.builder.base = context.base || ''
+      this.builder.baseSource = context.baseSource || 'none'
       this.mapNodeElement(root, context)
     }
   }
 
   mapNodeElement(element, parentContext) {
+    if (this.builder.truncated) return null
     const context = this.contextFor(element, parentContext)
+    if (this.depth >= this.builder.maxDepth) {
+      this.noteXmlNestingLimit(element)
+      return null
+    }
+    this.depth++
+    try {
+      return this.mapNodeElementBody(element, context)
+    } finally {
+      this.depth--
+    }
+  }
+
+  noteXmlNestingLimit(element) {
+    this.builder.diagnose(
+      'nesting-limit',
+      'error',
+      'XML nesting depth limit of ' + this.builder.maxDepth +
+        ' reached; the nested branch was skipped',
+      element.line,
+    )
+  }
+
+  mapNodeElementBody(element, context) {
     const nameIri = this.elementIri(element)
     if (!nameIri) {
       this.builder.error('cannot resolve the element name <' + element.qname + '>', element.line)
@@ -1762,7 +2117,9 @@ class OntoRdfXmlParser {
     }
     if (nameIri === ONTO_RDF_NS + 'RDF') {
       this.builder.base = context.base || ''
+      this.builder.baseSource = context.baseSource || 'none'
       for (let i = 0; i < element.children.length; i++) {
+        if (this.builder.truncated) break
         this.mapNodeElement(element.children[i], context)
       }
       return null
@@ -1811,6 +2168,7 @@ class OntoRdfXmlParser {
   mapChildProperties(element, subject, context) {
     let liIndex = 0
     for (let i = 0; i < element.children.length; i++) {
+      if (this.builder.truncated) break
       const child = element.children[i]
       let predicate = this.elementIri(child)
       if (!predicate) {
@@ -1826,7 +2184,21 @@ class OntoRdfXmlParser {
   }
 
   mapPropertyElement(element, subject, predicate, parentContext) {
+    if (this.builder.truncated) return
     const context = this.contextFor(element, parentContext)
+    if (this.depth >= this.builder.maxDepth) {
+      this.noteXmlNestingLimit(element)
+      return
+    }
+    this.depth++
+    try {
+      this.mapPropertyElementBody(element, subject, predicate, context)
+    } finally {
+      this.depth--
+    }
+  }
+
+  mapPropertyElementBody(element, subject, predicate, context) {
     const parseType = this.getAttribute(element, ONTO_RDF_NS + 'parseType')
     const resource = this.getAttribute(element, ONTO_RDF_NS + 'resource')
     const nodeId = this.getAttribute(element, ONTO_RDF_NS + 'nodeID')
@@ -1835,7 +2207,12 @@ class OntoRdfXmlParser {
 
     if (id !== undefined && !this.warnedReification) {
       this.warnedReification = true
-      this.builder.warn('rdf:ID reification is not implemented; the statement itself was kept', element.line)
+      this.builder.diagnose(
+        'rdfxml-reification-ignored',
+        'warning',
+        'rdf:ID reification is not implemented; the statement itself was kept',
+        element.line,
+      )
     }
 
     if (parseType === 'Resource') {
@@ -1859,7 +2236,12 @@ class OntoRdfXmlParser {
     }
 
     if (parseType !== undefined && parseType !== '') {
-      this.builder.warn('unsupported rdf:parseType="' + parseType + '"; treated as a plain property', element.line)
+      this.builder.diagnose(
+        'rdfxml-parsetype-unsupported',
+        'warning',
+        'unsupported rdf:parseType="' + parseType + '"; treated as a plain property',
+        element.line,
+      )
     }
 
     if (resource !== undefined) {
@@ -1885,8 +2267,14 @@ class OntoRdfXmlParser {
           childSubject.slice(0, 2) === '_:' ? 'blank' : 'iri',
         )
       }
-      for (let i = 1; i < element.children.length; i++) {
-        this.builder.warn('only the first nested node element was used as the object', element.line)
+      if (element.children.length > 1 && this.warnedMultipleObjectsSubjects[subject] !== true) {
+        this.warnedMultipleObjectsSubjects[subject] = true
+        this.builder.diagnose(
+          'rdfxml-multiple-objects',
+          'warning',
+          'property element <' + element.qname + '> has multiple objects; only the first was used',
+          element.line,
+        )
       }
       return
     }
@@ -1927,6 +2315,7 @@ class OntoRdfXmlParser {
     const head = this.builder.freshBlank()
     const items = []
     for (let i = 0; i < children.length; i++) {
+      if (this.builder.truncated) break
       const item = this.mapNodeElement(children[i], context)
       if (item) items.push(item)
     }
@@ -1960,8 +2349,12 @@ class OntoJsonLdParser {
     const opts = options || {}
     this.builder = new OntoRdfBuilder('jsonld', ontoRdfNormalizeText(text), opts)
     this.source = this.builder.text
-    this.fileBase = ontoRdfFileBase(opts.fileName)
-    this.builder.base = this.fileBase
+    const initial = ontoRdfInitialBase(opts)
+    this.initialBase = initial.base
+    this.initialBaseSource = initial.source
+    this.builder.base = initial.base
+    this.builder.baseSource = initial.source
+    this.depth = 0
     this.warnedContainers = Object.create(null)
     this.appliedContextNodes = new WeakSet()
   }
@@ -1975,7 +2368,7 @@ class OntoJsonLdParser {
       return this.builder.finish()
     }
     try {
-      const context = this.newContext(this.fileBase)
+      const context = this.newContext(this.initialBase, this.initialBaseSource)
       this.processTop(data, context)
     } catch (error) {
       this.builder.error(
@@ -1985,11 +2378,12 @@ class OntoJsonLdParser {
     return this.builder.finish()
   }
 
-  newContext(base) {
+  newContext(base, baseSource) {
     return {
       terms: Object.create(null),
       vocab: '',
       base: base || '',
+      baseSource: baseSource || 'none',
       language: '',
     }
   }
@@ -1999,6 +2393,7 @@ class OntoJsonLdParser {
       terms: Object.assign(Object.create(null), context.terms),
       vocab: context.vocab,
       base: context.base,
+      baseSource: context.baseSource,
       language: context.language,
     }
     this.applyContext(next, raw)
@@ -2010,7 +2405,8 @@ class OntoJsonLdParser {
       context.terms = Object.create(null)
       context.vocab = ''
       context.language = ''
-      context.base = this.fileBase
+      context.base = this.initialBase
+      context.baseSource = this.initialBaseSource
       this.syncPrefixes(context)
       return
     }
@@ -2018,7 +2414,11 @@ class OntoJsonLdParser {
     for (let i = 0; i < items.length; i++) {
       const item = items[i]
       if (typeof item === 'string') {
-        this.builder.warn('remote @context "' + item + '" was not fetched and was skipped')
+        this.builder.diagnose(
+          'jsonld-remote-context-skipped',
+          'warning',
+          'remote @context "' + item + '" was not fetched and was skipped',
+        )
         continue
       }
       if (!item || typeof item !== 'object' || Array.isArray(item)) {
@@ -2029,12 +2429,22 @@ class OntoJsonLdParser {
         const base = item['@base']
         if (base === null) {
           context.base = ''
+          context.baseSource = 'none'
         } else if (typeof base === 'string') {
-          if (ontoRdfIsAbsoluteIri(base)) context.base = base
-          else if (context.base) context.base = resolveIri(context.base, base)
-          else {
-            this.builder.warn('relative @base "' + base + '" has no base to resolve against')
+          if (ontoRdfIsAbsoluteIri(base)) {
             context.base = base
+            context.baseSource = 'document'
+          } else if (context.base) {
+            context.base = resolveIri(context.base, base)
+            context.baseSource = 'document'
+          } else {
+            this.builder.diagnose(
+              'base-unavailable',
+              'warning',
+              'relative @base "' + base + '" has no base to resolve against',
+            )
+            context.base = ''
+            context.baseSource = 'none'
           }
         }
       }
@@ -2108,7 +2518,11 @@ class OntoJsonLdParser {
     }
     if (ontoRdfHas(value, '@reverse')) {
       definition.id = this.expandIri(value['@reverse'], context, { vocab: true, document: true })
-      this.builder.warn('@reverse term definitions are treated as forward properties')
+      this.builder.diagnose(
+        'jsonld-reverse-term-forward',
+        'warning',
+        '@reverse term definitions are treated as forward properties',
+      )
     } else if (ontoRdfHas(value, '@id')) {
       const id = value['@id']
       if (id === null) definition.id = null
@@ -2148,7 +2562,11 @@ class OntoJsonLdParser {
       const key = term + '|' + name
       if (this.warnedContainers[key]) continue
       this.warnedContainers[key] = true
-      this.builder.warn('@container "' + name + '" on term "' + term + '" is not supported')
+      this.builder.diagnose(
+        'jsonld-container-unsupported',
+        'warning',
+        '@container "' + name + '" on term "' + term + '" is not supported',
+      )
     }
   }
 
@@ -2184,7 +2602,11 @@ class OntoJsonLdParser {
     }
     if (ontoRdfIsAbsoluteIri(value)) return value
     if (context.base) return resolveIri(context.base, value)
-    this.builder.warn('relative IRI "' + value + '" could not be resolved (no base)')
+    this.builder.diagnose(
+      'base-unavailable',
+      'warning',
+      'relative IRI "' + value + '" could not be resolved (no base)',
+    )
     return value
   }
 
@@ -2197,7 +2619,10 @@ class OntoJsonLdParser {
 
   processTop(data, context) {
     if (Array.isArray(data)) {
-      for (let i = 0; i < data.length; i++) this.processNode(data[i], context)
+      for (let i = 0; i < data.length; i++) {
+        if (this.builder.truncated) break
+        this.processNode(data[i], context)
+      }
       return
     }
     if (data === null || typeof data !== 'object') {
@@ -2210,18 +2635,26 @@ class OntoJsonLdParser {
       this.appliedContextNodes.add(data)
     }
     this.builder.base = local.base || ''
-    if (ontoRdfHas(data, '@graph')) {
-      const graph = data['@graph']
-      const items = Array.isArray(graph) ? graph : [graph]
-      for (let i = 0; i < items.length; i++) this.processNode(items[i], local)
-      return
-    }
+    this.builder.baseSource = local.baseSource || 'none'
+    // processNode handles a top-level @graph object, including its sibling keys.
     this.processNode(data, local)
   }
 
   processNode(node, inheritedContext) {
     if (Array.isArray(node)) {
-      for (let i = 0; i < node.length; i++) this.processNode(node[i], inheritedContext)
+      if (this.depth >= this.builder.maxDepth) {
+        this.noteJsonLdNestingLimit()
+        return null
+      }
+      this.depth++
+      try {
+        for (let i = 0; i < node.length; i++) {
+          if (this.builder.truncated) break
+          this.processNode(node[i], inheritedContext)
+        }
+      } finally {
+        this.depth--
+      }
       return null
     }
     if (node === null || typeof node !== 'object') return null
@@ -2231,14 +2664,43 @@ class OntoJsonLdParser {
       this.appliedContextNodes.add(node)
     }
     if (ontoRdfHas(node, '@value') || ontoRdfHas(node, '@list') || ontoRdfHas(node, '@set')) {
-      this.builder.warn('value object used where a node was expected was ignored')
+      this.builder.diagnose(
+        'jsonld-value-object-dropped',
+        'warning',
+        'value object used where a node was expected was ignored',
+      )
       return null
     }
-    if (ontoRdfHas(node, '@graph') && !ontoRdfHas(node, '@id')) {
+    if (this.depth >= this.builder.maxDepth) {
+      this.noteJsonLdNestingLimit()
+      return null
+    }
+    this.depth++
+    try {
+      return this.processNodeBody(node, context)
+    } finally {
+      this.depth--
+    }
+  }
+
+  noteJsonLdNestingLimit() {
+    this.builder.diagnose(
+      'nesting-limit',
+      'error',
+      'JSON-LD nesting depth limit of ' + this.builder.maxDepth +
+        ' reached; the nested branch was skipped',
+    )
+  }
+
+  processNodeBody(node, context) {
+    const graphWithoutId = ontoRdfHas(node, '@graph') && !ontoRdfHas(node, '@id')
+    if (graphWithoutId) {
       const graph = node['@graph']
       const items = Array.isArray(graph) ? graph : [graph]
-      for (let i = 0; i < items.length; i++) this.processNode(items[i], context)
-      return null
+      for (let i = 0; i < items.length; i++) {
+        if (this.builder.truncated) break
+        this.processNode(items[i], context)
+      }
     }
 
     let subject
@@ -2262,6 +2724,7 @@ class OntoJsonLdParser {
     if (ontoRdfHas(node, '@type')) {
       const types = Array.isArray(node['@type']) ? node['@type'] : [node['@type']]
       for (let i = 0; i < types.length; i++) {
+        if (this.builder.truncated) break
         const type = types[i]
         if (typeof type !== 'string') continue
         const expanded = this.expandIri(type, context, { vocab: true, document: true })
@@ -2276,20 +2739,33 @@ class OntoJsonLdParser {
 
     const keys = Object.keys(node)
     for (let i = 0; i < keys.length; i++) {
+      if (this.builder.truncated) break
       const key = keys[i]
       if (key === '@context' || key === '@id' || key === '@type' || key === '@index') continue
       if (key === '@graph') {
+        if (graphWithoutId) continue
         const graph = node[key]
         const items = Array.isArray(graph) ? graph : [graph]
-        for (let g = 0; g < items.length; g++) this.processNode(items[g], context)
+        for (let g = 0; g < items.length; g++) {
+          if (this.builder.truncated) break
+          this.processNode(items[g], context)
+        }
         continue
       }
       if (key === '@reverse') {
-        this.builder.warn('@reverse is not supported and was skipped')
+        this.builder.diagnose(
+          'jsonld-node-reverse-ignored',
+          'warning',
+          '@reverse is not supported and was skipped',
+        )
         continue
       }
       if (key === '@included' || key === '@nest') {
-        this.builder.warn('"' + key + '" is not supported and was skipped')
+        this.builder.diagnose(
+          'jsonld-included-nest-ignored',
+          'warning',
+          '"' + key + '" is not supported and was skipped',
+        )
         continue
       }
       if (key === '@value' || key === '@list' || key === '@set' || key === '@language') continue
@@ -2306,16 +2782,38 @@ class OntoJsonLdParser {
   }
 
   addValue(subject, predicate, value, context, definition) {
+    if (this.builder.truncated) return
     if (value === null || value === undefined) return
+    const container = definition ? definition.container : null
+    const containers = Array.isArray(container) ? container : (container ? [container] : [])
+
+    // A term-level `@container: "@list"` must become an RDF list, so this has to
+    // be decided before arrays are flattened into separate triples.
+    if (containers.indexOf('@list') !== -1) {
+      const items = Array.isArray(value) ? value : [value]
+      const head = this.buildList(items, context, definition)
+      this.builder.add(subject, predicate, head, this.kindOf(head))
+      return
+    }
+
     if (Array.isArray(value)) {
-      for (let i = 0; i < value.length; i++) {
-        this.addValue(subject, predicate, value[i], context, definition)
+      if (this.depth >= this.builder.maxDepth) {
+        this.noteJsonLdNestingLimit()
+        return
+      }
+      this.depth++
+      try {
+        for (let i = 0; i < value.length; i++) {
+          if (this.builder.truncated) break
+          this.addValue(subject, predicate, value[i], context, definition)
+        }
+      } finally {
+        this.depth--
       }
       return
     }
-    const container = definition ? definition.container : null
 
-    if (container === '@language' && value && typeof value === 'object' && !Array.isArray(value) &&
+    if (containers.indexOf('@language') !== -1 && value && typeof value === 'object' && !Array.isArray(value) &&
       !ontoRdfHas(value, '@value') && !ontoRdfHas(value, '@id')) {
       const languages = Object.keys(value)
       for (let i = 0; i < languages.length; i++) {
@@ -2330,18 +2828,12 @@ class OntoJsonLdParser {
       return
     }
 
-    if (container === '@index' && value && typeof value === 'object' && !Array.isArray(value) &&
+    if (containers.indexOf('@index') !== -1 && value && typeof value === 'object' && !Array.isArray(value) &&
       !ontoRdfHas(value, '@value') && !ontoRdfHas(value, '@id')) {
       const indexes = Object.keys(value)
       for (let i = 0; i < indexes.length; i++) {
         this.addValue(subject, predicate, value[indexes[i]], context, definition)
       }
-      return
-    }
-
-    if (container === '@list' && Array.isArray(value)) {
-      const head = this.buildList(value, context, definition)
-      this.builder.add(subject, predicate, head, this.kindOf(head))
       return
     }
 
@@ -2457,22 +2949,32 @@ class OntoJsonLdParser {
 
   buildList(items, context, definition) {
     if (!Array.isArray(items) || items.length === 0) return ONTO_RDF_NIL
-    const head = this.builder.freshBlank()
-    let current = head
-    for (let i = 0; i < items.length; i++) {
-      const descriptor = this.itemDescriptor(items[i], context, definition)
-      if (descriptor) {
-        this.builder.add(current, ONTO_RDF_FIRST, descriptor.term, descriptor.kind, descriptor.dt, descriptor.lang)
-      }
-      if (i < items.length - 1) {
-        const next = this.builder.freshBlank()
-        this.builder.add(current, ONTO_RDF_REST, next, 'blank')
-        current = next
-      } else {
-        this.builder.add(current, ONTO_RDF_REST, ONTO_RDF_NIL, 'iri')
-      }
+    if (this.depth >= this.builder.maxDepth) {
+      this.noteJsonLdNestingLimit()
+      return ONTO_RDF_NIL
     }
-    return head
+    this.depth++
+    try {
+      const head = this.builder.freshBlank()
+      let current = head
+      for (let i = 0; i < items.length; i++) {
+        if (this.builder.truncated) break
+        const descriptor = this.itemDescriptor(items[i], context, definition)
+        if (descriptor) {
+          this.builder.add(current, ONTO_RDF_FIRST, descriptor.term, descriptor.kind, descriptor.dt, descriptor.lang)
+        }
+        if (i < items.length - 1) {
+          const next = this.builder.freshBlank()
+          this.builder.add(current, ONTO_RDF_REST, next, 'blank')
+          current = next
+        } else {
+          this.builder.add(current, ONTO_RDF_REST, ONTO_RDF_NIL, 'iri')
+        }
+      }
+      return head
+    } finally {
+      this.depth--
+    }
   }
 
   itemDescriptor(item, context, definition) {
@@ -2580,7 +3082,15 @@ function ontoRdfEmptyDocument(format, text, options) {
 
 /**
  * Parse any supported serialization. Never throws.
- * options: { fileName?: string, format?: string, maxTriples?: number }
+ * options: {
+ *   fileName?: string,          // display name, used for format detection only
+ *   resourceAddress?: string,   // real resource address, used for the base IRI
+ *   format?: string,
+ *   maxTriples?: number,
+ *   maxLiteralLength?: number,
+ *   maxDepth?: number,
+ *   maxDiagnostics?: number
+ * }
  */
 export function parseOntology(text, options) {
   const opts = options || {}
@@ -2589,7 +3099,14 @@ export function parseOntology(text, options) {
     result.errors.push('input is not a string')
     return result
   }
-  const parserOptions = { fileName: opts.fileName, maxTriples: opts.maxTriples }
+  const parserOptions = {
+    fileName: opts.fileName,
+    resourceAddress: opts.resourceAddress,
+    maxTriples: opts.maxTriples,
+    maxLiteralLength: opts.maxLiteralLength,
+    maxDepth: opts.maxDepth,
+    maxDiagnostics: opts.maxDiagnostics,
+  }
   let format
   const declared = typeof opts.format === 'string' && opts.format.trim() !== ''
   if (declared) {

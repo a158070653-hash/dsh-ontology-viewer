@@ -7,6 +7,12 @@ yarn.lock
 # Build/test scratch
 coverage/
 *.log
+.test-data/large-files/
+# Generated size-boundary fixtures; recreate with scripts/make-large-test-files.mjs
+examples/near-5MiB.ttl
+examples/over-5MiB.ttl
+examples/near-12MiB.ttl
+examples/over-12MiB.ttl
 
 # OS / editor noise
 .DS_Store

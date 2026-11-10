@@ -28,6 +28,7 @@
     "check": "node --check client.js && node build/build.mjs --check && node --test \"tests/*.test.mjs\"",
     "i18n": "node scripts/check-i18n.mjs",
     "stats": "node scripts/pipeline-check.mjs",
+    "bench": "node scripts/bench.mjs",
     "pack:release": "node scripts/pack-release.mjs"
   },
   "keywords": [
