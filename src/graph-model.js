@@ -177,6 +177,58 @@ function resolveGraphSource(opts, input) {
 }
 
 /**
+ * Graph context used when a caller hands over statements that predate the
+ * graph field: the model never claims those statements belong to the default
+ * graph, because the source may have lost that information.
+ */
+const FALLBACK_STATEMENT_GRAPH = Object.freeze({ kind: 'unknown' })
+const LEGACY_SOURCE_ID = 'single'
+
+/**
+ * Expand the input into flat statements that carry source and statement
+ * identity. The workspace composes merged records and passes the expanded
+ * occurrences through `options.statements`; a plain parsed document keeps the
+ * V1.0.0 `triples` contract and is wrapped as one legacy source.
+ */
+function normalizeStatements(input, opts) {
+  if (Array.isArray(opts.statements)) return opts.statements
+  const triples = Array.isArray(input.triples) ? input.triples : []
+  const explicit = typeof opts.sourceId === 'string' && opts.sourceId
+    ? opts.sourceId
+    : (typeof input.sourceId === 'string' && input.sourceId ? input.sourceId : LEGACY_SOURCE_ID)
+  const statements = new Array(triples.length)
+  for (let index = 0; index < triples.length; index++) {
+    const triple = triples[index]
+    if (!isObject(triple)) {
+      statements[index] = triple
+      continue
+    }
+    statements[index] = {
+      s: triple.s,
+      p: triple.p,
+      o: triple.o,
+      oKind: triple.oKind,
+      dt: triple.dt,
+      lang: triple.lang,
+      literalTruncated: triple.literalTruncated,
+      graph: isObject(triple.graph) ? triple.graph : FALLBACK_STATEMENT_GRAPH,
+      sourceId: typeof triple.sourceId === 'string' && triple.sourceId ? triple.sourceId : explicit,
+      statementId: typeof triple.statementId === 'string' && triple.statementId
+        ? triple.statementId
+        : 'legacy:' + explicit + ':' + index,
+    }
+  }
+  return statements
+}
+
+/** Sorted copy of a Set of strings, for stable output. */
+function sortedValues(set) {
+  const values = []
+  for (const value of set) values.push(value)
+  return values.sort(compareStrings)
+}
+
+/**
  * Turn parsed triples into a renderable node-link graph.
  *
  * Classification (deterministic precedence, first match wins):
@@ -193,6 +245,10 @@ function resolveGraphSource(opts, input) {
  * `node.literals`. rdf:first / rdf:rest triples are list plumbing and are
  * dropped from the graph (they still count in `stats.triples`).
  *
+ * Provenance: nodes, literals and edges carry `sourceIds` / `statementIds`
+ * collected from the statements that produced them. They never infer a byte,
+ * line or column position (`location` stays null upstream).
+ *
  * Budgets (all optional, all structured, none silent):
  *   - maxNodes (default 1200): highest total degree first, id as stable tie-break.
  *   - maxLiteralsPerNode (default 60): per-node literal statements kept.
@@ -203,12 +259,14 @@ function resolveGraphSource(opts, input) {
  *   - maxLiteralLength (default off): single literal value `length` cap; a
  *     truncated value is marked with `literal.truncated = true`.
  *
- * @param {{triples?: any[], prefixes?: Record<string, string>}} parsed
- * @param {{maxNodes?: number, maxLiteralsPerNode?: number, maxEdges?: number,
+ * @param {{triples?: any[], prefixes?: Record<string, string>, sources?: any[]}} parsed
+ * @param {{statements?: any[], sources?: any[], sourceId?: string,
+ *          maxNodes?: number, maxLiteralsPerNode?: number, maxEdges?: number,
  *          maxLiteralLength?: number,
  *          source?: {address?: string, displayName?: string, format?: string}}} [options]
  * @returns {{nodes: any[], edges: any[], stats: any, warnings: string[],
- *            truncation: any, source: {address: string, displayName: string, format: string}}}
+ *            truncation: any, sources: any[],
+ *            source: {address: string, displayName: string, format: string}}}
  */
 export function buildGraph(parsed, options) {
   const opts = isObject(options) ? options : {}
@@ -218,13 +276,18 @@ export function buildGraph(parsed, options) {
   const maxEdges = optionalPositiveInteger(opts.maxEdges)
 
   const input = isObject(parsed) ? parsed : {}
-  const triples = Array.isArray(input.triples) ? input.triples : []
+  const statements = normalizeStatements(input, opts)
   const prefixes = isObject(input.prefixes) ? input.prefixes : {}
   const warnings = []
   const source = resolveGraphSource(opts, input)
+  const sources = Array.isArray(opts.sources)
+    ? opts.sources
+    : (Array.isArray(input.sources) ? input.sources : [])
 
   /** id -> { id, types, literals, out, in, label, labelRank } */
   const records = new Map()
+  /** id -> { sourceIds: Set, statementIds: Set, roles: Set } */
+  const provenance = new Map()
   /** id -> true when the node is used as the object of rdf:type (i.e. a class-like IRI) */
   const usedAsType = new Set()
   /** ids involved in rdfs:subClassOf (subject or IRI object) */
@@ -243,7 +306,54 @@ export function buildGraph(parsed, options) {
     return record
   }
 
-  for (const triple of triples) {
+  /** Record one entity occurrence for provenance, without inferring positions. */
+  function noteProvenance(id, statement, role) {
+    let entry = provenance.get(id)
+    if (entry === undefined) {
+      entry = { sourceIds: new Set(), statementIds: new Set(), roles: new Set(), bySource: new Map() }
+      provenance.set(id, entry)
+    }
+    if (typeof statement.sourceId === 'string' && statement.sourceId) {
+      entry.sourceIds.add(statement.sourceId)
+      let contribution = entry.bySource.get(statement.sourceId)
+      if (!contribution) {
+        contribution = { roles: new Set(), statementIds: new Set() }
+        entry.bySource.set(statement.sourceId, contribution)
+      }
+      contribution.roles.add(role)
+      if (statement.statementId) contribution.statementIds.add(statement.statementId)
+    }
+    if (typeof statement.statementId === 'string' && statement.statementId) {
+      entry.statementIds.add(statement.statementId)
+    }
+    entry.roles.add(role)
+  }
+
+  /**
+   * Remember one distinct graph context of an edge. Blank and unknown graph
+   * names stay scoped to their source so equal labels do not merge them.
+   */
+  function noteDraftGraph(draft, statement) {
+    const graph = isObject(statement.graph) ? statement.graph : FALLBACK_STATEMENT_GRAPH
+    const sourceId = typeof statement.sourceId === 'string' ? statement.sourceId : ''
+    let kind = 'default'
+    if (graph.kind === 'iri' && typeof graph.value === 'string' && graph.value !== '') kind = 'iri'
+    else if (graph.kind === 'blank') kind = 'blank'
+    else if (graph.kind === 'unknown') kind = 'unknown'
+    let key = 'd'
+    if (kind === 'iri') key = 'i\t' + graph.value
+    else if (kind === 'blank') key = 'b\t' + sourceId + '\t' + String(graph.value || '')
+    else if (kind === 'unknown') key = 'u\t' + sourceId
+    let entry = draft.graphMap.get(key)
+    if (entry === undefined) {
+      entry = { kind: kind, sourceIds: new Set() }
+      if (kind === 'iri' || kind === 'blank') entry.value = String(graph.value)
+      draft.graphMap.set(key, entry)
+    }
+    if (sourceId) entry.sourceIds.add(sourceId)
+  }
+
+  for (const triple of statements) {
     if (!isObject(triple)) continue
     const subject = typeof triple.s === 'string' ? triple.s : ''
     const predicate = typeof triple.p === 'string' ? triple.p : ''
@@ -257,6 +367,7 @@ export function buildGraph(parsed, options) {
       // List plumbing literals are irrelevant once the list is skipped.
       if (LIST_PREDICATES.has(predicate)) continue
       const record = ensureRecord(subject)
+      noteProvenance(subject, triple, 'subject')
       const rank = labelRank(predicate)
       let value = objectText
       let valueTruncated = false
@@ -270,6 +381,10 @@ export function buildGraph(parsed, options) {
         value,
         order: record.literals.length,
         rank,
+        sourceIds: typeof triple.sourceId === 'string' && triple.sourceId ? [triple.sourceId] : [],
+        statementIds: typeof triple.statementId === 'string' && triple.statementId
+          ? [triple.statementId]
+          : [],
       }
       if (valueTruncated) literal.truncated = true
       if (typeof triple.dt === 'string' && triple.dt) literal.dt = triple.dt
@@ -302,12 +417,28 @@ export function buildGraph(parsed, options) {
     }
 
     const key = subject + '\u0000' + predicate + '\u0000' + object
-    const draft = edgeDrafts.get(key)
+    let draft = edgeDrafts.get(key)
     if (draft === undefined) {
-      edgeDrafts.set(key, { source: subject, target: object, p: predicate, count: 1 })
-    } else {
-      draft.count += 1
+      draft = {
+        source: subject,
+        target: object,
+        p: predicate,
+        count: 0,
+        sourceIds: new Set(),
+        statementIds: new Set(),
+        graphMap: new Map(),
+      }
+      edgeDrafts.set(key, draft)
     }
+    draft.count += 1
+    noteProvenance(subject, triple, 'subject')
+    noteProvenance(object, triple, 'object')
+    noteProvenance(predicate, triple, 'predicate')
+    if (typeof triple.sourceId === 'string' && triple.sourceId) draft.sourceIds.add(triple.sourceId)
+    if (typeof triple.statementId === 'string' && triple.statementId) {
+      draft.statementIds.add(triple.statementId)
+    }
+    noteDraftGraph(draft, triple)
   }
 
   function degreeOf(id) {
@@ -368,6 +499,18 @@ export function buildGraph(parsed, options) {
 
   // Emit edges in first-occurrence order so ids stay stable across budgets.
   const edges = []
+  function graphsOf(draft) {
+    const list = []
+    for (const entry of draft.graphMap.values()) {
+      const item = { kind: entry.kind }
+      if (entry.value !== undefined) item.value = entry.value
+      item.sourceIds = sortedValues(entry.sourceIds)
+      list.push(item)
+    }
+    list.sort((a, b) => compareStrings(a.kind, b.kind) ||
+      compareStrings(String(a.value || ''), String(b.value || '')))
+    return list
+  }
   for (const draft of edgeDrafts.values()) {
     if (!keptDraftSet.has(draft)) continue
     let kind = 'object'
@@ -382,6 +525,9 @@ export function buildGraph(parsed, options) {
       label: shortenIri(draft.p, prefixes),
       kind,
       count: draft.count,
+      sourceIds: sortedValues(draft.sourceIds),
+      statementIds: sortedValues(draft.statementIds),
+      graphs: graphsOf(draft),
     })
   }
 
@@ -399,7 +545,7 @@ export function buildGraph(parsed, options) {
 
   const nodes = []
   const stats = emptyStats()
-  stats.triples = triples.length || Number(input.stats && input.stats.tripleCount) || 0
+  stats.triples = statements.length || Number(input.stats && input.stats.tripleCount) || 0
   let literalCandidates = 0
   let keptLiteralCount = 0
   let droppedLiteralCount = 0
@@ -432,6 +578,8 @@ export function buildGraph(parsed, options) {
         p: literal.p,
         pLabel: shortenIri(literal.p, prefixes),
         value: literal.value,
+        sourceIds: Array.isArray(literal.sourceIds) ? literal.sourceIds.slice() : [],
+        statementIds: Array.isArray(literal.statementIds) ? literal.statementIds.slice() : [],
       }
       if (literal.dt) item.dt = literal.dt
       if (literal.lang) item.lang = literal.lang
@@ -442,6 +590,7 @@ export function buildGraph(parsed, options) {
     const rawLocal = localName(record.id)
     const local = rawLocal || record.id
     const label = record.label || local
+    const origin = provenance.get(record.id)
 
     if (kind === 'class') stats.classes += 1
     else if (kind === 'property') stats.properties += 1
@@ -459,6 +608,14 @@ export function buildGraph(parsed, options) {
       literals,
       outEdges: out,
       inEdges: incoming,
+      provenance: {
+        sourceIds: origin === undefined ? [] : sortedValues(origin.sourceIds),
+        statementIds: origin === undefined ? [] : sortedValues(origin.statementIds),
+        roles: origin === undefined ? [] : sortedValues(origin.roles),
+        bySource: origin === undefined ? [] : Array.from(origin.bySource, ([sourceId, value]) => ({
+          sourceId: sourceId, roles: sortedValues(value.roles), statementIds: sortedValues(value.statementIds),
+        })),
+      },
       // Reserved source location: always null in this change (spec
       // "源位置预留"); never inferred from filenames or document order.
       literalsTruncated: droppedForNode,
@@ -496,7 +653,79 @@ export function buildGraph(parsed, options) {
     ),
   }
 
-  return { nodes, edges, stats, warnings, truncation, source }
+  return { nodes, edges, stats, warnings, truncation, sources, source }
+}
+
+/**
+ * Source-contribution projection (L1 → L2).
+ *
+ * An empty or absent selection means "all sources". Otherwise an edge is kept
+ * only when at least one selected source contributed it, a node only when a
+ * selected source contributed to it or it touches a kept edge, and a literal
+ * only when a selected source contributed it. The input graph is never
+ * mutated: nodes are shallow-copied when their literal list changes.
+ *
+ * This projection runs before the existing type/predicate/direction filter and
+ * exploration, so a shared node cannot drag another source's edges back in.
+ *
+ * @param {any} graph L1 graph produced by buildGraph
+ * @param {string[]} sourceIds selected source ids (empty = all)
+ * @returns {{nodes: any[], edges: any[], stats: any, hidden: object}}
+ */
+export function filterBySources(graph, sourceIds) {
+  const input = isObject(graph) ? graph : {}
+  const nodes = Array.isArray(input.nodes) ? input.nodes : []
+  const edges = Array.isArray(input.edges) ? input.edges : []
+  const selected = new Set(
+    (Array.isArray(sourceIds) ? sourceIds : []).filter((id) => typeof id === 'string'),
+  )
+  const all = selected.size === 0
+  const contributes = (ids) => all || (Array.isArray(ids) && ids.some((id) => selected.has(id)))
+
+  const keptEdges = edges.filter((edge) => contributes(edge && edge.sourceIds))
+  const keptEdgeSet = new Set(keptEdges)
+  const touched = new Set()
+  for (const edge of keptEdges) {
+    touched.add(edge.source)
+    touched.add(edge.target)
+  }
+
+  const keptNodes = []
+  let hiddenNodes = 0
+  let hiddenLiterals = 0
+  for (const node of nodes) {
+    if (!isObject(node)) continue
+    const origin = isObject(node.provenance) ? node.provenance : null
+    const literals = Array.isArray(node.literals) ? node.literals : []
+    const keptLiterals = all
+      ? literals
+      : literals.filter((literal) => contributes(literal && literal.sourceIds))
+    const droppedHere = literals.length - keptLiterals.length
+    if (!all && !touched.has(node.id) && !contributes(origin && origin.sourceIds)) {
+      hiddenNodes += 1
+      hiddenLiterals += literals.length
+      continue
+    }
+    if (droppedHere > 0 || keptLiterals !== literals) {
+      hiddenLiterals += droppedHere
+      keptNodes.push(Object.assign({}, node, { literals: keptLiterals }))
+    } else {
+      keptNodes.push(node)
+    }
+  }
+
+  const stats = statsFor(keptNodes, keptEdges, input.stats && input.stats.triples)
+  return {
+    nodes: keptNodes,
+    edges: keptEdges,
+    stats: stats,
+    hidden: {
+      nodes: hiddenNodes,
+      edges: edges.length - keptEdges.length,
+      literals: hiddenLiterals,
+    },
+    sourceIds: all ? [] : Array.from(selected),
+  }
 }
 
 /**

@@ -278,3 +278,80 @@ test('embedded worker source runs compute and relayout successfully', () => {
   assert.ok(relayout, 'relayout must reuse the cached graph')
   assert.equal(relayout.positions.length, graphMessage.graph.nodes.length * 2)
 })
+
+test('embedded worker source parses and composes multiple sources', () => {
+  const workerSource = embeddedWorkerSource(readFileSync(bundlePath, 'utf8'))
+  const outbox = []
+  const self = { postMessage: (message) => outbox.push(message), onmessage: null }
+  const sandbox = { self, console, TextDecoder, TextEncoder, Date, Math, JSON, Float64Array }
+  vm.createContext(sandbox)
+  vm.runInContext(workerSource, sandbox, { filename: 'ontology-worker-multi.js' })
+
+  outbox.length = 0
+  self.onmessage({
+    data: {
+      type: 'parse-source', id: 'p1', sourceId: 'src1', revision: 1,
+      text: '@prefix ex: <http://e/> .\nex:a ex:p ex:shared .\n',
+      displayName: 'one.ttl', format: 'turtle',
+      absolutePath: 'D:\\dir\\one.ttl', maxTriples: 100,
+    },
+  })
+  const first = outbox.find((message) => message.type === 'source' && message.sourceId === 'src1')
+  assert.ok(first, 'worker must answer parse-source with a source message')
+  assert.equal(first.parsed.triples.length, 1)
+  assert.equal(first.parsed.base, 'file:///D:/dir/one.ttl', 'the worker uses the host path, not a DSH route')
+  assert.equal(first.parsed.triples[0].graph.kind, 'default')
+  assert.equal(first.parsed.triples[0].location, null)
+
+  outbox.length = 0
+  self.onmessage({
+    data: {
+      type: 'parse-source', id: 'p2', sourceId: 'src2', revision: 1,
+      text: '@prefix ex: <http://e/> .\nex:b ex:q ex:shared .\n',
+      displayName: 'two.ttl', format: 'turtle',
+      absolutePath: 'D:\\dir\\two.ttl', maxTriples: 100,
+    },
+  })
+  assert.ok(outbox.find((message) => message.type === 'source' && message.sourceId === 'src2'))
+
+  outbox.length = 0
+  self.onmessage({
+    data: {
+      type: 'compose', id: 'c1', sourceIds: ['src1', 'src2'],
+      layout: { width: 400, height: 300, seed: 1, iterations: 10 },
+    },
+  })
+  const graphMessage = outbox.find((message) => message.type === 'graph')
+  assert.ok(graphMessage)
+  assert.equal(graphMessage.statements, 2)
+  assert.equal(graphMessage.occurrences, 2)
+  const shared = graphMessage.graph.nodes.find((node) => node.id === 'http://e/shared')
+  assert.ok(shared)
+  assert.equal(JSON.stringify(Array.from(shared.provenance.sourceIds).sort()),
+    JSON.stringify(['src1', 'src2']))
+  assert.ok(outbox.find((message) => message.type === 'layout').positions instanceof Float64Array)
+
+  outbox.length = 0
+  self.onmessage({ data: { type: 'drop-source', id: -1, sourceId: 'src2' } })
+  self.onmessage({
+    data: {
+      type: 'compose', id: 'c2', sourceIds: ['src1'],
+      layout: { width: 400, height: 300, seed: 1, iterations: 10 },
+    },
+  })
+  const single = outbox.find((message) => message.type === 'graph')
+  assert.equal(single.graph.nodes.some((node) => node.id === 'http://e/b'), false)
+  assert.equal(single.statements, 1)
+
+  // A recreated Worker accepts the bounded L0 snapshot without parsing text.
+  outbox.length = 0
+  self.onmessage({ data: { type: 'cache-source', source: {
+    sourceId: 'shared3', origin: 'browser', displayName: 'snapshot.ttl',
+    revision: 1, byteSize: 100, parsed: first.parsed,
+  } } })
+  self.onmessage({ data: { type: 'compose', id: 'c3', sourceIds: ['shared3'],
+    layout: { width: 400, height: 300, seed: 1, iterations: 10 } } })
+  const hydrated = outbox.find(message => message.type === 'graph')
+  assert.equal(hydrated.statements, 1)
+  assert.equal(hydrated.graph.sources[0].origin, 'browser')
+})

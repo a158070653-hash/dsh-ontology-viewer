@@ -42,6 +42,9 @@ const LAYOUT_ITERATIONS = 320
 
 /** Built once per Client module load; the component identity must stay stable. */
 const GRAPH_VIEW = createOntologyGraphView(React).OntologyGraphView
+/** Workspace surface: primary file + additional sources + three views. */
+const WORKSPACE_COMPONENTS = createOntologyWorkspace(React)
+const ONTOLOGY_WORKSPACE = WORKSPACE_COMPONENTS.OntologyWorkspacePanel
 
 const ZH = {
   // surfaces / titles
@@ -164,6 +167,16 @@ const ZH = {
   'viewer.relationsHidden': '未在画布绘制',
   'viewer.showMore': '显示更多',
   'viewer.sourceReserved': '源文件定位（预留）',
+  'viewer.copySourceHint': '复制来源标识',
+  'viewer.copySourceId': '复制来源标识',
+  'viewer.graphIdentity': '图身份',
+  'viewer.graphIdentityNone': '无',
+  'viewer.locationUnavailable': '语句位置未记录（null）。',
+  'viewer.provenance': '已接纳来源',
+  'viewer.provenanceStatements': '{n} 条语句',
+  'viewer.provenanceMissing': '该实体没有记录已接纳来源。',
+  'viewer.provenanceRoles': '角色：{roles}',
+  'viewer.provenanceHint': '已接纳来源不代表输入完整。',
   // kind group labels
   'viewer.group.type': '类型',
   'viewer.group.literals': '字面量',
@@ -186,6 +199,114 @@ const ZH = {
   'diag.literal-limit': '字面量超过长度上限',
   'diag.triple-limit': '三元组达到上限',
   'diag.diagnostics-truncated': '诊断条数超过上限',
+  // workspace (multi-file) chrome
+  'workspace.toolbar': '工作区工具栏',
+  'workspace.sources': '来源',
+  'workspace.totals': '{files} 个文件 · {triples} 条三元组',
+  'workspace.addFiles': '添加文件',
+  'workspace.allSources': '全部来源',
+  'workspace.union': '联合',
+  'workspace.close': '关闭',
+  'workspace.pickWorkspaceFiles': '工作区文件',
+  'workspace.cancel': '取消',
+  'workspace.loadingDir': '正在读取目录…',
+  'workspace.noFiles': '该目录没有文件。',
+  'workspace.openDir': '打开文件夹',
+  'workspace.selectFile': '选择文件',
+  'workspace.dirTruncated': '目录列表已截断。',
+  'workspace.parentDir': '上一级',
+  'workspace.readSelected': '读取所选',
+  'workspace.dirError': '无法读取该目录：{reason}',
+  'workspace.readError': '无法读取 {name}：{reason}',
+  'workspace.shareUnavailable': '无法确认会话身份；工作区仅在本面板内使用。',
+  'workspace.share': '共享',
+  'workspace.sharing': '已共享',
+  'workspace.shareHint': '共享仅在本页面内，最后一个面板关闭即清空。',
+  'workspace.empty': '尚未载入来源。',
+  'workspace.includeSource': '纳入来源',
+  'workspace.sourceTriples': '{n} 条三元组',
+  'workspace.sourceErrors': '{n} 个错误',
+  'workspace.sourceWarnings': '{n} 个警告',
+  'workspace.truncated': '已截断',
+  'workspace.stale': '磁盘已变化',
+  'workspace.reload': '重载',
+  'workspace.remove': '移除',
+  'workspace.addHint': '文件只保留在当前页面；本地文件重载需要重新选择。',
+  'workspace.rejected': '未能添加来源：{reason}',
+  'workspace.unionName': '{n} 个来源',
+  'source.status.ready': '就绪',
+  'source.status.partial': '部分',
+  'source.status.empty': '空',
+  'source.status.error': '错误',
+  'source.status.rejected': '已拒绝',
+  'source.origin.host': 'DSH 文件',
+  'source.origin.browser': '本地文件',
+  // multiview
+  'view.network': '关系网络',
+  'view.tree': '类层级',
+  'view.layered': '分层关系',
+  'view.switch': '视图',
+  'view.mode': '模式',
+  'view.mode.class': '类',
+  'view.mode.property': '属性',
+  'view.search': '搜索',
+  'view.entityCount': '{n} 个实体',
+  'view.treeBudget': '层级已限制：{n} 项',
+  'view.cycleCount': '{n} 个循环',
+  'view.noMatches': '没有实体匹配“{query}”。',
+  'view.exploreRootNotClass': '探索根不是类，类树不展示探索范围。',
+  'view.cycleMembers': '循环组成员',
+  'view.selectionHidden': '当前关系类型下不显示所选实体。',
+  'view.noHierarchy': '这份文档没有显式类层级关系。',
+  'view.cycle': '循环',
+  'view.orphan': '孤立',
+  'view.inCycle': '处于循环',
+  'view.groupOf': '循环组（{n} 个成员）',
+  'view.expand': '展开',
+  'view.collapse': '折叠',
+  'view.orientation': '方向',
+  'view.orientation.down': '从上到下',
+  'view.orientation.right': '从左到右',
+  'view.predicates': '关系类型',
+  'view.layerStats': '{nodes} 个节点 · {layers} 层 · {groups} 个循环组',
+  'view.fit': '适配',
+  'view.noRelations': '所选关系类型下没有可显示的关系。',
+  'view.layered': '分层语义关系图',
+  // export
+  'export.title': '导出',
+  'export.range': '范围',
+  'export.range.viewport': '当前视口',
+  'export.range.layout': '当前显示集合完整布局',
+  'export.copySvg': '复制 SVG',
+  'export.copySvgHint': '浏览器阻止下载时可用。',
+  'export.copied': 'SVG 已复制到剪贴板。',
+  'export.copyFailed': '剪贴板不可用，请改用 SVG 文件导出。',
+  'export.manualHint': '剪贴板不可用，可在下方文本框中全选手动复制。',
+  'export.svgText': 'SVG 文本',
+  'export.scale': '倍率',
+  'export.svg': 'SVG',
+  'export.png': 'PNG',
+  'export.blocked': '暂无可导出内容：请等待布局完成。',
+  'export.started': '已发起下载。浏览器不会报告文件是否保存成功。',
+  'export.failed': '下载失败：{reason}',
+  'export.tooLarge': '该视图在当前倍率下超出 PNG 像素上限，请降低倍率或导出 SVG。',
+  'export.pngFallback': 'PNG 生成失败（{reason}），已改为导出 SVG。',
+  // provenance
+  'provenance.title': '来源',
+  'provenance.sources': '来源（{n}）',
+  'provenance.none': '没有保留的来源',
+  'provenance.roles': '角色',
+  'provenance.statements': '{n} 条语句',
+  'provenance.relations': '关系（{n}）',
+  'provenance.subject': '主体',
+  'provenance.predicate': '谓词',
+  'provenance.object': '客体',
+  'provenance.graphs': '命名图',
+  'provenance.graph.default': '默认图',
+  'provenance.graph.unknown': '图身份未知',
+  'provenance.graph.blank': '匿名图',
+  'provenance.graph.iri': '命名图',
+  'provenance.otherEnd': '对端',
 }
 
 const EN = {
@@ -303,6 +424,16 @@ const EN = {
   'viewer.relationsHidden': 'not drawn',
   'viewer.showMore': 'Show more',
   'viewer.sourceReserved': 'Source location (reserved)',
+  'viewer.copySourceHint': 'Copy source identity',
+  'viewer.copySourceId': 'Copy source id',
+  'viewer.graphIdentity': 'Graph identity',
+  'viewer.graphIdentityNone': 'none',
+  'viewer.locationUnavailable': 'Statement location is not recorded (null).',
+  'viewer.provenance': 'Accepted sources',
+  'viewer.provenanceStatements': '{n} statements',
+  'viewer.provenanceMissing': 'No accepted source recorded for this entity.',
+  'viewer.provenanceRoles': 'Roles: {roles}',
+  'viewer.provenanceHint': 'Accepted sources are not proof that the input is complete.',
   'viewer.group.type': 'Types',
   'viewer.group.literals': 'Literals',
   'viewer.group.out': 'Outgoing',
@@ -323,6 +454,114 @@ const EN = {
   'diag.literal-limit': 'Literal exceeds the length limit',
   'diag.triple-limit': 'Triple limit reached',
   'diag.diagnostics-truncated': 'Too many diagnostics',
+  // workspace (multi-file) chrome
+  'workspace.toolbar': 'Workspace toolbar',
+  'workspace.sources': 'Sources',
+  'workspace.totals': '{files} files · {triples} triples',
+  'workspace.addFiles': 'Add files',
+  'workspace.allSources': 'All sources',
+  'workspace.union': 'Union',
+  'workspace.close': 'Close',
+  'workspace.pickWorkspaceFiles': 'Workspace files',
+  'workspace.cancel': 'Cancel',
+  'workspace.loadingDir': 'Reading folder…',
+  'workspace.noFiles': 'No files in this folder.',
+  'workspace.openDir': 'Open folder',
+  'workspace.selectFile': 'Select file',
+  'workspace.dirTruncated': 'Folder listing truncated.',
+  'workspace.parentDir': 'Up',
+  'workspace.readSelected': 'Read selected',
+  'workspace.dirError': 'Cannot read this folder: {reason}',
+  'workspace.readError': 'Cannot read {name}: {reason}',
+  'workspace.shareUnavailable': 'Session identity unavailable; this workspace stays panel-local.',
+  'workspace.share': 'Share',
+  'workspace.sharing': 'Sharing',
+  'workspace.shareHint': 'Sharing stays in this page and clears when the last panel closes.',
+  'workspace.empty': 'No sources loaded yet.',
+  'workspace.includeSource': 'Include source',
+  'workspace.sourceTriples': '{n} triples',
+  'workspace.sourceErrors': '{n} errors',
+  'workspace.sourceWarnings': '{n} warnings',
+  'workspace.truncated': 'Truncated',
+  'workspace.stale': 'Changed on disk',
+  'workspace.reload': 'Reload',
+  'workspace.remove': 'Remove',
+  'workspace.addHint': 'Files stay in this page only; reloading a local file asks you to pick it again.',
+  'workspace.rejected': 'Source not added: {reason}',
+  'workspace.unionName': '{n} sources',
+  'source.status.ready': 'Ready',
+  'source.status.partial': 'Partial',
+  'source.status.empty': 'Empty',
+  'source.status.error': 'Error',
+  'source.status.rejected': 'Rejected',
+  'source.origin.host': 'DSH file',
+  'source.origin.browser': 'Local file',
+  // multiview
+  'view.network': 'Network',
+  'view.tree': 'Class tree',
+  'view.layered': 'Layered',
+  'view.switch': 'View',
+  'view.mode': 'Mode',
+  'view.mode.class': 'Classes',
+  'view.mode.property': 'Properties',
+  'view.search': 'Search',
+  'view.entityCount': '{n} entities',
+  'view.treeBudget': 'Tree budget reached: {n}',
+  'view.cycleCount': '{n} cycles',
+  'view.noMatches': 'No entity matches "{query}".',
+  'view.exploreRootNotClass': 'The exploration root is not a class, so the tree does not show exploration scope.',
+  'view.cycleMembers': 'Cycle group members',
+  'view.selectionHidden': 'Selected entity is not shown with these relation types.',
+  'view.noHierarchy': 'This document has no explicit class hierarchy.',
+  'view.cycle': 'cycle',
+  'view.orphan': 'orphan',
+  'view.inCycle': 'in cycle',
+  'view.groupOf': 'group of {n}',
+  'view.expand': 'Expand',
+  'view.collapse': 'Collapse',
+  'view.orientation': 'Direction',
+  'view.orientation.down': 'Top to bottom',
+  'view.orientation.right': 'Left to right',
+  'view.predicates': 'Relations',
+  'view.layerStats': '{nodes} nodes · {layers} layers · {groups} cycles',
+  'view.fit': 'Fit',
+  'view.noRelations': 'No relations match the selected relation types.',
+  'view.layered': 'Layered relation view',
+  // export
+  'export.title': 'Export',
+  'export.range': 'Range',
+  'export.range.viewport': 'Current viewport',
+  'export.range.layout': 'Whole displayed layout',
+  'export.copySvg': 'Copy SVG',
+  'export.copySvgHint': 'Use this when the browser blocks the download.',
+  'export.copied': 'SVG copied to the clipboard.',
+  'export.copyFailed': 'Clipboard unavailable; export the SVG file instead.',
+  'export.manualHint': 'Clipboard unavailable; select and copy the SVG text below.',
+  'export.svgText': 'SVG text',
+  'export.scale': 'Scale',
+  'export.svg': 'SVG',
+  'export.png': 'PNG',
+  'export.blocked': 'Nothing to export yet: wait for the layout to finish.',
+  'export.started': 'Download started. Browsers do not report whether the file was saved.',
+  'export.failed': 'Download failed: {reason}',
+  'export.tooLarge': 'This view is too large for PNG at that scale; lower the scale or export SVG.',
+  'export.pngFallback': 'PNG failed ({reason}); exported SVG instead.',
+  // provenance
+  'provenance.title': 'Sources',
+  'provenance.sources': 'Sources ({n})',
+  'provenance.none': 'No retained source',
+  'provenance.roles': 'roles',
+  'provenance.statements': '{n} statements',
+  'provenance.relations': 'Relations ({n})',
+  'provenance.subject': 'Subject',
+  'provenance.predicate': 'Predicate',
+  'provenance.object': 'Object',
+  'provenance.graphs': 'Graphs',
+  'provenance.graph.default': 'default graph',
+  'provenance.graph.unknown': 'unknown graph',
+  'provenance.graph.blank': 'anonymous graph',
+  'provenance.graph.iri': 'named graph',
+  'provenance.otherEnd': 'Other end',
 }
 
 /**
@@ -696,6 +935,10 @@ function OntologyDocumentBody(props) {
   const ready = text !== null
   const address = props && typeof props.resourceAddress === 'string' ? props.resourceAddress : ''
   const fileName = fileNameOf(address)
+  // The route is navigation/authorization only. The real file identity comes
+  // from the host's resource metadata; when it is unavailable the workspace
+  // keeps relative IRIs source-scoped and reports it instead of guessing.
+  const absolutePath = nativeAbsolutePath(props)
   return h('div', {
     style: {
       position: 'absolute',
@@ -707,15 +950,39 @@ function OntologyDocumentBody(props) {
       background: 'var(--dsw-alias-bg-layer-1, #ffffff)',
     },
     'data-ontology-source': fileName,
-  }, h(OntologyPanel, {
+  }, h(ONTOLOGY_WORKSPACE, {
     text: ready ? text : '',
     source: { address, displayName: fileName, surface: 'preview' },
+    absolutePath: absolutePath,
     sizeBytes: rawBytes !== null ? rawBytes : byteLengthOf(text || ''),
     limitBytes: MAX_SOURCE_BYTES,
     loading: !ready && !overLimit,
     skipReason: overLimit ? 'tooLarge' : undefined,
     t,
+    ctx: pluginContext,
   }))
+}
+
+/**
+ * Resolve the host-confirmed absolute path for the current preview tab.
+ * The standard slot props expose `useTabInfo` / `useResource`; the resource
+ * value is the host's WorkspaceFileStat, whose `absolutePath` is the only
+ * identity we trust. Missing metadata stays empty (never inferred).
+ */
+function nativeAbsolutePath(props) {
+  try {
+    const useTabInfo = props && props.useTabInfo
+    const useResource = props && props.useResource
+    if (typeof useTabInfo !== 'function' || typeof useResource !== 'function') return ''
+    const tabInfo = useTabInfo()
+    const tab = tabInfo && tabInfo.tab ? tabInfo.tab : null
+    if (!tab || typeof tab.contentId !== 'string' || !tab.contentId) return ''
+    const resource = useResource(tab.contentId)
+    const value = resource && resource.value ? resource.value : null
+    return value && typeof value.absolutePath === 'string' ? value.absolutePath : ''
+  } catch (error) {
+    return ''
+  }
 }
 
 /**
@@ -765,15 +1032,24 @@ function OntologySidebarViewer(props) {
       background: 'var(--dsw-alias-bg-layer-1, #ffffff)',
     },
     'data-ontology-source': fileName,
-  }, h(OntologyPanel, {
+  }, h(ONTOLOGY_WORKSPACE, {
     text: content,
     source: { address: path, displayName: fileName, surface: 'sidebar' },
+    sessionId: props && props.scope && typeof props.scope.sessionId === 'string' ? props.scope.sessionId : null,
+    absolutePath: isAbsolutePath(path) ? path : '',
     sizeBytes,
     limitBytes: SURFACE_SIDEBAR_BYTES,
     loading,
     skipReason: largeFile ? 'tooLarge' : undefined,
     t,
+    ctx: owner,
   }))
+}
+
+/** True when the value looks like a host-absolute filesystem path. */
+function isAbsolutePath(value) {
+  if (typeof value !== 'string' || value === '') return false
+  return /^[A-Za-z]:[\\/]/.test(value) || value.slice(0, 2) === '\\\\' || value.charAt(0) === '/'
 }
 
 /** Monochrome file-tree icon for ontology extensions (better-sidebar fileIcon contract). */
@@ -807,6 +1083,7 @@ let pluginContext = null
  */
 export function apply(ctx) {
   pluginContext = ctx
+  ctx.effect(() => () => WORKSPACE_COMPONENTS.clearSharedWorkspaces(), 'dsh-ontology: shared workspaces')
 
   ctx.effect(() => ctx.locale.register(LOCALE_NS, { zh: ZH, en: EN }), 'dsh-ontology: dictionaries')
 

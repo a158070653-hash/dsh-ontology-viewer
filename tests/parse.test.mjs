@@ -10,6 +10,9 @@ import {
   parseJsonLd,
   resolveIri,
   expandPrefixedName,
+  isDshResourceAddress,
+  parseDshResourceAddress,
+  fileUriFromPath,
 } from '../src/rdf-parse.js'
 
 const RDF = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#'
@@ -89,6 +92,8 @@ test('turtle: prefixes, lists, literals, blank nodes and collections', () => {
     p: RDF + 'type',
     o: FOAF + 'Person',
     oKind: 'iri',
+    graph: { kind: 'default' },
+    location: null,
   })
 
   const names = bySubjectAndPredicate(doc, EX + 'alice', FOAF + 'name')
@@ -176,7 +181,7 @@ test('ntriples: exact count, unicode escape, blank node and datatype', () => {
   assert.equal(note.o, 'line1\nline2\ttabbed')
 })
 
-test('ntriples: N-Quads graph term is ignored', () => {
+test('ntriples: N-Quads graph term is retained', () => {
   const doc = parseNTriples('<http://e/s> <http://e/p> <http://e/o> <http://e/g> .\n')
   assert.equal(doc.triples.length, 1)
   assert.deepEqual(doc.triples[0], {
@@ -184,15 +189,17 @@ test('ntriples: N-Quads graph term is ignored', () => {
     p: 'http://e/p',
     o: 'http://e/o',
     oKind: 'iri',
+    graph: { kind: 'iri', value: 'http://e/g' },
+    location: null,
   })
-  const diagnostic = diagnosticsWithCode(doc, 'named-graph-ignored')
-  assert.ok(diagnostic, 'N-Quads graph terms must be reported')
-  assert.equal(diagnostic.count, 1)
-  assert.equal(diagnostic.sample.length, 1)
-  assert.match(diagnostic.sample[0], /http:\/\/e\/g/)
+  assert.equal(diagnosticsWithCode(doc, 'named-graph-ignored'), undefined)
 
   const plain = parseNTriples('<http://e/s> <http://e/p> <http://e/o> .\n')
+  assert.equal(plain.triples[0].graph.kind, 'default')
   assert.equal(diagnosticsWithCode(plain, 'named-graph-ignored'), undefined)
+
+  const blankGraph = parseNTriples('<http://e/s> <http://e/p> <http://e/o> _:g .\n')
+  assert.deepEqual(blankGraph.triples[0].graph, { kind: 'blank', value: '_:g' })
 })
 
 test('rdfxml: typed node, nested property, resource, collection and xml:lang', () => {
@@ -211,6 +218,8 @@ test('rdfxml: typed node, nested property, resource, collection and xml:lang', (
     p: RDF + 'type',
     o: FOAF + 'Person',
     oKind: 'iri',
+    graph: { kind: 'default' },
+    location: null,
   })
 
   const name = byPredicate(doc, FOAF + 'name')[0]
@@ -256,6 +265,8 @@ test('jsonld: context prefixes, @graph, nested node, @value language and @type',
     p: RDF + 'type',
     o: FOAF + 'Person',
     oKind: 'iri',
+    graph: { kind: 'default' },
+    location: null,
   })
 
   const name = bySubjectAndPredicate(doc, EX + 'alice', FOAF + 'name')[0]
@@ -508,7 +519,7 @@ test('base IRI: resource addresses map deterministically', () => {
 
   // Windows drive and UNC paths normalize to file URLs.
   assert.equal(parseRelative('C:\\repo\\onto.ttl').base, 'file:///C:/repo/onto.ttl')
-  assert.equal(parseRelative('\\\\server\\share\\onto.ttl').base, 'file:////server/share/onto.ttl')
+  assert.equal(parseRelative('\\\\server\\share\\onto.ttl').base, 'file://server/share/onto.ttl')
 
   // Custom schemes are used verbatim only when they are absolute hierarchical URIs.
   assert.equal(parseRelative('dsh-app://panel/dir/onto.ttl#frag').base, 'dsh-app://panel/dir/onto.ttl')
@@ -575,6 +586,104 @@ test('base IRI: document declarations override the resource address', () => {
 })
 
 /* ------------------------------------------------------------------ */
+/* DSH route vs RDF base identity                                     */
+/* ------------------------------------------------------------------ */
+
+test('dsh routes are authorization only and never an RDF base', () => {
+  const route = 'dsh-resource://file/session/s/D:/data/sample.ttl'
+  assert.equal(isDshResourceAddress(route), true)
+  assert.equal(isDshResourceAddress('dsh-app://panel/x.ttl'), false)
+  assert.deepEqual(parseDshResourceAddress(route), {
+    authority: 'file', sessionId: 's', path: 'D:/data/sample.ttl',
+  })
+  assert.deepEqual(parseDshResourceAddress('dsh-resource://file/session/s//etc/hosts'), {
+    authority: 'file', sessionId: 's', path: '/etc/hosts',
+  })
+  assert.equal(parseDshResourceAddress('https://example.org/x.ttl'), null)
+  assert.equal(parseDshResourceAddress(undefined), null)
+
+  const routed = parseRelative(route)
+  assert.equal(routed.base, '')
+  assert.equal(routed.baseSource, 'none')
+  assert.equal(routed.triples[0].s, 'rel')
+  assert.ok(diagnosticsWithCode(routed, 'base-unavailable'))
+
+  // Even when the legacy resource address is the same route, it stays excluded.
+  const legacyRoute = parseOntology('<rel> <http://e/p> <http://e/o> .', {
+    format: 'turtle',
+    resourceAddress: route,
+  })
+  assert.equal(legacyRoute.base, '')
+  assert.equal(legacyRoute.triples[0].s, 'rel')
+
+  const withPath = parseOntology('<rel> <http://e/p> <http://e/o> .', {
+    format: 'turtle',
+    navigationAddress: route,
+    absolutePath: 'D:/data/sample.ttl',
+  })
+  assert.equal(withPath.base, 'file:///D:/data/sample.ttl')
+  assert.equal(withPath.baseSource, 'resource')
+  assert.equal(withPath.triples[0].s, 'file:///D:/data/rel')
+
+  const explicitBase = parseOntology('<rel> <http://e/p> <http://e/o> .', {
+    format: 'turtle',
+    navigationAddress: route,
+    absolutePath: 'D:/data/sample.ttl',
+    rdfBase: 'https://ontology.example/base/',
+  })
+  assert.equal(explicitBase.base, 'https://ontology.example/base/')
+  assert.equal(explicitBase.triples[0].s, 'https://ontology.example/base/rel')
+})
+
+test('one file in both host entries gets the same base', () => {
+  const direct = parseOntology('<rel> <http://e/p> <http://e/o> .', {
+    format: 'turtle',
+    absolutePath: 'D:\\data\\dir\\sample.ttl',
+  })
+  const viaUri = parseOntology('<rel> <http://e/p> <http://e/o> .', {
+    format: 'turtle',
+    resourceAddress: 'file:///D:/data/dir/sample.ttl',
+  })
+  assert.equal(direct.base, 'file:///D:/data/dir/sample.ttl')
+  assert.equal(viaUri.base, direct.base)
+  assert.equal(direct.triples[0].s, viaUri.triples[0].s)
+
+  // Mixed separators and drive case fold to the same identity.
+  const mixed = parseOntology('<rel> <http://e/p> <http://e/o> .', {
+    format: 'turtle',
+    absolutePath: 'd:/data\\dir/sample.ttl',
+  })
+  assert.equal(mixed.base, direct.base)
+})
+
+test('path to file URI conversion is one deterministic function', () => {
+  assert.equal(fileUriFromPath('D:\\repo\\a b\\c#d.ttl'), 'file:///D:/repo/a%20b/c%23d.ttl')
+  assert.equal(fileUriFromPath('C:/repo/onto.ttl'), 'file:///C:/repo/onto.ttl')
+  assert.equal(fileUriFromPath('\\\\server\\share\\a b.ttl'), 'file://server/share/a%20b.ttl')
+  assert.equal(fileUriFromPath('/repo/é.ttl'), 'file:///repo/%C3%A9.ttl')
+  // A literal percent escape in a raw path is encoded once, not decoded.
+  assert.equal(fileUriFromPath('/repo/a%20b.ttl'), 'file:///repo/a%2520b.ttl')
+  assert.equal(fileUriFromPath('relative/x.ttl'), null)
+  assert.equal(fileUriFromPath(''), null)
+  assert.equal(fileUriFromPath(undefined), null)
+
+  // An already encoded file URI is kept as-is (no decode/re-encode cycle).
+  const encoded = parseOntology('<rel> <http://e/p> <http://e/o> .', {
+    format: 'turtle',
+    resourceAddress: 'file:///repo/a%20b.ttl',
+  })
+  assert.equal(encoded.base, 'file:///repo/a%20b.ttl')
+
+  // Windows special characters round-trip through the parser.
+  const windows = parseOntology('<rel> <http://e/p> <http://e/o> .', {
+    format: 'turtle',
+    absolutePath: 'D:\\onto dir\\a#b?.ttl',
+  })
+  assert.equal(windows.base, 'file:///D:/onto%20dir/a%23b%3F.ttl')
+  assert.equal(windows.triples[0].s, 'file:///D:/onto%20dir/rel')
+})
+
+/* ------------------------------------------------------------------ */
 /* Structured truncation                                              */
 /* ------------------------------------------------------------------ */
 
@@ -621,24 +730,47 @@ test('structured truncation: every format stops at maxTriples', () => {
 /* Named graphs                                                       */
 /* ------------------------------------------------------------------ */
 
-test('named graph diagnostics: TriG labels are ignored, triples kept', () => {
+test('named graphs: TriG labels are retained, triples keep graph context', () => {
   const trig = parseTurtle(
     '@prefix ex: <http://e/> .\nex:g1 { ex:a ex:p ex:b . }\nex:g2 { ex:c ex:p ex:d . }',
   )
   assert.equal(trig.triples.length, 2)
-  const diagnostic = diagnosticsWithCode(trig, 'named-graph-ignored')
-  assert.ok(diagnostic, 'TriG labels must be reported')
-  assert.equal(diagnostic.severity, 'warning')
-  assert.equal(diagnostic.count, 2)
-  assert.equal(diagnostic.sample.length, 2)
+  assert.equal(diagnosticsWithCode(trig, 'named-graph-ignored'), undefined)
   assert.deepEqual(trig.triples.map((triple) => triple.s), ['http://e/a', 'http://e/c'])
+  assert.deepEqual(trig.triples.map((triple) => triple.graph), [
+    { kind: 'iri', value: 'http://e/g1' },
+    { kind: 'iri', value: 'http://e/g2' },
+  ])
 
   const keyword = parseTurtle('@prefix ex: <http://e/> .\nGRAPH ex:g { ex:a ex:p ex:b . }')
   assert.equal(keyword.triples.length, 1)
-  assert.ok(diagnosticsWithCode(keyword, 'named-graph-ignored'))
+  assert.deepEqual(keyword.triples[0].graph, { kind: 'iri', value: 'http://e/g' })
+
+  const blank = parseTurtle('@prefix ex: <http://e/> .\n_:g { ex:a ex:p ex:b . }')
+  assert.equal(blank.triples[0].graph.kind, 'blank')
+  assert.equal(blank.triples[0].graph.value, '_:g')
+
+  const iri = parseTurtle('@prefix ex: <http://e/> .\n<http://e/g> { ex:a ex:p ex:b . }')
+  assert.deepEqual(iri.triples[0].graph, { kind: 'iri', value: 'http://e/g' })
+
+  const defaultBlock = parseTurtle('@prefix ex: <http://e/> .\n{ ex:a ex:p ex:b . }')
+  assert.equal(defaultBlock.triples[0].graph.kind, 'default')
+
+  // Entering and leaving nested-style blocks restores the enclosing context.
+  const sequential = parseTurtle(
+    '@prefix ex: <http://e/> .\nex:a ex:p ex:b .\nex:g { ex:c ex:p ex:d . }\nex:e ex:p ex:f .',
+  )
+  assert.deepEqual(sequential.triples.map((triple) => triple.graph.kind),
+    ['default', 'iri', 'default'])
 
   const plain = parseTurtle('@prefix ex: <http://e/> .\nex:a ex:p ex:b .')
   assert.equal(diagnosticsWithCode(plain, 'named-graph-ignored'), undefined)
+  assert.equal(plain.triples[0].graph.kind, 'default')
+
+  const unresolved = parseTurtle('@prefix ex: <http://e/> .\nmissing:g { ex:a ex:p ex:b . }')
+  assert.equal(unresolved.triples.length, 1)
+  assert.equal(unresolved.triples[0].graph.kind, 'unknown')
+  assert.ok(diagnosticsWithCode(unresolved, 'named-graph-context'))
 })
 
 /* ------------------------------------------------------------------ */
@@ -847,4 +979,24 @@ test('parsing with diagnostics and truncation is deterministic', () => {
   assert.deepEqual(first, second)
   assert.equal(JSON.stringify(first), JSON.stringify(second))
   assert.ok(first.diagnostics.length > 0)
+})
+
+test('base IRI: nested xml:base restores the enclosing scope', () => {
+  const RDF_NS = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#'
+  const doc = parseOntology(
+    '<rdf:RDF xmlns:rdf="' + RDF_NS + '" xmlns:ex="http://e/" xml:base="http://outer.example/root/">' +
+      '<rdf:Description rdf:about="a"><ex:p rdf:resource="x"/></rdf:Description>' +
+      '<rdf:Description rdf:about="b" xml:base="http://inner.example/dir/">' +
+        '<ex:p rdf:resource="y"/></rdf:Description>' +
+      '<rdf:Description rdf:about="c"><ex:p rdf:resource="z"/></rdf:Description>' +
+    '</rdf:RDF>',
+    { format: 'rdfxml' },
+  )
+  const edges = doc.triples.filter((triple) => triple.p === 'http://e/p')
+  assert.equal(edges.length, 3)
+  const targets = Object.fromEntries(edges.map((triple) => [triple.s, triple.o]))
+  assert.equal(targets['http://outer.example/root/a'], 'http://outer.example/root/x')
+  assert.equal(targets['http://inner.example/dir/b'], 'http://inner.example/dir/y')
+  assert.equal(targets['http://outer.example/root/c'], 'http://outer.example/root/z',
+    'the sibling after the nested scope uses the outer base again')
 })

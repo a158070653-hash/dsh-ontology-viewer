@@ -29,6 +29,17 @@ import { cpus, totalmem, platform, arch } from 'node:os'
 
 import { parseOntology } from '../src/rdf-parse.js'
 import { buildGraph, layoutGraph } from '../src/graph-model.js'
+import {
+  createWorkspace,
+  addSource,
+  composeWorkspaceGraph,
+} from '../src/ontology-workspace.js'
+import {
+  entityKeyForTerm,
+  statementIdFor,
+  graphIdentityFor,
+} from '../src/ontology-identity.js'
+import { buildHierarchy, layoutLayeredGraph } from '../src/ontology-views.js'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 
@@ -401,9 +412,125 @@ function printHumanReport(report) {
     if (fixture.failure) console.log([fixture.name, '-', 'failure', fixture.failure].join('\t'))
     console.log('')
   }
+  if (report.workspace) {
+    const workspace = report.workspace
+    console.log('workspace: multi-file compose')
+    console.log([
+      'workspace',
+      '-',
+      'files=' + workspace.files,
+      'parsedTriples=' + workspace.parsedTriples,
+      'statements=' + workspace.statements,
+      'occurrences=' + workspace.occurrences,
+      'parseMs=' + workspace.parseMs.p50 + '/' + workspace.parseMs.p95,
+      'composeMs=' + workspace.composeMs.p50 + '/' + workspace.composeMs.p95,
+      'treeMs=' + workspace.treeProjectionMs.p50,
+      'layeredMs=' + workspace.layeredProjectionMs.p50,
+    ].join('\t'))
+    console.log('')
+  }
   console.log('Notes: timings are milliseconds (p50/p95 of ' + REPS + ' reps after one warmup).')
   console.log('`json` is JSON.stringify(graph).length: the structured-clone payload proxy for worker transfer.')
   console.log('Real Worker init / message round-trip / transfer cost are measured by the DSH runtime probe, not here.')
+}
+
+
+function createWorkspaceFixture() {
+  // Two deterministic sources sharing one entity: the merge/projection cost is
+  // what matters here, not the single-file pipeline.
+  const shared = 'http://bench.example/shared'
+  let one = '@prefix ex: <http://bench.example/> .\n'
+  let two = '@prefix ex: <http://bench.example/> .\n'
+  for (let index = 0; index < 300; index += 1) {
+    one += 'ex:a' + index + ' ex:link ex:shared .\n'
+    one += 'ex:a' + index + ' ex:label "node ' + index + '" .\n'
+    two += 'ex:b' + index + ' ex:link ex:shared .\n'
+    two += 'ex:b' + index + ' ex:label "node ' + index + '" .\n'
+  }
+  one += 'ex:Sub ex:sub rdf:subClassOf ex:Base .\n'
+  return {
+    one: one,
+    two: two,
+    shared: shared,
+  }
+}
+
+/**
+ * Measure the multi-file path: parse each source once, then compose twice
+ * (the second compose represents switching views without re-parsing).
+ */
+function measureWorkspace() {
+  const fixture = createWorkspaceFixture()
+  const identity = { entityKeyForTerm, statementIdFor, graphIdentityFor }
+  const makeWorkspace = () => createWorkspace({ buildGraph, identity })
+  const parseOne = { name: 'one.ttl', path: 'D:/bench/one.ttl' }
+  const parseTwo = { name: 'two.ttl', path: 'D:/bench/two.ttl' }
+  const parsedOne = parseOntology(fixture.one, Object.assign({}, PARSE_OPTIONS, {
+    fileName: parseOne.name, absolutePath: parseOne.path,
+  }))
+  const parsedTwo = parseOntology(fixture.two, Object.assign({}, PARSE_OPTIONS, {
+    fileName: parseTwo.name, absolutePath: parseTwo.path,
+  }))
+  const parseTimes = []
+  const composeTimes = []
+  const treeTimes = []
+  const layeredTimes = []
+  let statements = 0
+  let occurrences = 0
+  for (let rep = 0; rep < REPS; rep += 1) {
+    const startParse = now()
+    const parsedA = parseOntology(fixture.one, Object.assign({}, PARSE_OPTIONS, {
+      fileName: parseOne.name, absolutePath: parseOne.path,
+    }))
+    const parsedB = parseOntology(fixture.two, Object.assign({}, PARSE_OPTIONS, {
+      fileName: parseTwo.name, absolutePath: parseTwo.path,
+    }))
+    parseTimes.push(now() - startParse)
+
+    let workspace = makeWorkspace()
+    workspace = addSource(workspace, {
+      origin: 'host', displayName: parseOne.name, absolutePath: parseOne.path,
+      parsed: parsedA, text: fixture.one, byteSize: fixture.one.length,
+    }).workspace
+    workspace = addSource(workspace, {
+      origin: 'host', displayName: parseTwo.name, absolutePath: parseTwo.path,
+      parsed: parsedB, text: fixture.two, byteSize: fixture.two.length,
+    }).workspace
+
+    const startCompose = now()
+    const first = composeWorkspaceGraph(workspace, {
+      maxNodes: 1500, maxEdges: 6000, maxLiteralsPerNode: 60, maxLiteralLength: 16384,
+    })
+    composeTimes.push(now() - startCompose)
+    const second = composeWorkspaceGraph(workspace, {
+      maxNodes: 1500, maxEdges: 6000, maxLiteralsPerNode: 60, maxLiteralLength: 16384,
+    })
+    statements = first.statements
+    occurrences = first.occurrences
+    if (second.occurrences !== occurrences) throw new Error('compose is not deterministic')
+
+    const startTree = now()
+    const hierarchy = buildHierarchy(first.graph, { mode: 'class' })
+    treeTimes.push(now() - startTree)
+    const startLayered = now()
+    layoutLayeredGraph(first.graph, {
+      predicates: ['http://www.w3.org/2000/01/rdf-schema#subClassOf'],
+      width: 900, height: 600,
+    })
+    layeredTimes.push(now() - startLayered)
+  }
+  // Parse once more after the loop to report source sizes without touching
+  // the measured arrays.
+  return {
+    files: 2,
+    statements: statements,
+    occurrences: occurrences,
+    parseMs: summarize(parseTimes),
+    composeMs: summarize(composeTimes),
+    treeProjectionMs: summarize(treeTimes),
+    layeredProjectionMs: summarize(layeredTimes),
+    parsedTriples: parsedOne.triples.length + parsedTwo.triples.length,
+  }
 }
 
 function main() {
@@ -416,6 +543,7 @@ function main() {
   for (const fixture of createFixtures()) {
     report.fixtures.push(measureFixture(fixture))
   }
+  report.workspace = measureWorkspace()
   if (JSON_OUTPUT) {
     process.stdout.write(JSON.stringify(report, null, 2) + '\n')
   } else {

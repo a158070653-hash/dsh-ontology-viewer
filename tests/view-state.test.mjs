@@ -108,6 +108,8 @@ import {
 
 import {
   DETAILS_SECTIONS,
+  sourceLabelFrom,
+  nodeGraphKinds,
   DETAILS_GROUP_LIMIT,
   nextDrawerFocusTarget,
   normalizeConnectionGroups,
@@ -515,13 +517,13 @@ test('detailsSections: fixed section order with presence flags', () => {
   const base = { id: 'ex:alice', types: [], literals: [], source: null }
   const empty = detailsSections(base, { out: [], in: [] })
   assert.deepEqual(empty.map((section) => section.key), DETAILS_SECTIONS)
-  assert.deepEqual(empty.map((section) => section.present), [true, false, false, false, true, false])
+  assert.deepEqual(empty.map((section) => section.present), [true, false, false, false, true, false, false])
 
   const full = detailsSections(
     { id: 'ex:alice', types: [RDF_TYPE], literals: [{ p: RDFS_LABEL, value: 'Alice' }], source: null },
     { out: [{ predicate: 'ex:knows', count: 1, items: [] }], in: [] },
   )
-  assert.deepEqual(full.map((section) => section.present), [true, true, true, true, true, false])
+  assert.deepEqual(full.map((section) => section.present), [true, true, true, true, true, false, false])
 })
 
 test('visibleGroupItems: default page, show-more and empty groups', () => {
@@ -554,4 +556,192 @@ test('literalTruncation: shows kept vs total literal count', () => {
     { shown: 2, dropped: 3, total: 5, truncated: true })
   assert.deepEqual(literalTruncation({}), { shown: 0, dropped: 0, total: 0, truncated: false })
   assert.deepEqual(literalTruncation(null), { shown: 0, dropped: 0, total: 0, truncated: false })
+})
+
+import {
+  toggleExpandedList,
+  sourceStatusKey,
+  collectPredicateOptions,
+  nextWorksetSelection,
+  treeSearchPlan,
+  filterTreeRows,
+  layeredFocus,
+  togglePickerSelection,
+  sourcePanelBadges,
+  nextTreeFocusIndex,
+} from '../src/graph-view-multiview.js'
+
+// ---------------------------------------------------------------------------
+// Workspace views: pure state helpers
+// ---------------------------------------------------------------------------
+
+test('workspace view state: expansion toggles are immutable and idempotent', () => {
+  const initial = []
+  const opened = toggleExpandedList(initial, 'http://e/A')
+  assert.deepEqual(opened, ['http://e/A'])
+  assert.deepEqual(initial, [], 'the previous list is not mutated')
+  const again = toggleExpandedList(opened, 'http://e/A')
+  assert.deepEqual(again, [])
+  const two = toggleExpandedList(opened, 'http://e/B')
+  assert.deepEqual(two, ['http://e/A', 'http://e/B'])
+  assert.deepEqual(toggleExpandedList(two, undefined), two, 'non-string ids are ignored')
+})
+
+test('workspace view state: source status and origin keys are stable', () => {
+  assert.equal(sourceStatusKey('ready'), 'source.status.ready')
+  assert.equal(sourceStatusKey('partial'), 'source.status.partial')
+  assert.equal(sourceStatusKey('empty'), 'source.status.empty')
+  assert.equal(sourceStatusKey('rejected'), 'source.status.rejected')
+  assert.equal(sourceStatusKey('weird'), 'source.status.error')
+})
+
+test('workspace view state: predicate options come from the graph and sort by label', () => {
+  const graph = {
+    edges: [
+      { p: 'http://e/b', label: 'ex:b' },
+      { p: 'http://e/a', label: 'ex:a' },
+      { p: 'http://e/a', label: 'ex:a' },
+      { p: 'http://e/c' },
+    ],
+  }
+  const options = collectPredicateOptions(graph)
+  assert.deepEqual(options.map((option) => option.iri), ['http://e/a', 'http://e/b', 'http://e/c'])
+  assert.deepEqual(options.map((option) => option.label), ['ex:a', 'ex:b', 'http://e/c'])
+  assert.deepEqual(collectPredicateOptions(null), [])
+})
+
+test('workspace view state: workset toggles deselect one source from the implicit all-set', () => {
+  const all = ['a', 'b', 'c']
+  // Empty workset means "all selected"; deselecting the first source must keep
+  // the other two, not collapse the set to the clicked id.
+  assert.deepEqual(nextWorksetSelection(all, [], 'b'), ['a', 'c'])
+  assert.deepEqual(nextWorksetSelection(all, ['a', 'c'], 'a'), ['c'])
+  assert.deepEqual(nextWorksetSelection(all, ['c'], 'a'), ['c', 'a'])
+  // Re-selecting the last missing source restores the unfiltered state.
+  assert.deepEqual(nextWorksetSelection(all, ['a', 'c'], 'b'), [])
+  // Unknown ids and malformed input never produce a bogus filter.
+  assert.deepEqual(nextWorksetSelection(all, [], 'missing'), [])
+  assert.deepEqual(nextWorksetSelection(null, null, 'a'), [])
+})
+
+test('workspace view state: tree search finds hidden matches and their ancestor path', () => {
+  const entities = new Map([
+    ['A', { label: 'Animal', parents: [], children: [{ childId: 'B' }] }],
+    ['B', { label: 'Bird', parents: [{ parentId: 'A' }], children: [] }],
+    ['C', { label: 'Car', parents: [], children: [] }],
+  ])
+  const hierarchy = { entities }
+  const plan = treeSearchPlan(hierarchy, 'bir')
+  assert.equal(plan.count, 1)
+  assert.equal(plan.entityId, 'B', 'the first entity id in sorted order is selected')
+  assert.deepEqual(plan.ancestors, ['A'], 'the path that reveals the match is reported')
+  assert.equal(treeSearchPlan(hierarchy, '   ').entityId, null)
+  assert.equal(treeSearchPlan(hierarchy, 'zzz').count, 0)
+  assert.equal(treeSearchPlan(null, 'a').entityId, null)
+
+  const refs = [
+    { refId: 'r1', entityId: 'A', parentRefId: null, depth: 0, childCount: 1 },
+    { refId: 'r2', entityId: 'B', parentRefId: 'r1', depth: 1, childCount: 0 },
+    { refId: 'r3', entityId: 'C', parentRefId: null, depth: 0, childCount: 0 },
+  ]
+  assert.deepEqual(filterTreeRows(refs, hierarchy, plan).map((ref) => ref.refId), ['r1', 'r2'])
+  assert.equal(filterTreeRows(refs, hierarchy, treeSearchPlan(hierarchy, 'zzz')).length, 0)
+  assert.deepEqual(filterTreeRows(refs, hierarchy, treeSearchPlan(hierarchy, '')).map((ref) => ref.refId),
+    ['r1', 'r2', 'r3'], 'an empty query keeps every row')
+})
+
+test('workspace view state: layered focus keeps the selection and one hop', () => {
+  const layout = {
+    nodes: [
+      { id: 'A', kind: 'node' },
+      { id: 'B', kind: 'node' },
+      { id: 'C', kind: 'node' },
+      { id: 'G', kind: 'group', groupId: 'A' },
+    ],
+    edges: [
+      { id: 'e1', source: 'A', target: 'B' },
+      { id: 'e2', source: 'B', target: 'C' },
+    ],
+  }
+  const focus = layeredFocus(layout, 'A')
+  assert.deepEqual([...focus.nodes].sort(), ['A', 'B', 'G'])
+  assert.deepEqual([...focus.edges], ['e1'], 'only incident edges stay focused')
+  assert.equal(layeredFocus(layout, ''), null)
+  assert.equal(layeredFocus(layout, 'missing'), null)
+  assert.equal(layeredFocus(null, 'A'), null)
+})
+
+test('details provenance: source labels resolve from Map, plain map or fallback', () => {
+  const map = new Map([['src1', 'pizza.ttl']])
+  assert.equal(sourceLabelFrom(map, 'src1'), 'pizza.ttl')
+  assert.equal(sourceLabelFrom({ src2: 'people.nt' }, 'src2'), 'people.nt')
+  assert.equal(sourceLabelFrom(map, 'missing'), 'missing')
+  assert.equal(sourceLabelFrom(null, 'src3'), 'src3')
+})
+
+test('workspace view state: workspace-file picker selection toggles by path', () => {
+  assert.deepEqual(togglePickerSelection([], 'a/b.ttl'), ['a/b.ttl'])
+  assert.deepEqual(togglePickerSelection(['a/b.ttl'], 'a/b.ttl'), [])
+  assert.deepEqual(togglePickerSelection(['a/b.ttl'], 'a/c.ttl'), ['a/b.ttl', 'a/c.ttl'])
+  assert.deepEqual(togglePickerSelection(['a/b.ttl'], 'a/c.ttl', false), ['a/b.ttl'])
+  assert.deepEqual(togglePickerSelection(['a/b.ttl'], 'a/b.ttl', true), ['a/b.ttl'])
+  assert.deepEqual(togglePickerSelection(null, ''), [])
+})
+
+test('details provenance: node graph identity counts incident edge graphs', () => {
+  const graph = {
+    edges: [
+      { id: 'e1', source: 'A', target: 'B', graphs: [] },
+      { id: 'e2', source: 'A', target: 'C', graphs: [{ kind: 'iri', value: 'g1' }] },
+      { id: 'e3', source: 'B', target: 'C', graphs: [{ kind: 'unknown' }] },
+      { id: 'e4', source: 'C', target: 'D', graphs: [{ kind: 'iri' }, { kind: 'iris-bad' }] },
+    ],
+  }
+  const a = nodeGraphKinds(graph, 'A')
+  assert.equal(a.default, 0)
+  assert.equal(a.unknown, 1, 'legacy missing graph identity is unknown, not default')
+  assert.equal(a.iri, 1)
+  assert.equal(a.blank, 0)
+  const c = nodeGraphKinds(graph, 'C')
+  assert.equal(c.unknown, 2, 'unknown and unrecognised kinds are reported as unknown')
+  assert.deepEqual(nodeGraphKinds(null, 'A'), { default: 0, iri: 0, blank: 0, unknown: 0 })
+})
+
+test('source panel state: badges cover ready/empty/error/partial and per-file flags', () => {
+  const hostReady = sourcePanelBadges({ origin: 'host', status: 'ready', format: 'turtle', tripleCount: 73 })
+  assert.deepEqual(hostReady.map((entry) => entry.key), ['origin', 'status', 'format'])
+  assert.equal(hostReady[0].textKey, 'source.origin.host')
+  assert.equal(hostReady[1].textKey, 'source.status.ready')
+  assert.equal(hostReady[2].text, 'TURTLE')
+
+  const browserEmpty = sourcePanelBadges({ origin: 'browser', status: 'empty' })
+  assert.equal(browserEmpty[0].textKey, 'source.origin.browser')
+  assert.equal(browserEmpty[1].textKey, 'source.status.empty')
+
+  const failed = sourcePanelBadges({
+    origin: 'host', status: 'error', errorCount: 2, warningCount: 1, truncated: true, stale: true,
+  })
+  assert.equal(failed[1].tone, 'error')
+  assert.equal(failed.find((entry) => entry.key === 'errors').count, 2)
+  assert.equal(failed.find((entry) => entry.key === 'warnings').tone, 'warning')
+  assert.equal(failed.find((entry) => entry.key === 'truncated').tone, 'warning')
+  assert.equal(failed.find((entry) => entry.key === 'stale').tone, 'warning')
+
+  const partial = sourcePanelBadges({ origin: 'host', status: 'partial' })
+  assert.equal(partial[1].tone, 'warning')
+  const missing = sourcePanelBadges(null)
+  assert.equal(missing[0].textKey, 'source.origin.host')
+  assert.equal(missing[1].textKey, 'source.status.error', 'unknown status falls back to the error family')
+})
+
+test('workspace view state: tree keyboard focus walks visible rows and clamps', () => {
+  const rows = [{ entityId: 'a' }, { entityId: 'b' }, { entityId: 'c' }]
+  assert.equal(nextTreeFocusIndex(rows, 'a', 'ArrowDown'), 1)
+  assert.equal(nextTreeFocusIndex(rows, 'c', 'ArrowDown'), 2, 'clamps at the last row')
+  assert.equal(nextTreeFocusIndex(rows, 'a', 'ArrowUp'), 0, 'clamps at the first row')
+  assert.equal(nextTreeFocusIndex(rows, 'b', 'Home'), 0)
+  assert.equal(nextTreeFocusIndex(rows, 'b', 'End'), 2)
+  assert.equal(nextTreeFocusIndex(rows, 'missing', 'ArrowDown'), 0)
+  assert.equal(nextTreeFocusIndex([], 'a', 'ArrowDown'), -1)
+  assert.equal(nextTreeFocusIndex(rows, 'a', 'x'), 0, 'other keys keep the current row')
 })

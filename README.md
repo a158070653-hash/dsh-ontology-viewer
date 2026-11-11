@@ -122,21 +122,34 @@ dsh plugin --profile <profile> add link:<克隆下来的绝对路径>
 | 「重新布局」/「适配视图」 | 重新计算布局 / 缩放到整图 |
 | 「标签」 | 节点文字开关（大图默认只在高缩放级别显示标签） |
 | 点击关系端点 / 邻居类型 IRI | 在图内选中并居中该节点（若存在） |
+| 「来源」 | 打开来源面板：已载入文件、格式、状态、三元组/错误/警告数、截断与磁盘变化；可添加本地文件、移除、重载、选择联合或单文件工作集 |
+| 「关系网络 / 类层级 / 分层关系」 | 三种视图共享同一实体身份与来源数据；类层级基于显式 `rdfs:subClassOf`/`rdfs:subPropertyOf`，分层图按所选谓词与方向布局并折叠循环；点击循环组会列出成员并可直接选中成员 |
+| 「导出」 | 导出当前视图为 SVG/PNG；范围可选「当前视口」或「当前显示集合完整布局」，导出不增加被过滤/折叠/预算隐藏的内容 |
+| 「共享」（来源面板） | 在同一 Session 的面板间共享已解析来源（只共享解析快照，不发送源文本）；最后一个面板关闭即清空 |
+| 节点来源（类层级/分层视图） | 查看节点的完整来源、出现角色、语句数，以及每条关系的 s/p/o、来源列表与命名图状态 |
+
+> 来源面板与详情展示的是**已接纳数据来源**，不等于输入完整性：解析截断、被拒绝/超出预算的文件、未加载或已移除的来源都不在其中；详情里的“已接纳来源不代表输入完整”提示即为该语义。
+
+> 多文件：打开主文件后，在「来源」面板点击「添加文件」可把本地 RDF 文件加入当前工作区。加入的文件只在当前页面内存中，不会上传；本地文件重载时需要重新选择文件。DSH 工作区内逐目录复选加载（方案 A）依赖官方 `workspaceFiles` 能力，目前保留为可选路线，需在真实环境完成授权/取消/读取验证后才启用；在此之前使用本地文件选择（方案 B）。
 
 ## 支持的格式
 
 | 后缀 | 解析器 | 覆盖范围 |
 | --- | --- | --- |
-| `.ttl` `.turtle` `.n3` `.trig` | Turtle | `@prefix`/`PREFIX`、`@base`、`;` 与 `,` 列表、空白节点 `[ ]`、集合 `( )`、语言标签、`^^` 类型、数字/布尔简写、`\u` 转义；TriG 的图标签不产生命名图语义（产生 `named-graph-ignored` 诊断）、内部三元组保留 |
-| `.nt` `.nq` | N-Triples | 每行一条语句、`\u` 转义、空白节点；`.nq` 的第 4 列图名忽略并产生诊断 |
+| `.ttl` `.turtle` `.n3` `.trig` | Turtle | `@prefix`/`PREFIX`、`@base`、`;` 与 `,` 列表、空白节点 `[ ]`、集合 `( )`、语言标签、`^^` 类型、数字/布尔简写、`\u` 转义；TriG 图标签保留为语句的 `graph` 字段（默认图/命名图/空白图名），无法识别的图上下文标为 `unknown` 并给出分类诊断 |
+| `.nt` `.nq` | N-Triples | 每行一条语句、`\u` 转义、空白节点；`.nq` 的第 4 列图名保留为语句的 `graph` 字段 |
 | `.rdf` `.owl` `.xml` | RDF/XML | `rdf:about`/`rdf:ID`/`rdf:nodeID`、`rdf:resource`、`rdf:parseType`（Resource/Literal/Collection）、`rdf:li`、`xml:base`/`xml:lang`、xmlns 前缀解析；未实现的具体化/parseType 会给出分类诊断 |
-| `.jsonld` | JSON-LD | `@context`（前缀 / term / `@vocab` / `@base`）、`@graph`（含顶层 `@graph` 兄弟键）、`@id`、`@type`、`@value` + `@language`、`@container`（`@set`/`@list`/`@language`/`@index`）；`@reverse` 等不支持结构会给出分类诊断 |
+| `.jsonld` | JSON-LD | `@context`（前缀 / term / `@vocab` / `@base`）、`@graph`（含顶层 `@graph` 兄弟键）、`@id`、`@type`、`@value` + `@language`、`@container`（`@set`/`@list`/`@language`/`@index`）；`@reverse` 等不支持结构会给出分类诊断；带 `@id` 的命名 `@graph` 保留语句但标为 `unknown` 图身份并诊断 |
 
 **故意不接管 `.json`**：普通 JSON 文件仍然走宿主的代码/JSON 查看器，只有 `.jsonld` 后缀进入图谱。
 
 格式未知时按内容嗅探：`{` / `[` → JSON-LD，`<?xml` / `<rdf:` → RDF/XML，`@prefix` / `PREFIX` → Turtle。
 
-解析永不抛异常：坏文件返回已解析的三元组 + 带行号的原始消息，并在视图顶部「解析提示」条里按分类 code 聚合展示（同一类只列次数与最多 3 条样本）；内置上限防止警告洪泛、超深嵌套与超长字面量拖垮页面。相对 IRI 的 Base 来自真实资源地址（原生预览的 `resourceAddress` / better-sidebar 的路径），再由文档内 `@base` / `xml:base` / JSON-LD `@base` 覆盖；没有可用地址时保留原 IRI 并给出 `base-unavailable` 诊断，不再用显示文件名伪造身份。
+解析永不抛异常：坏文件返回已解析的三元组 + 带行号的原始消息，并在视图顶部「解析提示」条里按分类 code 聚合展示（同一类只列次数与最多 3 条样本）；内置上限防止警告洪泛、超深嵌套与超长字面量拖垮页面。
+
+**身份与 Base IRI**：插件把三种标识分开——`navigationAddress`（DSH 会话路由，例如 `dsh-resource://…`，只用于访问/授权/导航）、`absolutePath`（宿主确认的真实文件路径）与 `rdfBase`（相对 IRI 的解析基准）。DSH 路由不会被当作 RDF Base；原生预览优先从宿主资源元数据取得 `absolutePath`，better-sidebar 使用其提供的绝对路径，两个入口共用一个路径→`file:` URI 转换（Windows 盘符/UNC/POSIX、空格与特殊字符、`%` 不重复解码）。文档内 `@base` / `xml:base` / JSON-LD `@base` 仍按各自作用域优先生效。没有可靠 Base 时相对 IRI 保持原文、产生 `base-unavailable` 诊断，并在合并层限制在来源内部，不会被错误地跨文件合并；浏览器本地文件若声明了有效绝对 Base，仍可正常跨文件关联。
+
+**跨文件合并**：相同完整 IRI 合并为同一实体；空白节点按来源隔离；重复语句去重但保留全部来源、出现次数与命名图身份；来源移除/重载按来源贡献更新，不累积旧数据。合并基于保留的解析语句（L0），不从已裁剪的图模型逆推。
 
 ## 实现原理
 
@@ -177,9 +190,13 @@ flowchart LR
   - 绘制：默认最多 6000 条边（选中/搜索命中/高度数优先），SVG 元素量受此约束；
   - 探索：每跳 300 个新增节点 / 800 条边，最多 5 跳，预算截断后可继续展开；
   - 源文件：12 MiB，按 **UTF-8 字节**计算（原生预览入口；better-sidebar 入口受其宿主 5 MiB 读取阈值限制）。
-- 解析/建模/布局优先在后台 Worker 执行；Worker 不可用时降级为主线程分片布局（只让布局非阻塞，解析/建模仍同步）并收紧预算、明确提示。降级模式的预算是 6 万三元组 / 800 节点 / 3000 绘制边。
-- `npm run bench` 提供小型/中型/接近上限/高密度/异常五类夹具的分阶段基准（解析、建图、320/1000 次迭代布局、图规模、内存、序列化成本）。仓库内记录的基准结果见 `openspec/changes/archive/2026-11-10-enhance-ontology-graph-core/verification.md`。
-- 不做：`.omn`（Manchester 语法）、RDFa、远程 `@context`；JSON-LD 的 `@reverse`/`@included`/`@nest` 等结构不展开（给分类诊断）；RDF/XML 的 `rdf:ID` 具体化未实现（给诊断）；不做 OWL 推理。
+- 多文件工作区（候选护栏，可被后续基准下调）：最多 16 个文件、合计接纳源 24 MiB、全工作区保留 12 万条语句出现记录；视图切换复用已解析来源，不会重新解析未变文件；类树/分层图的展示引用与循环组有独立上限。
+- 解析/建模/布局优先在后台 Worker 执行；多文件时由同一个 Workspace Worker 缓存已解析来源，组合与布局复用该缓存。Worker 不可用时降级为主线程分片布局（只让布局非阻塞，解析/建模仍同步）并收紧预算、明确提示。降级模式的预算是 6 万三元组 / 800 节点 / 3000 绘制边。
+- `npm run bench` 提供小型/中型/接近上限/高密度/异常五类夹具的分阶段基准（解析、建图、320/1000 次迭代布局、图规模、内存、序列化成本），并输出多文件 compose/树/分层投影的一组基准；仓库内记录的基准结果见 `openspec/changes/archive/2026-11-10-enhance-ontology-graph-core/verification.md`。
+- 导出：SVG 使用静态元素白名单与文本转义，不包含脚本、外部资源、事件属性或 DTD；PNG 在浏览器内由同一 SVG 栅格化，分配前检查总像素与单边上限（16M 像素 / 8192 单边），失败时回退 SVG。导出文本会剥离控制字符与内部分隔标记，界面与可访问名称同样不会出现这些字符。下载只能确认「已发起」，浏览器不会报告文件是否保存成功；「复制 SVG」失败时会显示只读文本框，可手动全选复制。
+
+> 导出文件在哪里：DSH（Electron）会在系统「下载」目录里先生成 `<uuid>.tmp`，并弹出原生「另存为」对话框（可能出现在其他显示器或被主窗口挡住）。在对话框中确认后才会改名为 `<源文件名>.svg/.png`；若没有看到对话框，下载目录里会留下 `*.tmp`，把它重命名为 `.svg`/`.png` 即可打开。最稳妥的方式是「复制 SVG」后粘贴到文本编辑器另存。
+- 不做：`.omn`（Manchester 语法）、RDFa、远程 `@context`；JSON-LD 的 `@reverse`/`@included`/`@nest` 等结构不展开（给分类诊断），带 `@id` 的命名 `@graph` 标为 `unknown`；RDF/XML 的 `rdf:ID` 具体化未实现（给诊断）；不做 OWL 推理、SPARQL、`owl:imports` 联网加载或自动扫描工作区。
 
 ## 目录结构
 
@@ -191,14 +208,20 @@ dsh-ontology-viewer/
 ├─ client.js             # 构建产物：浏览器 Client 模块（勿手改）
 ├─ src/
 │  ├─ rdf-parse.js          # Turtle / N-Triples / RDF-XML / JSON-LD 解析（零依赖，诊断与上限）
-│  ├─ graph-model.js        # 三元组 → 图模型；过滤/探索/绘制预算/布局任务
-│  ├─ ontology-job.js       # 计算任务状态机、Worker 客户端、主线程降级调度
+│  ├─ ontology-identity.js  # 跨文件实体键：空白节点/未解析相对 IRI 的来源隔离与防碰撞编码
+│  ├─ graph-model.js        # 三元组 → 图模型；来源贡献过滤/探索/绘制预算/布局任务
+│  ├─ ontology-workspace.js # 多文件 L0 来源缓存、准入预算、语句合并与来源表
+│  ├─ ontology-views.js     # 类/属性层级树、SCC、分层关系图投影与确定性布局
+│  ├─ graph-export.js       # 显示场景快照、安全 SVG、PNG 像素预算与栅格化
+│  ├─ ontology-job.js       # 计算任务状态机、Worker 客户端、工作区协议、主线程降级调度
 │  ├─ worker-entry.js       # Worker 侧入口（仅构建期内嵌，不进入主闭包）
 │  ├─ graph-view-style.js   # CSS、常量、kind 元数据
 │  ├─ graph-view-controls.js# 过滤/探索/搜索/工具栏
 │  ├─ graph-view-details.js # 节点详情与连接分组
 │  ├─ graph-view.js         # SVG 编排、缩放拖拽、状态与提示
-│  └─ main.js               # apply(ctx)：注册两个扩展点 + 任务外壳
+│  ├─ graph-view-multiview.js # 视图切换、来源面板、类树、分层图、来源详情、导出菜单
+│  ├─ graph-view-workspace.js # 工作区控制器：主文件 + 附加来源 + 三视图 + 导出
+│  └─ main.js               # apply(ctx)：注册两个扩展点 + 工作区外壳
 ├─ build/build.mjs          # 单文件 Client 模块构建（含内嵌 Worker 源）
 ├─ locale/{en,zh}.json      # 插件清单里的标题/描述
 ├─ examples/                # 5 个可直接点开的示例本体
@@ -273,6 +296,14 @@ npm run pack:release # 生成发版用 dsh-ontology-viewer.tgz（固定文件名
 - 图谱在页面中的实际视觉呈现、深/浅主题下的对比度、不同窗口宽度下的布局；
 - 点到真实文件时的最终画面；
 - 本次 `enhance-ontology-graph-core` 改造中新增的过滤、多跳探索、详情分组、搜索列表、Worker 真机路径与降级提示——这些只完成了代码与自动化测试，**未做真实 DSH 页面验收**，验收步骤见 Change 的 `verification.md`。
+
+`add-ontology-multiview-workspace` 新增能力的验证边界（规划与逐条证据见 `openspec/changes/add-ontology-multiview-workspace/`）：
+
+- 已用 Node 测试覆盖：双入口 Base 适配与路径编码、跨文件合并/移除/重载、空白节点隔离、命名图保留、类层级（多重继承/循环/预算）、分层图（SCC/布局/预算）、来源贡献过滤、SVG 安全与 PNG 像素预检、Worker 协议（解析/组合/缓存复用）、共享注册表隔离与生命周期、视图状态矩阵、导出场景一致性、组件级状态与可访问名称；
+- 已在真实 DSH 页面取得证据：多文件合并与来源过滤、来源面板与共享开关、类树搜索/键盘/属性模式/展开、分层方向图例/关系标签/空态/循环组成员面板（鼠标与键盘）、关系详情与“显示更多”分页、跨视图共享搜索、SVG（网络/类树/分层）与 PNG 实际栅格化并发起下载、浅色/深色主题、中英文切换、575px 窄栏详情抽屉与焦点恢复、导出产物字节校验（PNG 签名/IHDR/IEND；样例另存于 Change 的 `evidence/`）、500 类压力下的导入/内存/长任务采样；导出期间无外部请求；
+- **better-sidebar 双入口已真机验收**：`dsh-better-sidebar@0.30.1` 生效后，其文件树双击 `pizza.ttl` 会以本插件的 viewer 渲染（`data-ontology-source`），节点/边/三元组与原生预览一致（25/25、35/35、73），并验证了三视图切换、多文件 A/B 合并与移除、5/12 MiB 上限提示；
+- **未验证 / 未启用**：DSH `workspaceFiles` 逐目录复选的多文件入口（能力不存在，已禁用并走浏览器本地文件选择）、持续内存的泄漏定论（仅采样与峰值）。better-sidebar 入口中同名异目录、空/错文件、纯文本切换、更新/重载、缩放/拖拽/搜索/快捷键未逐项重复走查（共享组件已在原生入口与自动化测试覆盖）。这些项目保持未完成，不能据代码或 Node 测试声称已通过。
+- **导出下载链路已真机闭环**：三视图 SVG/PNG 共 6 个文件通过原生「另存为」确认保存到系统下载目录并逐一核对尺寸与内容（网络 575×1133/575×1154、类层级 102×98、分层 521×621），样例见 Change 的 `evidence/`；并记录宿主行为——确认前文件以 `<uuid>.tmp` 形式留在下载目录。
 
 如果你发现视觉问题，欢迎提 issue，附上文件片段和截图；改 `src/graph-view.js` 的 `CSS` 常量后 `npm run build` 即可。
 

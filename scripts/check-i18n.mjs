@@ -31,6 +31,13 @@ for (const stat of ['nodes', 'edges', 'triples']) staticKeys.add('viewer.' + sta
 for (const field of ['outEdges', 'inEdges', 'degree']) staticKeys.add('viewer.' + field)
 for (const direction of ['both', 'out', 'in']) staticKeys.add('viewer.direction.' + direction)
 for (const group of ['type', 'literals', 'out', 'in']) staticKeys.add('viewer.group.' + group)
+for (const status of ['ready', 'partial', 'empty', 'error', 'rejected']) {
+  staticKeys.add('source.status.' + status)
+}
+for (const origin of ['host', 'browser']) staticKeys.add('source.origin.' + origin)
+for (const graphKind of ['default', 'iri', 'blank', 'unknown']) {
+  staticKeys.add('provenance.graph.' + graphKind)
+}
 for (const code of [
   'base-unavailable',
   'named-graph-ignored',

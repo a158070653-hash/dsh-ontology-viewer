@@ -91,6 +91,136 @@ function ontologyWorkerErrorMessage(error) {
 /** Last computed graph, kept so `relayout` does not re-parse the document. */
 let ontologyWorkerCache = null
 
+/* ------------------------------------------------------------------ */
+/* Workspace protocol (multi-file)                                    */
+/* ------------------------------------------------------------------ */
+
+/** Parsed sources known to this worker, keyed by source id. */
+const ontologyWorkerSources = new Map()
+
+/** Copy one parse result into the bounded snapshot the workspace keeps. */
+function ontologyWorkerParsedSnapshot(parsed) {
+  const input = parsed && typeof parsed === 'object' ? parsed : {}
+  const stats = input.stats && typeof input.stats === 'object' ? input.stats : {}
+  return {
+    format: typeof input.format === 'string' ? input.format : '',
+    prefixes: input.prefixes && typeof input.prefixes === 'object' ? input.prefixes : {},
+    base: typeof input.base === 'string' ? input.base : '',
+    baseSource: typeof input.baseSource === 'string' ? input.baseSource : 'none',
+    triples: Array.isArray(input.triples) ? input.triples : [],
+    diagnostics: Array.isArray(input.diagnostics) ? input.diagnostics : [],
+    warnings: Array.isArray(input.warnings) ? input.warnings : [],
+    errors: Array.isArray(input.errors) ? input.errors : [],
+    stats: {
+      tripleCount: Number(stats.tripleCount) || (Array.isArray(input.triples) ? input.triples.length : 0),
+      truncated: !!stats.truncated,
+      truncation: stats.truncation || null,
+    },
+  }
+}
+
+/** Parse one source and keep it for later composition. */
+function ontologyWorkerParseSource(id, message) {
+  const sourceId = typeof message.sourceId === 'string' && message.sourceId
+    ? message.sourceId
+    : 'src' + (ontologyWorkerSources.size + 1)
+  const revision = Number.isFinite(message.revision) && message.revision > 0
+    ? Math.floor(message.revision)
+    : 1
+  const limits = ontologyWorkerNormalizeLimits({ maxTriples: message.maxTriples })
+  const startedAt = ontologyWorkerNow()
+  const parsed = parseOntology(typeof message.text === 'string' ? message.text : '', {
+    fileName: typeof message.displayName === 'string' ? message.displayName : undefined,
+    format: typeof message.format === 'string' && message.format ? message.format : undefined,
+    navigationAddress: typeof message.navigationAddress === 'string' && message.navigationAddress
+      ? message.navigationAddress
+      : undefined,
+    absolutePath: typeof message.absolutePath === 'string' && message.absolutePath
+      ? message.absolutePath
+      : undefined,
+    rdfBase: typeof message.rdfBase === 'string' && message.rdfBase ? message.rdfBase : undefined,
+    maxTriples: limits.maxTriples,
+    maxLiteralLength: limits.maxLiteralLength,
+    maxDepth: limits.maxDepth,
+  }) || {}
+  const snapshot = ontologyWorkerParsedSnapshot(parsed)
+  const byteSize = typeof message.byteSize === 'number' && Number.isFinite(message.byteSize)
+    ? message.byteSize
+    : (typeof message.text === 'string' ? message.text.length : 0)
+  ontologyWorkerSources.set(sourceId, {
+    sourceId: sourceId,
+    revision: revision,
+    origin: message.origin,
+    parsed: snapshot,
+    byteSize: byteSize,
+    displayName: typeof message.displayName === 'string' ? message.displayName : '',
+    navigationAddress: typeof message.navigationAddress === 'string' ? message.navigationAddress : '',
+    absolutePath: typeof message.absolutePath === 'string' ? message.absolutePath : '',
+  })
+  self.postMessage({
+    type: 'source',
+    id: id,
+    sourceId: sourceId,
+    revision: revision,
+    status: snapshot.triples.length === 0 ? 'empty' : 'ready',
+    parsed: snapshot,
+    timing: { parse: ontologyWorkerNow() - startedAt },
+  })
+}
+
+/** Compose the cached sources into one graph and lay it out. */
+function ontologyWorkerCompose(id, message) {
+  const sourceIds = Array.isArray(message.sourceIds)
+    ? message.sourceIds.filter(function (value) { return typeof value === 'string' })
+    : []
+  const selected = new Set(sourceIds)
+  let workspace = createWorkspace()
+  for (const entry of ontologyWorkerSources.values()) {
+    if (selected.size > 0 && !selected.has(entry.sourceId)) continue
+    const added = addSource(workspace, {
+      origin: entry.origin === 'browser' ? 'browser' : 'host',
+      displayName: entry.displayName || entry.sourceId,
+      sourceId: entry.sourceId,
+      revision: entry.revision,
+      navigationAddress: entry.navigationAddress || undefined,
+      absolutePath: entry.absolutePath || undefined,
+      parsed: entry.parsed,
+      byteSize: entry.byteSize,
+      text: '',
+    })
+    if (added.status !== 'rejected' && added.workspace) workspace = added.workspace
+  }
+  const composed = composeWorkspaceGraph(workspace, {
+    sourceIds: sourceIds.length > 0 ? sourceIds : undefined,
+    maxNodes: message.maxNodes,
+    maxEdges: message.maxEdges,
+    maxLiteralsPerNode: message.maxLiteralsPerNode,
+    maxLiteralLength: message.maxLiteralLength,
+  })
+  if (!composed || !composed.graph) {
+    self.postMessage({
+      type: 'error',
+      id: id,
+      message: composed && composed.error ? String(composed.error) : 'graph composition failed',
+    })
+    return
+  }
+  ontologyWorkerCache = { id: id, graph: composed.graph }
+  const layoutOptions = ontologyWorkerNormalizeLayout(message.layout)
+  self.postMessage({
+    type: 'graph',
+    id: id,
+    graph: composed.graph,
+    statements: composed.statements,
+    occurrences: composed.occurrences,
+    sourceIds: composed.sourceIds,
+    timing: {},
+  })
+  const laidOutAt = ontologyWorkerNow()
+  const positions = layoutGraph(composed.graph, layoutOptions)
+  ontologyWorkerPostLayout(id, positions, ontologyWorkerNow() - laidOutAt)
+}
+
 /** Post the transferable layout message. */
 function ontologyWorkerPostLayout(id, positions, elapsed) {
   const packed = ontologyWorkerPackPositions(positions)
@@ -176,6 +306,31 @@ self.onmessage = function ontologyWorkerOnMessage(event) {
     }
     if (message.type === 'relayout') {
       ontologyWorkerRelayout(id, message)
+      return
+    }
+    if (message.type === 'parse-source') {
+      ontologyWorkerParseSource(id, message)
+      return
+    }
+    if (message.type === 'compose') {
+      ontologyWorkerCompose(id, message)
+      return
+    }
+    if (message.type === 'cache-source') {
+      const source = message.source
+      if (source && typeof source.sourceId === 'string' && source.parsed && Array.isArray(source.parsed.triples)) {
+        ontologyWorkerSources.set(source.sourceId, {
+          sourceId: source.sourceId, revision: source.revision,
+          origin: source.origin, displayName: source.displayName,
+          absolutePath: source.absolutePath, navigationAddress: source.navigationAddress,
+          byteSize: source.byteSize, parsed: ontologyWorkerParsedSnapshot(source.parsed),
+        })
+      }
+      return
+    }
+    if (message.type === 'drop-source') {
+      if (typeof message.sourceId === 'string') ontologyWorkerSources.delete(message.sourceId)
+      return
     }
   } catch (error) {
     self.postMessage({ type: 'error', id: id, message: ontologyWorkerErrorMessage(error) })

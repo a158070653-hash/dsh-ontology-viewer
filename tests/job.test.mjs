@@ -6,6 +6,19 @@ import vm from 'node:vm'
 import { createOntologyRunner, computeOntology } from '../src/ontology-job.js'
 import { parseOntology } from '../src/rdf-parse.js'
 import { buildGraph, layoutGraph, createLayoutTask } from '../src/graph-model.js'
+import {
+  createWorkspace,
+  addSource,
+  removeSource,
+  replaceSource,
+  workspaceAdmission,
+  composeWorkspaceGraph,
+} from '../src/ontology-workspace.js'
+import {
+  entityKeyForTerm,
+  statementIdFor,
+  graphIdentityFor,
+} from '../src/ontology-identity.js'
 
 const REAL_IMPL = {
   parseOntology,
@@ -675,4 +688,228 @@ test('the worker entry speaks the documented compute/relayout/error protocol', (
   assert.equal(posted[0].message.type, 'error')
   assert.equal(posted[0].message.id, 99)
   assert.match(posted[0].message.message, /relayout requested before a graph is available/)
+})
+
+// ---------------------------------------------------------------------------
+// Workspace runner: multi-file parse, compose and removal
+// ---------------------------------------------------------------------------
+
+const WORKSPACE_IMPL = {
+  ...REAL_IMPL,
+  createWorkspace,
+  addSource,
+  removeSource,
+  replaceSource,
+  workspaceAdmission,
+  composeWorkspaceGraph,
+  identity: { entityKeyForTerm, statementIdFor, graphIdentityFor },
+}
+
+const FILE_ONE = '@prefix ex: <http://e/> .\nex:a ex:p ex:shared .\n'
+const FILE_TWO = '@prefix ex: <http://e/> .\nex:b ex:q ex:shared .\n'
+
+test('workspace main-thread composition discards a superseded layout', async () => {
+  const events = []
+  const scheduler = createFakeScheduler()
+  const runner = createOntologyRunner({ impl: WORKSPACE_IMPL, scheduler,
+    forceMainThread: true, onEvent: event => events.push(event) })
+  runner.parseSource({ text: FILE_ONE, displayName: 'one.ttl' })
+  const old = runner.compose({ layout: { iterations: 40 } })
+  runner.parseSource({ text: FILE_TWO, displayName: 'two.ttl' })
+  const current = runner.compose({ layout: { iterations: 1 } })
+  await scheduler.drainAll()
+  assert.ok(events.some(event => event.type === 'layout' && event.generation === current))
+  assert.equal(events.some(event => event.type === 'layout' && event.generation === old), false)
+  runner.dispose()
+})
+
+test('workspace runner: main-thread parse admits sources and compose builds L1', async () => {
+  const events = []
+  const scheduler = createFakeScheduler()
+  const runner = createOntologyRunner({
+    impl: WORKSPACE_IMPL,
+    scheduler,
+    forceMainThread: true,
+    onEvent: (event) => events.push(event),
+  })
+  runner.parseSource({
+    text: FILE_ONE, displayName: 'one.ttl', absolutePath: 'D:/one.ttl',
+  })
+  runner.parseSource({
+    text: FILE_TWO, displayName: 'two.ttl', absolutePath: 'D:/two.ttl',
+  })
+  const sources = events.filter((event) => event.type === 'source')
+  assert.equal(sources.length, 2)
+  assert.deepEqual(sources.map((event) => event.status), ['ready', 'ready'])
+  assert.equal(sources[1].totals.files, 2)
+  assert.equal(sources[1].sources.length, 2)
+  assert.equal(sources[0].summary.tripleCount, 1)
+  assert.equal(sources[0].summary.displayName, 'one.ttl')
+
+  const firstSourceId = sources[0].sourceId
+  events.length = 0
+  runner.compose({ sourceIds: [firstSourceId], layout: { width: 400, height: 300, seed: 1 } })
+  await scheduler.drainAll()
+
+  const graphEvent = events.find((event) => event.type === 'graph')
+  assert.ok(graphEvent)
+  assert.equal(graphEvent.sourceIds.length, 1)
+  assert.equal(graphEvent.occurrences, 1)
+  assert.deepEqual(graphEvent.graph.nodes.map((node) => node.id).sort(),
+    ['http://e/a', 'http://e/shared'])
+  const layoutEvent = events.find((event) => event.type === 'layout')
+  assert.ok(layoutEvent)
+  assert.equal(layoutEvent.positions.length, 2)
+  assert.ok(events.some((event) => event.type === 'state' && event.status === 'ready'))
+  runner.dispose()
+})
+
+test('workspace runner: compose never re-parses unchanged sources, and removal drops contributions', async () => {
+  let parseCalls = 0
+  const impl = {
+    ...WORKSPACE_IMPL,
+    parseOntology: (...args) => { parseCalls += 1; return parseOntology(...args) },
+  }
+  const events = []
+  const scheduler = createFakeScheduler()
+  const runner = createOntologyRunner({
+    impl, scheduler, forceMainThread: true, onEvent: (event) => events.push(event),
+  })
+  runner.parseSource({ text: FILE_ONE, displayName: 'one.ttl', absolutePath: 'D:/one.ttl' })
+  runner.parseSource({ text: FILE_TWO, displayName: 'two.ttl', absolutePath: 'D:/two.ttl' })
+  assert.equal(parseCalls, 2)
+
+  events.length = 0
+  const info = runner.workspaceInfo()
+  runner.compose({})
+  await scheduler.drainAll()
+  runner.compose({})
+  await scheduler.drainAll()
+  assert.equal(parseCalls, 2, 'switching/composing must not re-parse')
+  const graphs = events.filter((event) => event.type === 'graph')
+  assert.equal(graphs.length, 2)
+  assert.equal(graphs[0].graph.nodes.length, 3)
+  assert.equal(info.totals.files, 2)
+  assert.equal(info.totals.occurrences, 2)
+
+  const secondId = info.sources[1].sourceId
+  events.length = 0
+  runner.dropSource(secondId)
+  const removed = events.find((event) => event.type === 'sources')
+  assert.ok(removed)
+  assert.equal(removed.removedSourceId, secondId)
+  assert.equal(removed.sources.length, 1)
+  assert.equal(runner.workspaceInfo().totals.occurrences, 1)
+
+  events.length = 0
+  runner.compose({})
+  await scheduler.drainAll()
+  const after = events.find((event) => event.type === 'graph')
+  assert.equal(after.graph.nodes.some((node) => node.id === 'http://e/b'), false)
+  runner.dispose()
+})
+
+test('workspace runner: an over-budget source is rejected with a reason', () => {
+  const events = []
+  const impl = {
+    ...WORKSPACE_IMPL,
+    createWorkspace: (options) => createWorkspace({ ...(options || {}), limits: { maxFiles: 1 } }),
+  }
+  const runner = createOntologyRunner({
+    impl, forceMainThread: true, onEvent: (event) => events.push(event),
+  })
+  runner.parseSource({ text: FILE_ONE, displayName: 'one.ttl', absolutePath: 'D:/one.ttl' })
+  runner.parseSource({ text: FILE_TWO, displayName: 'two.ttl', absolutePath: 'D:/two.ttl' })
+  const sources = events.filter((event) => event.type === 'source')
+  assert.equal(sources.length, 2)
+  assert.equal(sources[0].status, 'ready')
+  assert.equal(sources[1].status, 'rejected')
+  assert.equal(sources[1].reason, 'file-limit')
+  assert.equal(runner.workspaceInfo().totals.files, 1)
+  runner.dispose()
+})
+
+test('workspace runner: worker path sends parse/compose and applies stale guards', async () => {
+  const events = []
+  const worker = createFakeWorker()
+  const runner = createOntologyRunner({
+    impl: WORKSPACE_IMPL,
+    workerFactory: () => worker,
+    workerTimeoutMs: 500,
+    onEvent: (event) => events.push(event),
+  })
+  runner.parseSource({ text: FILE_ONE, displayName: 'one.ttl', absolutePath: 'D:/one.ttl' })
+  assert.equal(worker.messages.length, 1)
+  const parseMessage = worker.messages[0]
+  assert.equal(parseMessage.type, 'parse-source')
+  assert.equal(parseMessage.text, FILE_ONE)
+  assert.equal(parseMessage.absolutePath, 'D:/one.ttl')
+  assert.equal(parseMessage.maxTriples, 120000)
+
+  const parsed = parseOntology(FILE_ONE, { format: 'turtle', absolutePath: 'D:/one.ttl' })
+  worker.emit({
+    type: 'source',
+    id: parseMessage.id,
+    sourceId: 'src1',
+    revision: 1,
+    status: 'ready',
+    parsed,
+  })
+  const sourceEvent = events.find((event) => event.type === 'source')
+  assert.ok(sourceEvent)
+  assert.equal(sourceEvent.sourceId, 'src1')
+  assert.equal(sourceEvent.summary.status, 'ready')
+  assert.equal(sourceEvent.summary.tripleCount, 1)
+
+  events.length = 0
+  worker.messages.length = 0
+  runner.compose({ sourceIds: ['src1'], layout: { width: 500, height: 320, seed: 2 } })
+  assert.equal(worker.messages.length, 1)
+  const composeMessage = worker.messages[0]
+  assert.equal(composeMessage.type, 'compose')
+  assert.deepEqual(composeMessage.sourceIds, ['src1'])
+  assert.equal(composeMessage.layout.width, 500)
+
+  const graph = buildGraph(parsed, { sourceId: 'src1' })
+  worker.emit({ type: 'graph', id: composeMessage.id, graph, statements: 1, occurrences: 1, sourceIds: ['src1'] })
+  worker.emit({
+    type: 'layout',
+    id: composeMessage.id,
+    positions: Float64Array.from([1, 2, 3, 4, 5, 6]),
+    timing: { layout: 4 },
+  })
+  const graphEvent = events.find((event) => event.type === 'graph')
+  assert.ok(graphEvent)
+  assert.equal(graphEvent.degraded, false)
+  assert.equal(graphEvent.statements, 1)
+  const layoutEvent = events.find((event) => event.type === 'layout')
+  assert.equal(layoutEvent.positions.length, 2)
+
+  // A response that arrives after disposal must not be published.
+  events.length = 0
+  runner.dispose()
+  worker.emit({ type: 'source', id: 999, sourceId: 'src9', revision: 1, status: 'ready', parsed })
+  assert.equal(events.length, 0)
+})
+
+test('workspace runner: worker failure falls back to the main thread', async () => {
+  const events = []
+  const worker = createFakeWorker()
+  const scheduler = createFakeScheduler()
+  const runner = createOntologyRunner({
+    impl: WORKSPACE_IMPL,
+    scheduler,
+    workerFactory: () => worker,
+    workerTimeoutMs: 50,
+    onEvent: (event) => events.push(event),
+  })
+  runner.parseSource({ text: FILE_ONE, displayName: 'one.ttl', absolutePath: 'D:/one.ttl' })
+  worker.fail('boom')
+  await flush()
+  const sourceEvent = events.find((event) => event.type === 'source')
+  assert.ok(sourceEvent, 'the degraded parse still admits the source')
+  assert.equal(sourceEvent.status, 'ready')
+  assert.ok(events.some((event) => event.type === 'state' && event.degraded === true &&
+    /unavailable/.test(String(event.message))))
+  runner.dispose()
 })

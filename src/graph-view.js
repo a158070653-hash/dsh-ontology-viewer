@@ -171,18 +171,31 @@ export function createOntologyGraphView(React) {
 
     // --- presentation state -------------------------------------------------
     const [size, setSize] = useState(GRAPH_DEFAULT_SIZE)
-    const [zoom, setZoom] = useState(1)
-    const [pan, setPan] = useState({ x: 0, y: 0 })
+    const initialCameraRef = useRef(props.cameraRef && props.cameraRef.current && props.cameraRef.current.saved
+      ? Object.assign({}, props.cameraRef.current) : null)
+    const [zoom, setZoom] = useState(() => initialCameraRef.current ? initialCameraRef.current.zoom : 1)
+    const [pan, setPan] = useState(() => initialCameraRef.current
+      ? { x: initialCameraRef.current.panX, y: initialCameraRef.current.panY } : { x: 0, y: 0 })
     const [selectedId, setSelectedId] = useState(null)
     const [hoverId, setHoverId] = useState(null)
-    const [query, setQuery] = useState('')
+    const [internalQuery, setInternalQuery] = useState('')
+    const controlledQuery = typeof props.searchQuery === 'string'
+    const query = controlledQuery ? props.searchQuery : internalQuery
+    const setQuery = useCallback((value) => {
+      if (typeof props.onSearchQuery === 'function') props.onSearchQuery(value)
+      else setInternalQuery(value)
+    }, [props.onSearchQuery])
     const [searchIndex, setSearchIndex] = useState(0)
     const [searchFocused, setSearchFocused] = useState(false)
     const [labelsOn, setLabelsOn] = useState(true)
     const [panelOpen, setPanelOpen] = useState(true)
     const [activePanel, setActivePanel] = useState('none')
-    const [filterState, setFilterState] = useState(() => emptyFilterState())
-    const [exploreState, setExploreState] = useState(() => createExploreState())
+    const [internalFilterState, setInternalFilterState] = useState(() => emptyFilterState())
+    const [internalExploreState, setInternalExploreState] = useState(() => createExploreState())
+    const filterState = props.filterState || internalFilterState
+    const exploreState = props.exploreState || internalExploreState
+    const setFilterState = props.onFilterState || setInternalFilterState
+    const setExploreState = props.onExploreState || setInternalExploreState
     const [notice, setNotice] = useState(null)
     const [issuesOpen, setIssuesOpen] = useState(false)
     const [copyState, setCopyState] = useState('idle')
@@ -343,6 +356,19 @@ export function createOntologyGraphView(React) {
         edge && typeof edge.source === 'string' && typeof edge.target === 'string' &&
         renderableIds.has(edge.source) && renderableIds.has(edge.target))
     }, [drawnResult, renderableIds])
+    useEffect(() => {
+      if (!props.displaySceneRef) return
+      props.displaySceneRef.current = {
+        // The raw prop identity is what the workspace compares against: the
+        // normalized graph is a new object whenever any array is re-created.
+        graph: graph,
+        nodes: renderableNodes,
+        edges: renderedEdges,
+        positions: renderableNodes.map(node => Object.assign({ id: node.id }, positionById.get(node.id))),
+        labels: labelsOn,
+        ready: !['parsing', 'modeling', 'layout'].includes(layoutStatus) && hasPositions,
+      }
+    }, [safeGraph, renderableNodes, renderedEdges, positionById, labelsOn, layoutStatus, hasPositions, props.displaySceneRef])
     const drawnEdgeKeys = useMemo(() => {
       const set = new Set()
       for (const edge of drawnResult.edges) {
@@ -422,6 +448,22 @@ export function createOntologyGraphView(React) {
     useEffect(() => { panRef.current = pan }, [pan])
     useEffect(() => { hoverRef.current = hoverId }, [hoverId])
 
+    // Report the current camera so the workspace shell can export exactly what
+    // is on screen (the view never serializes its own DOM).
+    useEffect(() => {
+      const cameraRef = props.cameraRef
+      if (cameraRef && typeof cameraRef === 'object') {
+        cameraRef.current = {
+          saved: true,
+          zoom: zoom,
+          panX: pan.x,
+          panY: pan.y,
+          width: size.width,
+          height: size.height,
+        }
+      }
+    }, [zoom, pan, size, props.cameraRef])
+
     // --- measure the canvas (ResizeObserver + debounce) ---------------------
     useLayoutEffect(() => {
       const element = canvasRef.current
@@ -451,14 +493,16 @@ export function createOntologyGraphView(React) {
     useEffect(() => {
       if (graphIdentityRef.current === safeGraph) return
       graphIdentityRef.current = safeGraph
-      setSelectedId(null)
+      if (!props.workspaceManaged) setSelectedId(null)
       setHoverId(null)
-      setQuery('')
+      if (!props.workspaceManaged) setQuery('')
       setSearchIndex(0)
       setSearchFocused(false)
       setActivePanel('none')
-      setFilterState(emptyFilterState())
-      setExploreState(createExploreState())
+      if (!props.workspaceManaged) {
+        setFilterState(emptyFilterState())
+        setExploreState(createExploreState())
+      }
       setNotice(null)
       setOverrides({})
       setRovingId(null)
@@ -574,6 +618,12 @@ export function createOntologyGraphView(React) {
       fitted.graph = safeGraph
       fitted.positions = positionsProp
       fitted.measured = measured
+      if (initialCameraRef.current) {
+        const restored = initialCameraRef.current
+        if (measured) initialCameraRef.current = null
+        applyView(restored.zoom, { x: restored.panX, y: restored.panY })
+        return
+      }
       const view = fitView(fitPointsList, size.width, size.height, GRAPH_FIT_PADDING)
       applyView(view.zoom, view.pan)
     }, [fitPointsList, safeGraph, positionsProp, size.width, size.height, applyView])
@@ -636,6 +686,7 @@ export function createOntologyGraphView(React) {
       return node ? (node.label || node.local || node.id) : String(id)
     }, [nodesById])
 
+    const onSelectNode = typeof props.onSelectNode === 'function' ? props.onSelectNode : null
     const selectNode = useCallback((id, options) => {
       const target = typeof id === 'string' && nodesById.has(id) ? id : null
       if (target && (!options || options.focusGraph !== false)) focusGraphCanvas()
@@ -643,6 +694,7 @@ export function createOntologyGraphView(React) {
       setPanelOpen(Boolean(target))
       if (target) setRovingId(target)
       setNotice(null)
+      if (target && onSelectNode) onSelectNode(target)
       if (target && exploreState.on && target !== selectedId) {
         setExploreState((previous) => resetExploreCursor(previous))
         setNotice({ kind: 'explore-root-switched', nodeLabel: labelOf(target) })
@@ -653,7 +705,18 @@ export function createOntologyGraphView(React) {
           setNotice({ kind: 'selection-hidden', nodeLabel: labelOf(target) })
         }
       }
-    }, [nodesById, exploreState.on, selectedId, filterActive, filterState, safeGraph, labelOf, focusGraphCanvas])
+    }, [nodesById, exploreState.on, selectedId, filterActive, filterState, safeGraph, labelOf, focusGraphCanvas, onSelectNode])
+
+    // Controlled selection: the workspace shell keeps one selected entity across
+    // views, so an external selection is adopted when it exists in this graph.
+    const externalSelection = typeof props.selectedId === 'string' ? props.selectedId : null
+    useEffect(() => {
+      if (!externalSelection) return
+      if (!nodesById.has(externalSelection)) return
+      if (externalSelection === selectedId) return
+      setSelectedId(externalSelection)
+      setPanelOpen(true)
+    }, [externalSelection, nodesById, selectedId])
 
     const selectAndCenter = useCallback((id) => {
       if (!nodesById.has(id)) return
@@ -1325,6 +1388,7 @@ export function createOntologyGraphView(React) {
       kindLabel,
       shortenIri: shortIri,
       drawnEdgeKeys,
+      sourceLabels: props.sourceLabels,
       canSelectNode: (id) => nodesById.has(id),
       onSelectNode: selectAndCenter,
       copyState,

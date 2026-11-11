@@ -27,7 +27,7 @@ export function nextDrawerFocusTarget(focusables, activeElement, shiftKey) {
 /** Default relations shown per predicate group before "show more". */
 export const DETAILS_GROUP_LIMIT = 10
 /** Section order in the details panel; empty sections keep their slot. */
-export const DETAILS_SECTIONS = ['iri', 'types', 'literals', 'connections', 'structure', 'source']
+export const DETAILS_SECTIONS = ['iri', 'types', 'literals', 'connections', 'structure', 'provenance', 'source']
 /** rdf:type IRI, used to put the type group first (no graph-model import here). */
 export const DETAILS_RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type'
 
@@ -186,6 +186,128 @@ export function connectionGroupsFallback(graph, nodeId, options) {
   return normalizeConnectionGroups({ out: toArray(outMap), in: toArray(inMap) }, options)
 }
 
+/** Resolve a source id to its display label from either a Map or a plain map. */
+export function sourceLabelFrom(labels, id) {
+  if (labels && typeof labels.get === 'function') {
+    const value = labels.get(id)
+    if (typeof value === 'string' && value) return value
+  }
+  if (labels && typeof labels === 'object' && typeof labels[id] === 'string' && labels[id]) return labels[id]
+  return String(id)
+}
+
+/**
+ * Statement ids are tagged with NUL separators for collision safety. The UI must
+ * never print those control characters, so map them to a readable separator and
+ * keep the result bounded.
+ */
+export function statementIdDisplay(id) {
+  const text = typeof id === 'string' ? id : (id === undefined || id === null ? '' : String(id))
+  return text.replace(/[\u0000-\u001f\u007f]+/g, ' \u00b7 ').trim().slice(0, 160)
+}
+
+/** One retained L1 edge per SPO, including its full accepted provenance. */
+export function incidentRelationDetails(graph, nodeId, labels) {
+  const input = graph && typeof graph === 'object' ? graph : {}
+  const edges = Array.isArray(input.edges) ? input.edges : []
+  const sources = Array.isArray(input.sources) ? input.sources : []
+  const sourceById = new Map(sources.filter((item) => item && typeof item.sourceId === 'string')
+    .map((item) => [item.sourceId, item]))
+  if (typeof nodeId !== 'string' || !nodeId) return []
+  const records = []
+  for (let index = 0; index < edges.length; index++) {
+    const edge = edges[index]
+    if (!edge || (edge.source !== nodeId && edge.target !== nodeId)) continue
+    const ids = (items) => Array.isArray(items)
+      ? Array.from(new Set(items.filter((id) => typeof id === 'string' && id))) : []
+    const describe = (id) => {
+      const source = sourceById.get(id)
+      return {
+        id,
+        label: source && typeof source.displayName === 'string' && source.displayName
+          ? source.displayName : sourceLabelFrom(labels, id),
+        absolutePath: source && typeof source.absolutePath === 'string' ? source.absolutePath : null,
+        navigationAddress: source && typeof source.navigationAddress === 'string' ? source.navigationAddress : null,
+      }
+    }
+    const graphTerms = Array.isArray(edge.graphs) && edge.graphs.length
+      ? edge.graphs
+      : [{ kind: 'unknown', sourceIds: ids(edge.sourceIds) }]
+    records.push({
+      id: typeof edge.id === 'string' ? edge.id : String(index),
+      subject: detailsString(edge.source), predicate: detailsString(edge.p), object: detailsString(edge.target),
+      count: detailsNumber(edge.count, 1),
+      sourceIds: ids(edge.sourceIds), sources: ids(edge.sourceIds).map(describe),
+      statementIds: ids(edge.statementIds),
+      graphs: graphTerms.map((term) => ({
+        kind: term && ['default', 'iri', 'blank', 'unknown'].includes(term.kind) ? term.kind : 'unknown',
+        value: term && typeof term.value === 'string' ? term.value : null,
+        sourceIds: ids(term && term.sourceIds),
+        sources: ids(term && term.sourceIds).map(describe),
+      })),
+      location: null,
+    })
+  }
+  return records
+}
+
+/** Group every retained relation; pagination is performed by the DOM only. */
+export function incidentConnectionGroups(graph, nodeId, labels) {
+  const input = graph && typeof graph === 'object' ? graph : {}
+  const byId = new Map((Array.isArray(input.nodes) ? input.nodes : [])
+    .filter((node) => node && typeof node.id === 'string').map((node) => [node.id, node]))
+  const maps = { out: new Map(), in: new Map() }
+  const summary = { outEdges: 0, inEdges: 0, degree: 0 }
+  for (const relation of incidentRelationDetails(graph, nodeId, labels)) {
+    for (const direction of ['out', 'in']) {
+      if ((direction === 'out' ? relation.subject : relation.object) !== nodeId) continue
+      const endpointId = direction === 'out' ? relation.object : relation.subject
+      const endpoint = byId.get(endpointId)
+      const map = maps[direction]
+      let group = map.get(relation.predicate)
+      if (!group) {
+        group = { direction, predicate: relation.predicate,
+          label: detailsLocalName(relation.predicate) || relation.predicate, count: 0, items: [] }
+        map.set(relation.predicate, group)
+      }
+      group.count++
+      group.items.push({ id: endpointId,
+        label: endpoint && (endpoint.label || endpoint.local) || endpointId,
+        kind: endpoint && endpoint.kind || 'individual', relation })
+      if (direction === 'out') summary.outEdges++
+      else summary.inEdges++
+    }
+  }
+  summary.degree = summary.outEdges + summary.inEdges
+  const sorted = (map) => Array.from(map.values()).sort(compareConnectionGroups)
+  return { out: sorted(maps.out), in: sorted(maps.in), summary, maxPerGroup: DETAILS_GROUP_LIMIT }
+}
+
+/**
+ * Aggregate the graph identity of one node from its incident edges. Nodes do
+ * not carry graph terms themselves; edges do, so the counts are edges, not
+ * statements, and the UI labels them as such.
+ */
+export function nodeGraphKinds(graph, nodeId) {
+  const counts = { default: 0, iri: 0, blank: 0, unknown: 0 }
+  const edges = graph && Array.isArray(graph.edges) ? graph.edges : []
+  for (const edge of edges) {
+    if (!edge || typeof nodeId !== 'string') continue
+    if (edge.source !== nodeId && edge.target !== nodeId) continue
+    const list = Array.isArray(edge.graphs) ? edge.graphs : []
+    if (list.length === 0) {
+      counts.unknown += 1
+      continue
+    }
+    for (const item of list) {
+      const kind = item && typeof item.kind === 'string' ? item.kind : 'unknown'
+      if (Object.prototype.hasOwnProperty.call(counts, kind)) counts[kind] += 1
+      else counts.unknown += 1
+    }
+  }
+  return counts
+}
+
 /** Section order with presence flags; empty sections keep their fixed slot. */
 export function detailsSections(node, groups) {
   const target = node && typeof node === 'object' ? node : {}
@@ -200,6 +322,10 @@ export function detailsSections(node, groups) {
     literals: literals.length > 0,
     connections: out.length > 0 || incoming.length > 0,
     structure: typeof target.id === 'string' && target.id.length > 0,
+    provenance: Boolean(target.provenance && (
+      (Array.isArray(target.provenance.sourceIds) && target.provenance.sourceIds.length > 0) ||
+      (Array.isArray(target.provenance.statementIds) && target.provenance.statementIds.length > 0)
+    )),
     source: DETAILS_SOURCE_ENABLED && Boolean(target.source),
   }
   return DETAILS_SECTIONS.map((key) => ({ key, present: present[key] === true }))
@@ -209,7 +335,9 @@ export function detailsSections(node, groups) {
 export function visibleGroupItems(group, expanded, limit) {
   const items = group && Array.isArray(group.items) ? group.items : []
   const capped = Math.max(0, Math.floor(detailsNumber(limit, DETAILS_GROUP_LIMIT)))
-  const max = expanded === true ? items.length : Math.min(items.length, capped)
+  const pageSize = typeof expanded === 'number' && Number.isFinite(expanded)
+    ? Math.max(capped, Math.floor(expanded)) : expanded === true ? items.length : capped
+  const max = Math.min(items.length, pageSize)
   return {
     items: items.slice(0, max),
     hiddenCount: Math.max(0, items.length - max),
@@ -272,26 +400,26 @@ export function createGraphViewDetails(React) {
     const narrow = props.narrow === true
     const open = props.open !== false
     const [collapsedGroups, setCollapsedGroups] = React.useState({})
-    const [expandedGroups, setExpandedGroups] = React.useState({})
-    const [maxPerGroup, setMaxPerGroup] = React.useState(DETAILS_GROUP_LIMIT)
+    const [expandedRelations, setExpandedRelations] = React.useState({})
+    const [groupPages, setGroupPages] = React.useState({})
+    const [sourceCopyError, setSourceCopyError] = React.useState(false)
     const panelRef = React.useRef(null)
     const previousFocusRef = React.useRef(null)
 
-    const groups = React.useMemo(() => {
-      if (!node) return null
-      const limit = Math.max(DETAILS_GROUP_LIMIT, maxPerGroup)
-      if (typeof connectionGroups === 'function') {
-        try {
-          return normalizeConnectionGroups(
-            connectionGroups(props.graph, node.id, { maxPerGroup: limit }),
-            { maxPerGroup: limit },
-          )
-        } catch (error) {
-          return connectionGroupsFallback(props.graph, node.id, { maxPerGroup: limit })
-        }
+    const groups = React.useMemo(() => node
+      ? incidentConnectionGroups(props.graph, node.id, props.sourceLabels) : null,
+    [node, props.graph, props.sourceLabels])
+
+    const copySourceId = (id) => {
+      setSourceCopyError(false)
+      try {
+        if (typeof navigator === 'undefined' || !navigator.clipboard ||
+            typeof navigator.clipboard.writeText !== 'function') throw new Error('clipboard unavailable')
+        Promise.resolve(navigator.clipboard.writeText(String(id))).catch(() => setSourceCopyError(true))
+      } catch (error) {
+        setSourceCopyError(true)
       }
-      return connectionGroupsFallback(props.graph, node.id, { maxPerGroup: limit })
-    }, [node, props.graph, maxPerGroup])
+    }
 
     // Modal drawer focus management: focus enters the panel, Tab cycles inside,
     // and closing restores focus to the element that opened it.
@@ -357,6 +485,23 @@ export function createGraphViewDetails(React) {
     const onSelectNode = typeof props.onSelectNode === 'function' ? props.onSelectNode : () => {}
     const drawnEdgeKeys = props.drawnEdgeKeys
     const literalInfo = literalTruncation(node)
+    const sourceNames = (ids) => (Array.isArray(ids) ? ids : []).map((id) => {
+      const source = props.graph && Array.isArray(props.graph.sources)
+        ? props.graph.sources.find((candidate) => candidate && candidate.sourceId === id) : null
+      return { id, label: source && source.displayName || sourceLabelFrom(props.sourceLabels, id),
+        absolutePath: source && source.absolutePath, navigationAddress: source && source.navigationAddress }
+    })
+    const sourceList = (sources) => sources.length
+      ? h('ul', { className: 'dov-items' }, sources.map((source) => h('li', { key: source.id, className: 'dov-item' },
+        h('span', { className: 'dov-item-label' }, source.label),
+        h('code', { style: { userSelect: 'text', overflowWrap: 'anywhere' } }, source.id),
+        source.absolutePath ? h('div', { className: 'dov-muted', style: { overflowWrap: 'anywhere' } }, source.absolutePath) : null,
+        source.navigationAddress ? h('div', { className: 'dov-muted', style: { overflowWrap: 'anywhere' } }, source.navigationAddress) : null,
+        h('button', { type: 'button', className: 'dov-btn',
+          'aria-label': tr('viewer.copySourceId', '复制来源标识') + ' ' + source.label,
+          onClick: () => copySourceId(source.id) }, tr('viewer.copySourceId', '复制来源标识')),
+        sourceCopyError ? h('span', { className: 'dov-rel-hidden' }, tr('viewer.copyFailed', '复制失败')) : null)))
+      : h('span', { className: 'dov-muted' }, tr('provenance.none', '没有保留的来源'))
 
     const connectionList = (direction) => {
       const list = direction === 'out' ? groups.out : groups.in
@@ -367,10 +512,32 @@ export function createGraphViewDetails(React) {
       return list.map((group) => {
         const groupKey = direction + ':' + group.predicate
         const collapsed = collapsedGroups[groupKey] === true
-        const expanded = expandedGroups[groupKey] === true
-        const page = visibleGroupItems(group, expanded, DETAILS_GROUP_LIMIT)
-        const hasMore = group.count > page.items.length
+        const pageNumber = detailsNumber(groupPages[groupKey], 1)
+        const page = visibleGroupItems(group, (pageNumber - 1) * DETAILS_GROUP_LIMIT + DETAILS_GROUP_LIMIT, DETAILS_GROUP_LIMIT)
+        const hasMore = page.hasMore
         const itemNodes = page.items.map((item) => {
+          const relation = item.relation
+          const relationKey = node.id + ':' + direction + ':' + relation.id
+          const isOpen = expandedRelations[relationKey] === true
+          const field = (key, value) => h('div', { key, className: 'dov-muted',
+            style: { overflowWrap: 'anywhere', userSelect: 'text' } },
+          tr('provenance.' + key, key) + ': ', h('code', null, value))
+          const provenanceContent = isOpen ? h('div', { className: 'dov-item' },
+            field('subject', relation.subject), field('predicate', relation.predicate), field('object', relation.object),
+            h('div', { className: 'dov-muted' }, '×' + String(relation.count)),
+            h('div', null, tr('provenance.sources', '来源（{n}）')
+              .replace('{n}', String(relation.sourceIds.length)), sourceList(relation.sources)),
+            h('div', null, tr('provenance.graphs', '命名图') + ':',
+              h('ul', { className: 'dov-items' }, relation.graphs.map((graphTerm, graphIndex) =>
+                h('li', { key: String(graphIndex), className: 'dov-item' },
+                  tr('provenance.graph.' + graphTerm.kind, graphTerm.kind),
+                  graphTerm.value !== null ? h('code', { style: { overflowWrap: 'anywhere' } }, ' ' + graphTerm.value) : null,
+                  sourceList(graphTerm.sources))))),
+            h('div', { className: 'dov-muted', style: { overflowWrap: 'anywhere', userSelect: 'text' } },
+              'statementIds: ', h('code', null, relation.statementIds.length
+                ? relation.statementIds.map(statementIdDisplay).join(', ')
+                : tr('viewer.graphIdentityNone', '无'))),
+            h('div', { className: 'dov-muted' }, tr('viewer.locationUnavailable', '语句位置未记录（null）。'))) : null;
           const drawn = !drawnEdgeKeys || (typeof drawnEdgeKeys.has === 'function' &&
             drawnEdgeKeys.has(relationDrawnKey(direction, node.id, group.predicate, item.id)))
           const content = [
@@ -380,15 +547,17 @@ export function createGraphViewDetails(React) {
             drawn ? null : h('span', { key: 'hidden', className: 'dov-rel-hidden' },
               tr('viewer.relationsHidden', '未在画布绘制')),
           ]
-          if (canSelectNode(item.id)) {
-            return h('li', { key: item.id },
-              h('button', {
-                type: 'button',
-                className: 'dov-rel-item',
-                onClick: () => onSelectNode(item.id),
-              }, content))
-          }
-          return h('li', { key: item.id }, h('span', { className: 'dov-rel-item' }, content))
+          return h('li', { key: relationKey },
+            canSelectNode(item.id)
+              ? h('button', { type: 'button', className: 'dov-rel-item',
+                onClick: () => onSelectNode(item.id) }, content)
+              : h('span', { className: 'dov-rel-item' }, content),
+            h('button', { type: 'button', className: 'dov-rel-more',
+              'aria-expanded': isOpen,
+              'aria-label': tr('provenance.relations', '关系（{n}）').replace('{n}', '1') + ' ' + item.label,
+              onClick: () => setExpandedRelations((previous) => ({ ...previous, [relationKey]: !isOpen })) },
+            tr('viewer.provenance', '已接纳来源') + (isOpen ? ' ▾' : ' ▸')),
+            provenanceContent)
         })
         const tail = []
         if (hasMore) {
@@ -396,12 +565,9 @@ export function createGraphViewDetails(React) {
             h('button', {
               type: 'button',
               className: 'dov-rel-more',
-              onClick: () => {
-                setExpandedGroups((previous) => ({ ...previous, [groupKey]: true }))
-                if (group.items.length < group.count) {
-                  setMaxPerGroup((previous) => Math.max(previous + DETAILS_GROUP_LIMIT, group.items.length + 1))
-                }
-              },
+              onClick: () => setGroupPages((previous) => ({
+                ...previous, [groupKey]: pageNumber + 1,
+              })),
             }, tr('viewer.showMore', '显示更多'))))
         }
         return h('div', { key: groupKey, className: 'dov-group' },
@@ -461,19 +627,22 @@ export function createGraphViewDetails(React) {
               : null),
           literals.length === 0
             ? h('div', { className: 'dov-muted' }, tr('viewer.noLiterals', '没有字面量属性'))
-            : h('table', { className: 'dov-literals' },
-              h('tbody', null, literals.map((literal, index) => h('tr', { key: 'lit-' + String(index) },
-                h('td', { className: 'dov-lit-p', title: literal.p || '' },
-                  literal.pLabel || shortenIri(literal.p || '')),
-                h('td', { className: 'dov-lit-v' },
-                  typeof literal.value === 'string' ? literal.value : String(literal.value),
-                  literal.lang ? h('span', { className: 'dov-lit-meta', key: 'lang' }, ' @' + literal.lang) : null,
-                  literal.dt ? h('span', { className: 'dov-lit-meta', key: 'dt' },
-                    ' ^^' + (detailsLocalName(literal.dt) || literal.dt)) : null,
-                  literal.truncated
-                    ? h('span', { className: 'dov-lit-meta', key: 'trunc' },
-                      ' ' + tr('viewer.literalValueTruncated', '值已截断'))
-                    : null)))))))
+            : h('div', { className: 'dov-literals' }, literals.map((literal, index) => {
+              const literalValue = [
+                typeof literal.value === 'string' ? literal.value : String(literal.value),
+                literal.lang ? h('span', { key: 'lang', className: 'dov-lit-meta' }, ' @' + literal.lang) : null,
+                literal.dt ? h('span', { key: 'dt', className: 'dov-lit-meta' }, ' ^^' + (detailsLocalName(literal.dt) || literal.dt)) : null,
+                literal.truncated ? h('span', { key: 'trunc', className: 'dov-lit-meta' }, ' ' + tr('viewer.literalValueTruncated', '值已截断')) : null,
+              ]
+              return h('div', { key: 'lit-' + String(index), className: 'dov-lit-row' },
+                h('div', { className: 'dov-lit-p', title: literal.p || '' }, literal.pLabel || shortenIri(literal.p || '')),
+                h('div', { className: 'dov-lit-v' }, literalValue),
+                h('div', { className: 'dov-muted', style: { overflowWrap: 'anywhere' } },
+                  sourceList(sourceNames(literal.sourceIds)),
+                  h('code', { style: { userSelect: 'text' } },
+                    (Array.isArray(literal.statementIds) ? literal.statementIds : [])
+                      .map(statementIdDisplay).join(', ') || '—')))
+            }))))
       } else if (section.key === 'connections') {
         const empty = groups.out.length === 0 && groups.in.length === 0
         const connectionsBody = empty
@@ -498,6 +667,57 @@ export function createGraphViewDetails(React) {
             countCell('outEdges', '出边'),
             countCell('inEdges', '入边'),
             countCell('degree', '度数'))))
+      } else if (section.key === 'provenance') {
+        const provenance = node.provenance && typeof node.provenance === 'object' ? node.provenance : {}
+        const sourceIds = Array.isArray(provenance.sourceIds) ? provenance.sourceIds : []
+        const roles = Array.isArray(provenance.roles) ? provenance.roles : []
+        const statementIds = Array.isArray(provenance.statementIds) ? provenance.statementIds : []
+        const labels = props.sourceLabels
+        const labelFor = (id) => sourceLabelFrom(labels, id)
+        sectionElements.push(h('section', { key: 'provenance', className: 'dov-section' },
+          h('div', { className: 'dov-section-title' },
+            tr('viewer.provenance', '已接纳来源'),
+            h('span', { className: 'dov-muted' },
+              tr('viewer.provenanceStatements', '{n} statements')
+                .replace('{n}', String(statementIds.length)))),
+          sourceIds.length > 0
+            ? h('div', { key: 'sources', className: 'dov-items' }, sourceIds.map((id) => h('div', {
+              key: 'src-' + id,
+              className: 'dov-item',
+            }, h('span', { className: 'dov-item-label' }, labelFor(id)))))
+            : h('div', { key: 'none', className: 'dov-muted' },
+              tr('viewer.provenanceMissing', 'No accepted source recorded for this entity.')),
+          sourceIds.length > 0
+            ? h('div', { key: 'copy-ids', className: 'dov-muted' },
+              tr('viewer.copySourceHint', 'Copy source identity'),
+              sourceIds.map((id) => h('button', {
+                key: 'copy-' + id,
+                type: 'button',
+                className: 'dov-btn',
+                title: labelFor(id) + ' · ' + id,
+                'aria-label': tr('viewer.copySourceId', 'Copy source id') + ' ' + labelFor(id),
+                onClick: () => copySourceId(id),
+              }, tr('viewer.copySourceId', 'Copy source id'))))
+            : null,
+          h('div', { key: 'roles', className: 'dov-muted' },
+            tr('viewer.provenanceRoles', 'Roles: {roles}')
+              .replace('{roles}', roles.length > 0 ? roles.join(', ') : '—')),
+          h('div', { key: 'graphs', className: 'dov-muted' },
+            tr('viewer.graphIdentity', 'Graph identity') + ': ' + (function () {
+              const kinds = nodeGraphKinds(props.graph, node.id)
+              const parts = []
+              for (const kind of ['default', 'iri', 'blank', 'unknown']) {
+                if (!kinds[kind]) continue
+                parts.push(tr('provenance.graph.' + kind, kind) + ' \u00d7' + String(kinds[kind]))
+              }
+              return parts.length > 0 ? parts.join(' \u00b7 ') : tr('viewer.graphIdentityNone', 'none')
+            })()),
+          h('div', { key: 'location', className: 'dov-muted' },
+            tr('viewer.locationUnavailable', 'Statement location is not recorded (null).')),
+          sourceCopyError ? h('div', { key: 'copy-error', className: 'dov-rel-hidden' },
+            tr('viewer.copyFailed', '复制失败') + ' · ' + tr('viewer.copySourceHint', '复制来源标识') + ': ' + sourceIds.join(', ')) : null,
+          h('div', { key: 'hint', className: 'dov-muted' },
+            tr('viewer.provenanceHint', 'Accepted sources are not proof that the input is complete.'))))
       } else if (section.key === 'source') {
         const graphSource = props.graph && typeof props.graph.source === 'object' && props.graph.source
           ? props.graph.source

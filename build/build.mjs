@@ -31,17 +31,27 @@ const OUTPUT = path.join(root, 'client.js')
  * Concatenation order; every module must be self-contained (no relative
  * imports). `const` initialization order matters: a module must come before
  * the modules that reference it. `src/ontology-job.js` must stay directly
- * after `src/graph-model.js` because the build embeds the worker source right
- * before it.
+ * after the graph/workspace modules because the build embeds the worker source
+ * right before it.
  */
 const MODULES = [
   'src/rdf-parse.js',
+  'src/ontology-identity.js',
+  'src/ontology-workspace-files.js',
+  'src/ontology-workspace-registry.js',
+  'src/ontology-view-state.js',
+  'src/ontology-file-queue.js',
   'src/graph-model.js',
+  'src/ontology-workspace.js',
+  'src/ontology-views.js',
+  'src/graph-export.js',
   'src/ontology-job.js',
   'src/graph-view-style.js',
   'src/graph-view-controls.js',
   'src/graph-view-details.js',
   'src/graph-view.js',
+  'src/graph-view-multiview.js',
+  'src/graph-view-workspace.js',
   'src/main.js',
 ]
 
@@ -51,7 +61,10 @@ const MODULES = [
  */
 const WORKER_MODULES = [
   'src/rdf-parse.js',
+  'src/ontology-identity.js',
   'src/graph-model.js',
+  'src/ontology-workspace.js',
+  'src/ontology-views.js',
   'src/worker-entry.js',
 ]
 

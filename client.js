@@ -140,19 +140,14 @@ window.__ModuleLoader__.load({
 		  return leaf.slice(dot + 1).toLowerCase()
 		}
 
-		function ontoRdfEncodeFilePath(path) {
-		  return path
-		    .replace(/%/g, '%25')
-		    .replace(/ /g, '%20')
-		    .replace(/#/g, '%23')
-		    .replace(/\?/g, '%3F')
-		}
-
 		/* ------------------------------------------------------------------ */
 		/* Resource address mapping (display name is never an identity)        */
 		/* ------------------------------------------------------------------ */
 
 		const ONTO_WINDOWS_DRIVE_PATH = /^[A-Za-z]:[\\/]/
+		const ONTO_URI_PATH_CHAR = /[A-Za-z0-9\-._~!$&'()*+,;=:@]/
+		const ONTO_SHARED_DEFAULT_GRAPH = Object.freeze({ kind: 'default' })
+		const ONTO_SHARED_UNKNOWN_GRAPH = Object.freeze({ kind: 'unknown' })
 
 		function ontoRdfStripFragment(value) {
 		  const hash = value.indexOf('#')
@@ -160,25 +155,114 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
+		 * DSH session file routes carry authorization and navigation only. They are
+		 * never used as an RDF base IRI, so the two host entries can agree on the
+		 * real file identity behind the route.
+		 */
+		function ontoRdfIsDshResourceAddress(value) {
+		  return typeof value === 'string' && /^dsh-resource:/i.test(value.trim())
+		}
+
+		/**
+		 * Split a DSH session file route into its authorizing session and requested
+		 * path. The path is a request hint only: the Host still resolves it.
+		 */
+		function ontoRdfParseDshResourceAddress(value) {
+		  if (!ontoRdfIsDshResourceAddress(value)) return null
+		  const match = /^dsh-resource:\/\/([^/]*)\/session\/([^/]+)\/([\s\S]*)$/i.exec(value.trim())
+		  if (!match) return null
+		  return { authority: match[1], sessionId: match[2], path: match[3] }
+		}
+
+		/** Percent-encode one Unicode code point as UTF-8. */
+		function ontoRdfEncodeCodePoint(code) {
+		  let bytes
+		  if (code < 0x80) bytes = [code]
+		  else if (code < 0x800) bytes = [0xc0 | (code >> 6), 0x80 | (code & 0x3f)]
+		  else if (code < 0x10000) {
+		    bytes = [0xe0 | (code >> 12), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f)]
+		  } else {
+		    bytes = [0xf0 | (code >> 18), 0x80 | ((code >> 12) & 0x3f),
+		      0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f)]
+		  }
+		  let output = ''
+		  for (let index = 0; index < bytes.length; index++) {
+		    const hex = bytes[index].toString(16).toUpperCase()
+		    output += '%' + (hex.length < 2 ? '0' + hex : hex)
+		  }
+		  return output
+		}
+
+		/**
+		 * Encode one filesystem path segment for a file URI. URI path characters are
+		 * kept; everything else (including `%`, spaces, `#`, `?` and non-ASCII) is
+		 * percent-encoded, so a literal `%20` in a raw path becomes `%2520` while an
+		 * already-encoded URI is never decoded and re-encoded.
+		 */
+		function ontoRdfEncodePathSegment(segment) {
+		  let output = ''
+		  for (let index = 0; index < segment.length; index++) {
+		    const code = segment.codePointAt(index)
+		    if (code > 0xffff) index++
+		    const character = String.fromCodePoint(code)
+		    if (ONTO_URI_PATH_CHAR.test(character)) output += character
+		    else output += ontoRdfEncodeCodePoint(code)
+		  }
+		  return output
+		}
+
+		function ontoRdfEncodePathSegments(path) {
+		  const segments = path.split('/')
+		  for (let index = 0; index < segments.length; index++) {
+		    segments[index] = ontoRdfEncodePathSegment(segments[index])
+		  }
+		  return segments.join('/')
+		}
+
+		/**
+		 * Map a host-confirmed absolute filesystem path to a file URI. Relative
+		 * paths, display names and non-path values return null: a real identity is
+		 * never guessed. Windows drive letters keep their case folded to upper case,
+		 * both separators are accepted, UNC keeps its share as the URI authority,
+		 * POSIX paths keep their case.
+		 */
+		function ontoRdfFileUriFromPath(value) {
+		  if (typeof value !== 'string') return null
+		  const raw = value.trim()
+		  if (raw === '') return null
+		  if (ONTO_WINDOWS_DRIVE_PATH.test(raw)) {
+		    const normalized = raw.replace(/\\/g, '/')
+		    const drive = normalized.slice(0, 1).toUpperCase() + ':'
+		    const rest = normalized.slice(2)
+		    return 'file:///' + drive + ontoRdfEncodePathSegments(rest)
+		  }
+		  if (raw.slice(0, 2) === '\\\\') {
+		    const normalized = raw.replace(/\\/g, '/').slice(2)
+		    const slash = normalized.indexOf('/')
+		    const host = slash < 0 ? normalized : normalized.slice(0, slash)
+		    const rest = slash < 0 ? '' : normalized.slice(slash)
+		    if (!host) return null
+		    return 'file://' + ontoRdfEncodePathSegment(host) + ontoRdfEncodePathSegments(rest)
+		  }
+		  if (raw.charAt(0) === '/') {
+		    return 'file://' + ontoRdfEncodePathSegments(raw)
+		  }
+		  return null
+		}
+
+		/**
 		 * Map a real resource address to an RDF base IRI, or null when it cannot be
-		 * mapped reliably. `resourceAddress` is not guaranteed to be a file URI: the
-		 * host may hand us an http(s) URL, a custom-scheme address, or a plain file
-		 * path from a different integration. A display file name is a relative path
-		 * and is therefore never mapped.
+		 * mapped reliably. A DSH session route is explicitly excluded; every other
+		 * absolute hierarchical URI keeps its RDF meaning. A display file name is a
+		 * relative path and is therefore never mapped.
 		 */
 		function ontoRdfMapResourceAddress(address) {
 		  if (typeof address !== 'string') return null
 		  const value = address.trim()
 		  if (value === '') return null
-		  if (ONTO_WINDOWS_DRIVE_PATH.test(value)) {
-		    return 'file:///' + ontoRdfEncodeFilePath(value.replace(/\\/g, '/'))
-		  }
-		  if (value.slice(0, 2) === '\\\\') {
-		    return 'file://' + ontoRdfEncodeFilePath(value.replace(/\\/g, '/'))
-		  }
-		  if (value.charAt(0) === '/') {
-		    return 'file://' + ontoRdfEncodeFilePath(value)
-		  }
+		  if (ontoRdfIsDshResourceAddress(value)) return null
+		  const mappedPath = ontoRdfFileUriFromPath(value)
+		  if (mappedPath) return mappedPath
 		  if (!ontoRdfIsAbsoluteIri(value)) return null
 		  const parts = ontoRdfParseIri(value)
 		  const scheme = typeof parts.scheme === 'string' ? parts.scheme.toLowerCase() : ''
@@ -195,10 +279,28 @@ window.__ModuleLoader__.load({
 
 		/**
 		 * Initial base for one parse: document declarations may override it later.
+		 * Precedence: explicit trusted `rdfBase`, then the host-confirmed
+		 * `absolutePath`, then legacy `resourceAddress` for library callers. A
+		 * `navigationAddress` (the DSH route) never contributes a base.
 		 * @returns {{ base: string, source: 'document'|'resource'|'none' }}
 		 */
 		function ontoRdfInitialBase(options) {
 		  const opts = options || {}
+		  if (opts.rdfBase !== undefined && opts.rdfBase !== null) {
+		    if (ontoRdfIsDshResourceAddress(opts.rdfBase)) return { base: '', source: 'none' }
+		    const mapped = ontoRdfMapResourceAddress(opts.rdfBase)
+		    if (mapped) return { base: mapped, source: 'resource' }
+		    return { base: '', source: 'none' }
+		  }
+		  if (opts.absolutePath !== undefined && opts.absolutePath !== null) {
+		    const mapped = ontoRdfFileUriFromPath(opts.absolutePath)
+		    if (mapped) return { base: mapped, source: 'resource' }
+		    return { base: '', source: 'none' }
+		  }
+		  if (opts.navigationAddress !== undefined && opts.navigationAddress !== null) {
+		    // The route is the only address here; it is not an RDF identity.
+		    return { base: '', source: 'none' }
+		  }
 		  if (opts.resourceAddress !== undefined && opts.resourceAddress !== null) {
 		    const mapped = ontoRdfMapResourceAddress(opts.resourceAddress)
 		    if (mapped) return { base: mapped, source: 'resource' }
@@ -240,6 +342,13 @@ window.__ModuleLoader__.load({
 		    this.blankCounter = 0
 		    this.usedBlankLabels = Object.create(null)
 		    this.lineIndex = null
+		    /**
+		     * Graph context for statements appended next. TriG/TriG-style blocks and
+		     * JSON-LD named graphs set this; every other serialization keeps the
+		     * shared default-graph marker. The object is shared so 100k statements do
+		     * not allocate 100k identical graph objects.
+		     */
+		    this.currentGraph = ONTO_SHARED_DEFAULT_GRAPH
 		    if (typeof text !== 'string') this.error('input is not a string')
 		  }
 
@@ -290,7 +399,7 @@ window.__ModuleLoader__.load({
 		    return entry
 		  }
 
-		  add(subject, predicate, object, objectKind, datatype, language) {
+		  add(subject, predicate, object, objectKind, datatype, language, graph) {
 		    if (this.triples.length >= this.maxTriples) {
 		      if (!this.truncated) {
 		        this.truncated = true
@@ -315,7 +424,14 @@ window.__ModuleLoader__.load({
 		      )
 		      term = term.slice(0, this.maxLiteralLength)
 		    }
-		    const triple = { s: subject, p: predicate, o: term, oKind: objectKind || 'iri' }
+		    const triple = {
+		      s: subject,
+		      p: predicate,
+		      o: term,
+		      oKind: objectKind || 'iri',
+		      graph: graph || this.currentGraph || ONTO_SHARED_DEFAULT_GRAPH,
+		      location: null,
+		    }
 		    if (literalTruncated) triple.literalTruncated = true
 		    if (datatype !== undefined) triple.dt = datatype
 		    if (language !== undefined) triple.lang = language
@@ -655,6 +771,9 @@ window.__ModuleLoader__.load({
 		    this.builder.baseSource = initial.source
 		    this.depth = 0
 		    this.prefixes = this.builder.prefixes
+		    /** Open TriG graph blocks; each entry is `{ term, index }`. */
+		    this.graphStack = []
+		    this.builder.currentGraph = ONTO_SHARED_DEFAULT_GRAPH
 		    if (opts.prefixes && typeof opts.prefixes === 'object') {
 		      const keys = Object.keys(opts.prefixes)
 		      for (let i = 0; i < keys.length; i++) {
@@ -857,15 +976,74 @@ window.__ModuleLoader__.load({
 		    if (value !== '') this.builder.baseSource = 'document'
 		  }
 
-		  /** Record that a TriG graph label was recognised and ignored. */
-		  noteNamedGraph(label, index) {
-		    const name = typeof label === 'string' && label !== '' ? label : 'anonymous graph'
+		  /* ------------------------- graph context ------------------------- */
+
+		  /** Open one TriG graph block and make its graph the current context. */
+		  pushGraph(term, index) {
+		    const graph = term && typeof term === 'object' ? term : ONTO_SHARED_DEFAULT_GRAPH
+		    this.graphStack.push({ term: graph, index: index })
+		    this.builder.currentGraph = graph
+		  }
+
+		  /** Close the innermost graph block; an unbalanced brace is diagnosed. */
+		  popGraph(index) {
+		    if (this.graphStack.length > 0) {
+		      this.graphStack.pop()
+		      this.builder.currentGraph = this.graphStack.length > 0
+		        ? this.graphStack[this.graphStack.length - 1].term
+		        : ONTO_SHARED_DEFAULT_GRAPH
+		      return
+		    }
 		    this.builder.diagnose(
-		      'named-graph-ignored',
+		      'named-graph-context',
 		      'warning',
-		      'named graph "' + name + '" was ignored; its triples were kept in the default graph',
+		      'closing "}" without an open graph block was ignored',
+		      this.lineAt(index === undefined ? this.pos : index),
+		    )
+		    this.builder.currentGraph = ONTO_SHARED_DEFAULT_GRAPH
+		  }
+
+		  /** Resolve one graph IRI through the current base and prefixes. */
+		  graphTermFromIri(iri, index) {
+		    if (!ontoRdfIsAbsoluteIri(iri)) {
+		      if (!this.base) {
+		        this.builder.diagnose(
+		          'base-unavailable',
+		          'warning',
+		          'graph IRI "' + iri + '" is relative and no base is available',
+		          this.lineAt(index),
+		        )
+		        return ONTO_SHARED_UNKNOWN_GRAPH
+		      }
+		      return { kind: 'iri', value: resolveIri(this.base, iri) }
+		    }
+		    return { kind: 'iri', value: iri }
+		  }
+
+		  /**
+		   * Resolve a prefixed-name graph label without aborting the document when
+		   * the prefix is unknown: the label is reported and kept as unknown.
+		   */
+		  graphTermFromNameToken(token) {
+		    const value = token && typeof token.value === 'string' ? token.value : ''
+		    const colon = value.indexOf(':')
+		    if (colon < 0) return null
+		    const prefix = value.slice(0, colon)
+		    const local = value.slice(colon + 1)
+		    const namespace = ontoRdfHas(this.prefixes, prefix) ? this.prefixes[prefix] : undefined
+		    if (typeof namespace !== 'string') return null
+		    return this.graphTermFromIri(namespace + local, token.start)
+		  }
+
+		  /** Diagnose one graph label that could not be resolved, then keep unknown. */
+		  noteUnresolvedGraph(label, index) {
+		    this.builder.diagnose(
+		      'named-graph-context',
+		      'warning',
+		      'graph label "' + label + '" could not be resolved; its statements keep an unknown graph context',
 		      this.lineAt(index),
 		    )
+		    return ONTO_SHARED_UNKNOWN_GRAPH
 		  }
 
 		  /** Skip one balanced bracket construct without recursing (depth-limit escape). */
@@ -1101,7 +1279,15 @@ window.__ModuleLoader__.load({
 		    while (!this.atEnd()) {
 		      if (this.builder.truncated) break
 		      const character = this.peek()
-		      if (character === '{' || character === '}') {
+		      if (character === '{') {
+		        // An anonymous block is TriG's default graph.
+		        this.pushGraph(ONTO_SHARED_DEFAULT_GRAPH, this.pos)
+		        this.pos++
+		        this.skipWhitespace()
+		        continue
+		      }
+		      if (character === '}') {
+		        this.popGraph(this.pos)
 		        this.pos++
 		        this.skipWhitespace()
 		        continue
@@ -1124,11 +1310,21 @@ window.__ModuleLoader__.load({
 		        continue
 		      }
 		      if (this.peek() === '}') {
+		        this.popGraph(this.pos)
 		        this.pos++
 		        this.skipWhitespace()
 		        continue
 		      }
 		      this.fatal("expected '.' after the triples", this.pos)
+		    }
+		    if (!this.builder.truncated && this.graphStack.length > 0) {
+		      this.builder.diagnose(
+		        'named-graph-context',
+		        'warning',
+		        'a graph block was not closed before the end of the document',
+		      )
+		      this.graphStack.length = 0
+		      this.builder.currentGraph = ONTO_SHARED_DEFAULT_GRAPH
 		    }
 		  }
 
@@ -1137,10 +1333,11 @@ window.__ModuleLoader__.load({
 		    if (this.peek() === '<') {
 		      const end = this.findIriEnd(save)
 		      if (end < 0) return false
-		      this.pos = end + 1
+		      this.pos = save
+		      const iri = this.readIriReference()
 		      this.skipWhitespace()
 		      if (this.peek() === '{') {
-		        this.noteNamedGraph(this.source.slice(save, end + 1), save)
+		        this.pushGraph(this.graphTermFromIri(iri, save), save)
 		        this.pos++
 		        return true
 		      }
@@ -1151,9 +1348,10 @@ window.__ModuleLoader__.load({
 		      this.pos += 2
 		      const labelStart = save
 		      while (!this.atEnd() && !this.isNameDelimiter(this.peek())) this.pos++
+		      const labelText = this.source.slice(labelStart, this.pos)
 		      this.skipWhitespace()
 		      if (this.peek() === '{') {
-		        this.noteNamedGraph(this.source.slice(labelStart, this.pos).trim(), save)
+		        this.pushGraph({ kind: 'blank', value: this.builder.useBlank(labelText.slice(2)) }, save)
 		        this.pos++
 		        return true
 		      }
@@ -1164,32 +1362,36 @@ window.__ModuleLoader__.load({
 		    if (word.toLowerCase() === 'graph' && ontoRdfIsWhitespace(this.source[this.pos + word.length])) {
 		      this.pos += word.length
 		      this.skipWhitespace()
-		      let label = ''
+		      let graph
+		      let labelText
 		      if (this.peek() === '<') {
 		        const labelStart = this.pos
-		        const end = this.findIriEnd(labelStart)
-		        if (end < 0) {
+		        if (this.findIriEnd(labelStart) < 0) {
 		          this.pos = save
 		          return false
 		        }
-		        this.readIriReference()
-		        label = this.source.slice(labelStart, end + 1)
+		        const iri = this.readIriReference()
+		        labelText = iri
+		        graph = this.graphTermFromIri(iri, save)
 		      } else if (this.peek() === '_' && this.peek(1) === ':') {
 		        const labelStart = this.pos
 		        this.pos += 2
 		        while (!this.atEnd() && !this.isNameDelimiter(this.peek())) this.pos++
-		        label = this.source.slice(labelStart, this.pos)
+		        labelText = this.source.slice(labelStart, this.pos)
+		        graph = { kind: 'blank', value: this.builder.useBlank(labelText.slice(2)) }
 		      } else {
 		        const labelToken = this.readNameToken()
 		        if (!labelToken.value) {
 		          this.pos = save
 		          return false
 		        }
-		        label = labelToken.value
+		        labelText = labelToken.value
+		        graph = this.graphTermFromNameToken(labelToken) ||
+		          this.noteUnresolvedGraph(labelText, save)
 		      }
 		      this.skipWhitespace()
 		      if (this.peek() === '{') {
-		        this.noteNamedGraph(label, save)
+		        this.pushGraph(graph, save)
 		        this.pos++
 		        return true
 		      }
@@ -1199,7 +1401,8 @@ window.__ModuleLoader__.load({
 		    const token = this.readNameToken()
 		    this.skipWhitespace()
 		    if (token.value && this.peek() === '{') {
-		      this.noteNamedGraph(token.value, save)
+		      this.pushGraph(this.graphTermFromNameToken(token) ||
+		        this.noteUnresolvedGraph(token.value, save), save)
 		      this.pos++
 		      return true
 		    }
@@ -1226,6 +1429,8 @@ window.__ModuleLoader__.load({
 		    const subject = this.parseSubject()
 		    this.skipWhitespace()
 		    if (this.peek() === '{') {
+		      // A block opened after a subject is tolerated as a default-graph block.
+		      this.pushGraph(ONTO_SHARED_DEFAULT_GRAPH, this.pos)
 		      this.pos++
 		      return
 		    }
@@ -1571,10 +1776,10 @@ window.__ModuleLoader__.load({
 		      else fail('expected an object')
 
 		      skip()
-		      let graphLabel
+		      let graphTerm = ONTO_SHARED_DEFAULT_GRAPH
 		      if (line[pos] === '<' || (line[pos] === '_' && line[pos + 1] === ':')) {
-		        if (line[pos] === '<') graphLabel = readIri()
-		        else graphLabel = readBlank()
+		        if (line[pos] === '<') graphTerm = { kind: 'iri', value: readIri() }
+		        else graphTerm = { kind: 'blank', value: readBlank() }
 		        skip()
 		      }
 
@@ -1585,15 +1790,7 @@ window.__ModuleLoader__.load({
 		        builder.warn('extra content after the statement was ignored', lineNumber)
 		      }
 
-		      if (graphLabel !== undefined) {
-		        builder.diagnose(
-		          'named-graph-ignored',
-		          'warning',
-		          'graph term "' + graphLabel + '" was ignored; N-Quads datasets are not supported',
-		          lineNumber,
-		        )
-		      }
-		      builder.add(subject, predicate, object.term, object.kind, object.dt, object.lang)
+		      builder.add(subject, predicate, object.term, object.kind, object.dt, object.lang, graphTerm)
 		    } catch (error) {
 		      if (error && error.ontoRdfFatal) return
 		      builder.error(
@@ -2758,11 +2955,25 @@ window.__ModuleLoader__.load({
 		      if (key === '@context' || key === '@id' || key === '@type' || key === '@index') continue
 		      if (key === '@graph') {
 		        if (graphWithoutId) continue
-		        const graph = node[key]
-		        const items = Array.isArray(graph) ? graph : [graph]
-		        for (let g = 0; g < items.length; g++) {
-		          if (this.builder.truncated) break
-		          this.processNode(items[g], context)
+		        // A @graph sibling of @id names a graph. This subset keeps the
+		        // statements but cannot express the graph term, so they are marked
+		        // unknown instead of being silently promoted to the default graph.
+		        this.builder.diagnose(
+		          'named-graph-unavailable',
+		          'warning',
+		          'JSON-LD named graphs are not supported; statements were kept with an unknown graph context',
+		        )
+		        const previousGraph = this.builder.currentGraph
+		        this.builder.currentGraph = ONTO_SHARED_UNKNOWN_GRAPH
+		        try {
+		          const graph = node[key]
+		          const items = Array.isArray(graph) ? graph : [graph]
+		          for (let g = 0; g < items.length; g++) {
+		            if (this.builder.truncated) break
+		            this.processNode(items[g], context)
+		          }
+		        } finally {
+		          this.builder.currentGraph = previousGraph
 		        }
 		        continue
 		      }
@@ -3050,6 +3261,25 @@ window.__ModuleLoader__.load({
 		  return new OntoJsonLdParser(text, options).parse()
 		}
 
+		/* ------------------------------------------------------------------ */
+		/* Identity helpers shared with the workspace and host adapters        */
+		/* ------------------------------------------------------------------ */
+
+		/** True when a value is a DSH session file route (authorization, not RDF). */
+		function isDshResourceAddress(value) {
+		  return ontoRdfIsDshResourceAddress(value)
+		}
+
+		/** Split a DSH session route into `{ authority, sessionId, path }`, or null. */
+		function parseDshResourceAddress(value) {
+		  return ontoRdfParseDshResourceAddress(value)
+		}
+
+		/** The single host-path → file-URI conversion used by every entry point. */
+		function fileUriFromPath(value) {
+		  return ontoRdfFileUriFromPath(value)
+		}
+
 		/** Detect the RDF serialization from a file name and/or the document text. */
 		function detectFormat(text, fileName) {
 		  const source = ontoRdfNormalizeText(text)
@@ -3098,7 +3328,10 @@ window.__ModuleLoader__.load({
 		 * Parse any supported serialization. Never throws.
 		 * options: {
 		 *   fileName?: string,          // display name, used for format detection only
-		 *   resourceAddress?: string,   // real resource address, used for the base IRI
+		 *   resourceAddress?: string,   // legacy real resource address (never a DSH route)
+		 *   navigationAddress?: string, // DSH session route: navigation only, never a base
+		 *   absolutePath?: string,      // host-confirmed absolute file path (the base)
+		 *   rdfBase?: string,           // explicit trusted base IRI
 		 *   format?: string,
 		 *   maxTriples?: number,
 		 *   maxLiteralLength?: number,
@@ -3116,6 +3349,9 @@ window.__ModuleLoader__.load({
 		  const parserOptions = {
 		    fileName: opts.fileName,
 		    resourceAddress: opts.resourceAddress,
+		    navigationAddress: opts.navigationAddress,
+		    absolutePath: opts.absolutePath,
+		    rdfBase: opts.rdfBase,
 		    maxTriples: opts.maxTriples,
 		    maxLiteralLength: opts.maxLiteralLength,
 		    maxDepth: opts.maxDepth,
@@ -3148,6 +3384,676 @@ window.__ModuleLoader__.load({
 		  const result = ontoRdfEmptyDocument('unknown', text, parserOptions)
 		  result.errors.push('unsupported RDF format: ' + String(format))
 		  return result
+		}
+
+		// ==== src/ontology-identity.js ====
+		/**
+		 * Entity identity for merged multi-file RDF data.
+		 *
+		 * The viewer merges statements from several sources into one node-link model.
+		 * Absolute RDF IRIs identify themselves; blank nodes, unresolved relative
+		 * IRIs and unknown graph contexts are scoped to the source document, so the
+		 * same label in two files never becomes the same entity.
+		 *
+		 * Internal keys use a marker character that a valid RDF IRI cannot contain
+		 * (U+0000), and every part is length-prefixed. A user IRI can therefore never
+		 * collide with an internal key, and blank labels containing separators cannot
+		 * shift key boundaries.
+		 *
+		 * Plain ECMAScript: this module is concatenated into the Client bundle and the
+		 * embedded Worker (see build/build.mjs), and imported directly by Node tests.
+		 */
+
+		const ONTO_IDENTITY_MARKER = '\u0000'
+
+		/** Length-prefix one key part so separators inside values are unambiguous. */
+		function ontoIdentityPart(value) {
+		  const text = typeof value === 'string' ? value : String(value)
+		  return text.length + ':' + text
+		}
+
+		/** Build one internal, collision-resistant key from its parts. */
+		function ontoIdentityKey(kind, parts) {
+		  let key = ONTO_IDENTITY_MARKER + kind + ONTO_IDENTITY_MARKER
+		  for (let index = 0; index < parts.length; index++) {
+		    key += ontoIdentityPart(parts[index])
+		  }
+		  return key
+		}
+
+		/** True when a key is a workspace-internal identity rather than an RDF IRI. */
+		function isInternalEntityKey(value) {
+		  if (typeof value !== 'string') return false
+		  if (value.charAt(0) === ONTO_IDENTITY_MARKER) return true
+		  return value.slice(0, 2) === '_:' && value.charAt(2) === ONTO_IDENTITY_MARKER
+		}
+
+		/** Split an internal key back into `{ kind, parts }`, or null for real IRIs. */
+		function describeInternalEntityKey(value) {
+		  if (!isInternalEntityKey(value)) return null
+		  const body = value.charAt(0) === ONTO_IDENTITY_MARKER ? value.slice(1) : value.slice(3)
+		  const marker = body.indexOf(ONTO_IDENTITY_MARKER)
+		  if (marker < 0) return null
+		  const kind = body.slice(0, marker)
+		  const rest = body.slice(marker + 1)
+		  const parts = []
+		  let index = 0
+		  while (index < rest.length) {
+		    const colon = rest.indexOf(':', index)
+		    if (colon < 0) return null
+		    const length = Number(rest.slice(index, colon))
+		    if (!Number.isInteger(length) || length < 0) return null
+		    const start = colon + 1
+		    parts.push(rest.slice(start, start + length))
+		    index = start + length
+		  }
+		  return { kind: kind, parts: parts }
+		}
+
+		/**
+		 * Identity of one blank node inside a source document. The `_:` prefix keeps
+		 * the graph model's blank-node classification working on the scoped id; the
+		 * marker after it still makes the key impossible to forge with an RDF IRI.
+		 */
+		function blankEntityKey(sourceId, label) {
+		  return '_:' + ontoIdentityKey('blank', [sourceId, label])
+		}
+
+		/** Identity of one unresolved relative IRI inside a source document. */
+		function relativeEntityKey(sourceId, raw) {
+		  return ontoIdentityKey('relative', [sourceId, raw])
+		}
+
+		/** Stable identity of one statement (source + ordinal). */
+		function statementIdFor(sourceId, ordinal) {
+		  return ontoIdentityKey('statement', [sourceId, String(ordinal)])
+		}
+
+		/**
+		 * Identity of the graph context of one statement. Default graphs share one
+		 * identity; IRI graphs identify themselves; blank and unknown contexts stay
+		 * scoped to their source document.
+		 */
+		function graphIdentityFor(sourceId, graph) {
+		  if (!graph || graph.kind === 'default') return 'default'
+		  if (graph.kind === 'iri' && typeof graph.value === 'string' && graph.value !== '') {
+		    return 'iri\t' + graph.value
+		  }
+		  if (graph.kind === 'blank') return blankEntityKey(sourceId, graph.value || '')
+		  return 'unknown\t' + sourceId
+		}
+
+		/**
+		 * Entity identity of one RDF term string. An absolute IRI keeps its own
+		 * identity; a blank node or a relative IRI is scoped to the source.
+		 */
+		function entityKeyForTerm(term, sourceId) {
+		  const value = typeof term === 'string' ? term : ''
+		  if (value.slice(0, 2) === '_:') return blankEntityKey(sourceId, value)
+		  if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(value)) return value
+		  return relativeEntityKey(sourceId, value)
+		}
+
+		// ==== src/ontology-workspace-files.js ====
+		/**
+		 * Optional Host "workspace files" adapter (option A).
+		 *
+		 * The Host service `remote.workspaceFiles` is optional and its wire results are
+		 * not part of this plugin's contract, so every entry point is defensive: the
+		 * capability is detected rather than assumed, list results are normalized, and
+		 * any failure returns a structured reason instead of throwing. Callers must keep
+		 * the local-file path (option B) working when this adapter is unavailable.
+		 */
+
+		const WORKSPACE_FILES_LIMITS = {
+		  maxEntries: 400,
+		  maxReadBytes: 24 * 1024 * 1024,
+		}
+
+		function workspaceFilesIsObject(value) {
+		  return value !== null && typeof value === 'object'
+		}
+
+		/** Read one property without letting a Cordis service guard escape. */
+		function workspaceFilesRead(object, key) {
+		  try {
+		    return workspaceFilesIsObject(object) ? object[key] : undefined
+		  } catch (error) {
+		    // A Cordis context without `inject` throws on service access by design.
+		    return undefined
+		  }
+		}
+
+		/**
+		 * Pull a usable `{ list, stat, readBytes }` facade out of a Cordis context.
+		 *
+		 * Every read is guarded: this module is used during render, so a blocked or
+		 * throwing service lookup must degrade to "unavailable" instead of breaking the
+		 * panel. Without an `inject` declaration the Host may refuse `remote`
+		 * access, and that refusal is the expected fallback signal (option B).
+		 */
+		function workspaceFilesApi(ctx) {
+		  try {
+		    if (!workspaceFilesIsObject(ctx)) return null
+		    const candidates = []
+		    const direct = workspaceFilesRead(ctx, 'remote')
+		    if (direct) candidates.push(direct)
+		    if (typeof ctx.get === 'function') {
+		      try {
+		        const remote = ctx.get('remote')
+		        if (remote) candidates.push(remote)
+		      } catch (error) {
+		        // ignore: service not injected
+		      }
+		    }
+		    const reflect = workspaceFilesRead(ctx, 'reflect')
+		    if (reflect && typeof reflect.get === 'function') {
+		      try {
+		        const remote = reflect.get('remote')
+		        if (remote) candidates.push(remote)
+		      } catch (error) {
+		        // ignore: service not injected
+		      }
+		    }
+		    for (const remote of candidates) {
+		      const api = workspaceFilesRead(remote, 'workspaceFiles')
+		      if (!workspaceFilesIsObject(api) || typeof api.list !== 'function' || typeof api.readBytes !== 'function') continue
+		      return {
+		        list: api.list.bind(api),
+		        stat: typeof api.stat === 'function' ? api.stat.bind(api) : null,
+		        readBytes: api.readBytes.bind(api),
+		      }
+		    }
+		  } catch (error) {
+		    return null
+		  }
+		  return null
+		}
+
+		/** Split a DSH route into the session + path the Host service expects. */
+		function workspaceFilesTarget(address, addressParser) {
+		  if (typeof address !== 'string' || address === '') return null
+		  const parser = typeof addressParser === 'function'
+		    ? addressParser
+		    : (typeof parseDshResourceAddress === 'function' ? parseDshResourceAddress : null)
+		  if (!parser) return null
+		  const parsed = parser(address)
+		  if (!parsed || typeof parsed.sessionId !== 'string' || !parsed.sessionId) return null
+		  if (typeof parsed.path !== 'string' || !parsed.path) return null
+		  return { sessionId: parsed.sessionId, path: parsed.path }
+		}
+
+		/** Normalize one list() result into sorted `{ name, path, isDirectory, size }`. */
+		function normalizeWorkspaceList(result) {
+		  const raw = Array.isArray(result)
+		    ? result
+		    : (workspaceFilesIsObject(result) && Array.isArray(result.entries) ? result.entries : [])
+		  const entries = []
+		  for (const item of raw) {
+		    if (!workspaceFilesIsObject(item)) continue
+		    const name = typeof item.name === 'string' && item.name
+		      ? item.name
+		      : (typeof item.path === 'string' ? item.path.split('/').filter(Boolean).pop() : '')
+		    if (!name) continue
+		    const path = typeof item.path === 'string' && item.path ? item.path : name
+		    const isDirectory = item.isDirectory === true || item.kind === 'directory' || item.type === 'directory'
+		    entries.push({ name: name, path: path, isDirectory: isDirectory, size: Number(item.size) || 0 })
+		    if (entries.length >= WORKSPACE_FILES_LIMITS.maxEntries) break
+		  }
+		  entries.sort(function (a, b) {
+		    if (a.isDirectory !== b.isDirectory) return a.isDirectory ? -1 : 1
+		    return a.name < b.name ? -1 : a.name > b.name ? 1 : 0
+		  })
+		  const truncated = raw.length > entries.length || (workspaceFilesIsObject(result) && result.truncated === true)
+		  return { entries: entries, truncated: truncated }
+		}
+
+		/** Decode a readBytes() result; only a complete, in-budget payload passes. */
+		function decodeWorkspaceBytes(result) {
+		  if (!workspaceFilesIsObject(result)) return { ok: false, reason: 'read-failed' }
+		  if (result.error) return { ok: false, reason: String(result.error) }
+		  let bytes = null
+		  if (result.bytes instanceof Uint8Array) bytes = result.bytes
+		  else if (result.bytes instanceof ArrayBuffer) bytes = new Uint8Array(result.bytes)
+		  if (!bytes) return { ok: false, reason: 'no-bytes' }
+		  if (bytes.byteLength > WORKSPACE_FILES_LIMITS.maxReadBytes) return { ok: false, reason: 'too-large' }
+		  if (Number(result.offset) > 0 || result.eof === false) return { ok: false, reason: 'partial-read' }
+		  let text = ''
+		  try {
+		    text = new TextDecoder('utf-8').decode(bytes)
+		  } catch (error) {
+		    return { ok: false, reason: 'decode-failed' }
+		  }
+		  return { ok: true, text: text, byteSize: bytes.byteLength, version: result.version }
+		}
+
+		/** List one directory; returns `{ok, entries, truncated}` or `{ok:false, reason}`. */
+		async function listWorkspaceDirectory(api, sessionId, directory, signal) {
+		  if (!api || typeof api.list !== 'function') return { ok: false, reason: 'unavailable' }
+		  try {
+		    const result = await api.list(sessionId, directory, signal)
+		    const normalized = normalizeWorkspaceList(result)
+		    return { ok: true, entries: normalized.entries, truncated: normalized.truncated }
+		  } catch (error) {
+		    return { ok: false, reason: error && error.message ? String(error.message) : 'list-failed' }
+		  }
+		}
+
+		/**
+		 * Read one Host file with the design contract: stat → readBytes(eof) → stat
+		 * again; a version change is retried once and then reported, never hidden.
+		 */
+		async function readWorkspaceSource(api, sessionId, path, signal) {
+		  if (!api || typeof api.readBytes !== 'function') return { ok: false, reason: 'unavailable' }
+		  let before = null
+		  if (typeof api.stat === 'function') {
+		    try {
+		      const stat = await api.stat(sessionId, path, signal)
+		      if (workspaceFilesIsObject(stat)) before = stat
+		      if (workspaceFilesIsObject(stat) && stat.error) return { ok: false, reason: String(stat.error) }
+		    } catch (error) {
+		      return { ok: false, reason: error && error.message ? String(error.message) : 'stat-failed' }
+		    }
+		  }
+		  for (let attempt = 0; attempt < 2; attempt += 1) {
+		    let read = null
+		    try {
+		      read = await api.readBytes(sessionId, path, {}, signal)
+		    } catch (error) {
+		      return { ok: false, reason: error && error.message ? String(error.message) : 'read-failed' }
+		    }
+		    const decoded = decodeWorkspaceBytes(read)
+		    if (!decoded.ok) return decoded
+		    let after = before
+		    if (typeof api.stat === 'function') {
+		      try {
+		        after = await api.stat(sessionId, path, signal)
+		        if (after && after.error) return { ok: false, reason: String(after.error) }
+		      } catch (error) {
+		        return { ok: false, reason: error && error.message ? String(error.message) : 'stat-failed' }
+		      }
+		    }
+		    const versions = [before && before.version, decoded.version, after && after.version]
+		      .filter(value => value !== undefined && value !== null).map(String)
+		    if (new Set(versions).size <= 1) {
+		      return Object.assign({ ok: true }, decoded, {
+		        absolutePath: after && typeof after.absolutePath === 'string' ? after.absolutePath
+		          : (before && typeof before.absolutePath === 'string' ? before.absolutePath : ''),
+		      })
+		    }
+		    before = after
+		  }
+		  return { ok: false, reason: 'changed-during-read' }
+		}
+
+		// ==== src/ontology-workspace-registry.js ====
+		/** Page-local sharing of bounded parsed sources, keyed by real session/workspace. */
+		const MAX_FILES = 16
+		const MAX_BYTES = 24 * 1024 * 1024
+		const MAX_OCCURRENCES = 120000
+		const DEFAULT_WORKSPACE_ID = 'explicit'
+
+		function validId(value) {
+		  return typeof value === 'string' && value.trim().length > 0
+		}
+
+		function validRegistry(value) {
+		  return value && value.sessions instanceof Map && Number.isSafeInteger(value.nextOwnerId)
+		}
+
+		function copyFrozen(value) {
+		  if (Array.isArray(value)) return Object.freeze(value.map(copyFrozen))
+		  if (value && typeof value === 'object') {
+		    const copy = {}
+		    for (const key of Object.keys(value)) copy[key] = copyFrozen(value[key])
+		    return Object.freeze(copy)
+		  }
+		  return value
+		}
+
+		function snapshot(source, ownerId) {
+		  if (!source || !validId(source.sourceId) || !source.parsed ||
+		    !Array.isArray(source.parsed.triples) || !Number.isSafeInteger(source.byteSize) ||
+		    source.byteSize < 0 || (source.revision !== undefined &&
+		      (!Number.isSafeInteger(source.revision) || source.revision < 0))) return null
+		  const parsed = source.parsed
+		  if (!parsed.triples.every((triple) => triple && typeof triple === 'object')) return null
+		  return copyFrozen({
+		    ownerId,
+		    sourceId: source.sourceId,
+		    sharedId: JSON.stringify([ownerId, source.sourceId]),
+		    revision: source.revision,
+		    origin: source.origin,
+		    displayName: source.displayName,
+		    format: source.format,
+		    navigationAddress: source.navigationAddress,
+		    absolutePath: source.absolutePath,
+		    rdfBase: source.rdfBase,
+		    status: source.status,
+		    byteSize: source.byteSize,
+		    occurrenceCount: parsed.triples.length,
+		    parsed: {
+		      format: parsed.format,
+		      prefixes: parsed.prefixes && typeof parsed.prefixes === 'object'
+		        ? { ...parsed.prefixes } : {},
+		      base: parsed.base,
+		      baseSource: parsed.baseSource,
+		      triples: parsed.triples.map((triple) => ({
+		        s: triple.s, p: triple.p, o: triple.o, oKind: triple.oKind,
+		        dt: triple.dt, lang: triple.lang, literalTruncated: triple.literalTruncated,
+		        graph: triple.graph && typeof triple.graph === 'object'
+		          ? { ...triple.graph } : triple.graph,
+		        location: triple.location,
+		      })),
+		      stats: parsed.stats && typeof parsed.stats === 'object' ? { ...parsed.stats } : {},
+		      diagnostics: Array.isArray(parsed.diagnostics) ? parsed.diagnostics.slice() : [],
+		      warnings: Array.isArray(parsed.warnings) ? parsed.warnings.slice() : [],
+		      errors: Array.isArray(parsed.errors) ? parsed.errors.slice() : [],
+		    },
+		  })
+		}
+
+		function allSources(entry, ownerId, replacement) {
+		  const result = []
+		  for (const [id, sources] of entry.owners) {
+		    result.push(...(id === ownerId ? replacement : sources.values()))
+		  }
+		  return result
+		}
+
+		function notify(entry) {
+		  const current = allSources(entry)
+		  for (const listener of entry.listeners) {
+		    try { listener(current.slice()) } catch (_) { /* isolate subscribers */ }
+		  }
+		}
+
+		function createSessionRegistry() {
+		  return { sessions: new Map(), nextOwnerId: 1 }
+		}
+
+		/** Missing session identity is not a shared session: the caller stays panel-local. */
+		function registryAcquire(registry, sessionId, workspaceId = DEFAULT_WORKSPACE_ID) {
+		  if (!validRegistry(registry) || !validId(sessionId) || !validId(workspaceId)) return null
+		  let workspaces = registry.sessions.get(sessionId)
+		  if (!workspaces) {
+		    workspaces = new Map()
+		    registry.sessions.set(sessionId, workspaces)
+		  }
+		  let entry = workspaces.get(workspaceId)
+		  if (!entry) {
+		    entry = { active: true, owners: new Map(), listeners: new Set() }
+		    workspaces.set(workspaceId, entry)
+		  }
+		  const ownerId = String(registry.nextOwnerId++)
+		  entry.owners.set(ownerId, new Map())
+		  let released = false
+		  let objects = new WeakMap()
+		  const subscriptions = new Set()
+		  const live = () => !released && entry.active
+		  const noop = () => {}
+
+		  function commit(next) {
+		    if (!live()) return { ok: false, reason: 'released' }
+		    const current = entry.owners.get(ownerId)
+		    const sources = allSources(entry, ownerId, next.values())
+		    if (sources.length > MAX_FILES) return { ok: false, reason: 'file-limit' }
+		    let bytes = 0
+		    let occurrences = 0
+		    for (const source of sources) {
+		      bytes += source.byteSize
+		      occurrences += source.occurrenceCount
+		      if (bytes > MAX_BYTES) return { ok: false, reason: 'byte-budget' }
+		      if (occurrences > MAX_OCCURRENCES) return { ok: false, reason: 'occurrence-budget' }
+		    }
+		    const changed = current.size !== next.size ||
+		      [...next].some(([id, value]) => current.get(id) !== value)
+		    if (changed) {
+		      entry.owners.set(ownerId, next)
+		      notify(entry)
+		    }
+		    return { ok: true, changed, sources: allSources(entry).slice() }
+		  }
+
+		  function retain(source, previous) {
+		    // A version identifies an unchanged parsed snapshot; otherwise object identity does.
+		    if (previous && source && typeof source === 'object' &&
+		      source.byteSize === previous.byteSize &&
+		      source.parsed && Array.isArray(source.parsed.triples) &&
+		      source.parsed.triples.length === previous.occurrenceCount &&
+		      (objects.get(source) === previous ||
+		        (source.revision !== undefined && previous.revision === source.revision))) {
+		      return previous
+		    }
+		    const record = snapshot(source, ownerId)
+		    if (record) objects.set(source, record)
+		    return record
+		  }
+
+		  return {
+		    sessionId,
+		    workspaceId,
+		    ownerId,
+		    publish(source) {
+		      if (!live()) return { ok: false, reason: 'released' }
+		      const next = new Map(entry.owners.get(ownerId))
+		      const record = retain(source, next.get(source && source.sourceId))
+		      if (!record) return { ok: false, reason: 'invalid-source' }
+		      next.set(record.sourceId, record)
+		      const result = commit(next)
+		      return result.ok ? { ...result, source: record } : result
+		    },
+		    replaceSources(sources) {
+		      if (!live()) return { ok: false, reason: 'released' }
+		      if (!Array.isArray(sources)) return { ok: false, reason: 'invalid-source' }
+		      const previous = entry.owners.get(ownerId)
+		      const next = new Map()
+		      for (const source of sources) {
+		        const record = retain(source, previous.get(source && source.sourceId))
+		        if (!record || next.has(record.sourceId)) return { ok: false, reason: 'invalid-source' }
+		        next.set(record.sourceId, record)
+		      }
+		      return commit(next)
+		    },
+		    remove(sourceId) {
+		      if (!live()) return { ok: false, reason: 'released' }
+		      if (!validId(sourceId)) return { ok: false, reason: 'invalid-source' }
+		      const next = new Map(entry.owners.get(ownerId))
+		      next.delete(sourceId)
+		      return commit(next)
+		    },
+		    list() { return live() ? allSources(entry).slice() : [] },
+		    subscribe(listener) {
+		      if (!live() || typeof listener !== 'function') return noop
+		      const callback = (sources) => listener(sources)
+		      entry.listeners.add(callback)
+		      subscriptions.add(callback)
+		      try { callback(allSources(entry).slice()) } catch (_) { /* isolate subscriber */ }
+		      return () => {
+		        subscriptions.delete(callback)
+		        entry.listeners.delete(callback)
+		      }
+		    },
+		    release() {
+		      if (!live()) { released = true; return }
+		      released = true
+		      objects = new WeakMap()
+		      for (const listener of subscriptions) entry.listeners.delete(listener)
+		      subscriptions.clear()
+		      entry.owners.delete(ownerId)
+		      if (entry.owners.size === 0) {
+		        entry.active = false
+		        entry.listeners.clear()
+		        workspaces.delete(workspaceId)
+		        if (workspaces.size === 0) registry.sessions.delete(sessionId)
+		      } else {
+		        notify(entry)
+		      }
+		    },
+		  }
+		}
+
+		/** Invalidate all outstanding handles, subscriptions and parsed references. */
+		function registryClear(registry) {
+		  if (!validRegistry(registry)) return
+		  for (const workspaces of registry.sessions.values()) {
+		    for (const entry of workspaces.values()) {
+		      entry.active = false
+		      entry.owners.clear()
+		      entry.listeners.clear()
+		    }
+		    workspaces.clear()
+		  }
+		  registry.sessions.clear()
+		}
+
+		// ==== src/ontology-view-state.js ====
+		/**
+		 * Per-view workspace state cache.
+		 *
+		 * The workspace keeps one state object per view (query, tree expansion, layered
+		 * orientation/predicates and the network camera) so switching views restores
+		 * what the user had instead of resetting it. Selection stays shared across
+		 * views by design; this store only covers view-local values.
+		 */
+
+		const VIEW_IDS = ['network', 'tree', 'layered']
+
+		function viewStateIsObject(value) {
+		  return value !== null && typeof value === 'object'
+		}
+
+		function viewStateNormalizeView(view) {
+		  return view === 'tree' || view === 'layered' ? view : 'network'
+		}
+
+		/** Create an empty store. */
+		function createViewStateStore() {
+		  return { active: 'network', views: {}, layoutRevision: 0 }
+		}
+
+		/** Snapshot one view's local state (partial patches merge). */
+		function snapshotView(store, view, patch) {
+		  const state = viewStateIsObject(store) ? store : createViewStateStore()
+		  if (!state.views) state.views = {}
+		  const key = viewStateNormalizeView(view)
+		  const previous = viewStateIsObject(state.views[key]) ? state.views[key] : {}
+		  const next = Object.assign({}, previous)
+		  if (viewStateIsObject(patch)) {
+		    for (const name of Object.keys(patch)) {
+		      if (patch[name] !== undefined) next[name] = patch[name]
+		    }
+		  }
+		  next.revision = typeof state.layoutRevision === 'number' ? state.layoutRevision : 0
+		  state.views[key] = next
+		  return next
+		}
+
+		/** Read one view's snapshot (empty object when never saved). */
+		function viewSnapshot(store, view) {
+		  if (!viewStateIsObject(store) || !viewStateIsObject(store.views)) return {}
+		  const saved = store.views[viewStateNormalizeView(view)]
+		  return viewStateIsObject(saved) ? Object.assign({}, saved) : {}
+		}
+
+		/** Record the current layout revision; older snapshots become stale. */
+		function markLayoutRevision(store, revision) {
+		  if (!viewStateIsObject(store)) return 0
+		  store.layoutRevision = Number(revision) || 0
+		  return store.layoutRevision
+		}
+
+		/** True when a saved snapshot predates the current layout. */
+		function isViewSnapshotStale(store, view) {
+		  if (!viewStateIsObject(store)) return false
+		  const saved = viewSnapshot(store, view)
+		  if (typeof saved.revision !== 'number') return false
+		  return saved.revision !== (typeof store.layoutRevision === 'number' ? store.layoutRevision : 0)
+		}
+
+		/**
+		 * Validate shared workspace state when the retained graph or workset changes.
+		 * Missing selections/anchors are removed; explorer cursors are always dropped
+		 * because a cursor belongs to an exact projection revision.
+		 */
+		function reconcileWorkspaceState(state, graph, sourceIds) {
+		  const input = viewStateIsObject(state) ? state : {}
+		  const nodes = graph && Array.isArray(graph.nodes) ? graph.nodes : []
+		  const valid = new Set(nodes.map(node => node && node.id).filter(id => typeof id === 'string'))
+		  const filter = input.filter && typeof input.filter === 'object' ? input.filter : {}
+		  const explore = input.explore && typeof input.explore === 'object' ? input.explore : {}
+		  const allowedSources = Array.isArray(sourceIds) ? new Set(sourceIds) : null
+		  const predicates = Array.isArray(filter.predicates)
+		    ? filter.predicates.filter(value => graph && graph.edges && graph.edges.some(edge => edge.p === value)) : []
+		  const anchorId = typeof input.anchorId === 'string' && valid.has(input.anchorId) ? input.anchorId : null
+		  return {
+		    query: typeof input.query === 'string' ? input.query : '',
+		    selectedId: typeof input.selectedId === 'string' && valid.has(input.selectedId) ? input.selectedId : null,
+		    anchorId,
+		    filter: {
+		      kinds: Array.isArray(filter.kinds) ? filter.kinds.slice() : [],
+		      predicates,
+		      direction: ['both', 'out', 'in'].includes(filter.direction) ? filter.direction : 'both',
+		      sourceIds: allowedSources && Array.isArray(filter.sourceIds)
+		        ? filter.sourceIds.filter(id => allowedSources.has(id)) : (Array.isArray(filter.sourceIds) ? filter.sourceIds.slice() : []),
+		    },
+		    explore: Object.assign({}, explore, {
+		      on: Boolean(explore.on && anchorId),
+		      cursor: null,
+		      extension: 0,
+		    }),
+		  }
+		}
+
+		/** All known view ids, for state-matrix tests and docs. */
+		function viewStateIds() {
+		  return VIEW_IDS.slice()
+		}
+
+		// ==== src/ontology-file-queue.js ====
+		/** Sequential browser reads; invalidation rejects late results without new authority. */
+		function createFileReadQueue(options) {
+		  const opts = options || {}
+		  let revision = 0
+		  let tail = Promise.resolve()
+		  let disposed = false
+		  let pending = 0
+		  return {
+		    enqueue(files, replacementId) {
+		      const list = Array.isArray(files) ? files : []
+		      const token = revision
+		      for (const file of list) {
+		        pending += 1
+		        tail = tail.then(async () => {
+		          if (disposed || revision !== token) return
+		          const byteSize = Number(file && file.size) || 0
+		          if (byteSize > (opts.maxBytes || 12 * 1024 * 1024)) {
+		            if (opts.onError) opts.onError(file, 'too-large', replacementId)
+		            return
+		          }
+		          try {
+		            if (!file || typeof file.arrayBuffer !== 'function') throw new Error('read-unavailable')
+		            const buffer = await file.arrayBuffer()
+		            if (disposed || revision !== token) return
+		            const text = new TextDecoder('utf-8', { fatal: true }).decode(buffer)
+		            await opts.accept({ file, text, byteSize, replacementId })
+		          } catch (error) {
+		            if (!disposed && revision === token && opts.onError) {
+		              opts.onError(file, error && error.message ? String(error.message) : 'read-failed', replacementId)
+		            }
+		          }
+		        }).finally(() => {
+		          pending -= 1
+		          if (!disposed && pending === 0 && opts.onIdle) opts.onIdle()
+		        })
+		      }
+		      return tail
+		    },
+		    get pending() { return pending },
+		    invalidate() { revision += 1 },
+		    dispose() { disposed = true; revision += 1 },
+		    whenIdle() { return tail },
+		  }
 		}
 
 		// ==== src/graph-model.js ====
@@ -3330,6 +4236,58 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
+		 * Graph context used when a caller hands over statements that predate the
+		 * graph field: the model never claims those statements belong to the default
+		 * graph, because the source may have lost that information.
+		 */
+		const FALLBACK_STATEMENT_GRAPH = Object.freeze({ kind: 'unknown' })
+		const LEGACY_SOURCE_ID = 'single'
+
+		/**
+		 * Expand the input into flat statements that carry source and statement
+		 * identity. The workspace composes merged records and passes the expanded
+		 * occurrences through `options.statements`; a plain parsed document keeps the
+		 * V1.0.0 `triples` contract and is wrapped as one legacy source.
+		 */
+		function normalizeStatements(input, opts) {
+		  if (Array.isArray(opts.statements)) return opts.statements
+		  const triples = Array.isArray(input.triples) ? input.triples : []
+		  const explicit = typeof opts.sourceId === 'string' && opts.sourceId
+		    ? opts.sourceId
+		    : (typeof input.sourceId === 'string' && input.sourceId ? input.sourceId : LEGACY_SOURCE_ID)
+		  const statements = new Array(triples.length)
+		  for (let index = 0; index < triples.length; index++) {
+		    const triple = triples[index]
+		    if (!isObject(triple)) {
+		      statements[index] = triple
+		      continue
+		    }
+		    statements[index] = {
+		      s: triple.s,
+		      p: triple.p,
+		      o: triple.o,
+		      oKind: triple.oKind,
+		      dt: triple.dt,
+		      lang: triple.lang,
+		      literalTruncated: triple.literalTruncated,
+		      graph: isObject(triple.graph) ? triple.graph : FALLBACK_STATEMENT_GRAPH,
+		      sourceId: typeof triple.sourceId === 'string' && triple.sourceId ? triple.sourceId : explicit,
+		      statementId: typeof triple.statementId === 'string' && triple.statementId
+		        ? triple.statementId
+		        : 'legacy:' + explicit + ':' + index,
+		    }
+		  }
+		  return statements
+		}
+
+		/** Sorted copy of a Set of strings, for stable output. */
+		function sortedValues(set) {
+		  const values = []
+		  for (const value of set) values.push(value)
+		  return values.sort(compareStrings)
+		}
+
+		/**
 		 * Turn parsed triples into a renderable node-link graph.
 		 *
 		 * Classification (deterministic precedence, first match wins):
@@ -3346,6 +4304,10 @@ window.__ModuleLoader__.load({
 		 * `node.literals`. rdf:first / rdf:rest triples are list plumbing and are
 		 * dropped from the graph (they still count in `stats.triples`).
 		 *
+		 * Provenance: nodes, literals and edges carry `sourceIds` / `statementIds`
+		 * collected from the statements that produced them. They never infer a byte,
+		 * line or column position (`location` stays null upstream).
+		 *
 		 * Budgets (all optional, all structured, none silent):
 		 *   - maxNodes (default 1200): highest total degree first, id as stable tie-break.
 		 *   - maxLiteralsPerNode (default 60): per-node literal statements kept.
@@ -3356,12 +4318,14 @@ window.__ModuleLoader__.load({
 		 *   - maxLiteralLength (default off): single literal value `length` cap; a
 		 *     truncated value is marked with `literal.truncated = true`.
 		 *
-		 * @param {{triples?: any[], prefixes?: Record<string, string>}} parsed
-		 * @param {{maxNodes?: number, maxLiteralsPerNode?: number, maxEdges?: number,
+		 * @param {{triples?: any[], prefixes?: Record<string, string>, sources?: any[]}} parsed
+		 * @param {{statements?: any[], sources?: any[], sourceId?: string,
+		 *          maxNodes?: number, maxLiteralsPerNode?: number, maxEdges?: number,
 		 *          maxLiteralLength?: number,
 		 *          source?: {address?: string, displayName?: string, format?: string}}} [options]
 		 * @returns {{nodes: any[], edges: any[], stats: any, warnings: string[],
-		 *            truncation: any, source: {address: string, displayName: string, format: string}}}
+		 *            truncation: any, sources: any[],
+		 *            source: {address: string, displayName: string, format: string}}}
 		 */
 		function buildGraph(parsed, options) {
 		  const opts = isObject(options) ? options : {}
@@ -3371,13 +4335,18 @@ window.__ModuleLoader__.load({
 		  const maxEdges = optionalPositiveInteger(opts.maxEdges)
 
 		  const input = isObject(parsed) ? parsed : {}
-		  const triples = Array.isArray(input.triples) ? input.triples : []
+		  const statements = normalizeStatements(input, opts)
 		  const prefixes = isObject(input.prefixes) ? input.prefixes : {}
 		  const warnings = []
 		  const source = resolveGraphSource(opts, input)
+		  const sources = Array.isArray(opts.sources)
+		    ? opts.sources
+		    : (Array.isArray(input.sources) ? input.sources : [])
 
 		  /** id -> { id, types, literals, out, in, label, labelRank } */
 		  const records = new Map()
+		  /** id -> { sourceIds: Set, statementIds: Set, roles: Set } */
+		  const provenance = new Map()
 		  /** id -> true when the node is used as the object of rdf:type (i.e. a class-like IRI) */
 		  const usedAsType = new Set()
 		  /** ids involved in rdfs:subClassOf (subject or IRI object) */
@@ -3396,7 +4365,54 @@ window.__ModuleLoader__.load({
 		    return record
 		  }
 
-		  for (const triple of triples) {
+		  /** Record one entity occurrence for provenance, without inferring positions. */
+		  function noteProvenance(id, statement, role) {
+		    let entry = provenance.get(id)
+		    if (entry === undefined) {
+		      entry = { sourceIds: new Set(), statementIds: new Set(), roles: new Set(), bySource: new Map() }
+		      provenance.set(id, entry)
+		    }
+		    if (typeof statement.sourceId === 'string' && statement.sourceId) {
+		      entry.sourceIds.add(statement.sourceId)
+		      let contribution = entry.bySource.get(statement.sourceId)
+		      if (!contribution) {
+		        contribution = { roles: new Set(), statementIds: new Set() }
+		        entry.bySource.set(statement.sourceId, contribution)
+		      }
+		      contribution.roles.add(role)
+		      if (statement.statementId) contribution.statementIds.add(statement.statementId)
+		    }
+		    if (typeof statement.statementId === 'string' && statement.statementId) {
+		      entry.statementIds.add(statement.statementId)
+		    }
+		    entry.roles.add(role)
+		  }
+
+		  /**
+		   * Remember one distinct graph context of an edge. Blank and unknown graph
+		   * names stay scoped to their source so equal labels do not merge them.
+		   */
+		  function noteDraftGraph(draft, statement) {
+		    const graph = isObject(statement.graph) ? statement.graph : FALLBACK_STATEMENT_GRAPH
+		    const sourceId = typeof statement.sourceId === 'string' ? statement.sourceId : ''
+		    let kind = 'default'
+		    if (graph.kind === 'iri' && typeof graph.value === 'string' && graph.value !== '') kind = 'iri'
+		    else if (graph.kind === 'blank') kind = 'blank'
+		    else if (graph.kind === 'unknown') kind = 'unknown'
+		    let key = 'd'
+		    if (kind === 'iri') key = 'i\t' + graph.value
+		    else if (kind === 'blank') key = 'b\t' + sourceId + '\t' + String(graph.value || '')
+		    else if (kind === 'unknown') key = 'u\t' + sourceId
+		    let entry = draft.graphMap.get(key)
+		    if (entry === undefined) {
+		      entry = { kind: kind, sourceIds: new Set() }
+		      if (kind === 'iri' || kind === 'blank') entry.value = String(graph.value)
+		      draft.graphMap.set(key, entry)
+		    }
+		    if (sourceId) entry.sourceIds.add(sourceId)
+		  }
+
+		  for (const triple of statements) {
 		    if (!isObject(triple)) continue
 		    const subject = typeof triple.s === 'string' ? triple.s : ''
 		    const predicate = typeof triple.p === 'string' ? triple.p : ''
@@ -3410,6 +4426,7 @@ window.__ModuleLoader__.load({
 		      // List plumbing literals are irrelevant once the list is skipped.
 		      if (LIST_PREDICATES.has(predicate)) continue
 		      const record = ensureRecord(subject)
+		      noteProvenance(subject, triple, 'subject')
 		      const rank = labelRank(predicate)
 		      let value = objectText
 		      let valueTruncated = false
@@ -3423,6 +4440,10 @@ window.__ModuleLoader__.load({
 		        value,
 		        order: record.literals.length,
 		        rank,
+		        sourceIds: typeof triple.sourceId === 'string' && triple.sourceId ? [triple.sourceId] : [],
+		        statementIds: typeof triple.statementId === 'string' && triple.statementId
+		          ? [triple.statementId]
+		          : [],
 		      }
 		      if (valueTruncated) literal.truncated = true
 		      if (typeof triple.dt === 'string' && triple.dt) literal.dt = triple.dt
@@ -3455,12 +4476,28 @@ window.__ModuleLoader__.load({
 		    }
 
 		    const key = subject + '\u0000' + predicate + '\u0000' + object
-		    const draft = edgeDrafts.get(key)
+		    let draft = edgeDrafts.get(key)
 		    if (draft === undefined) {
-		      edgeDrafts.set(key, { source: subject, target: object, p: predicate, count: 1 })
-		    } else {
-		      draft.count += 1
+		      draft = {
+		        source: subject,
+		        target: object,
+		        p: predicate,
+		        count: 0,
+		        sourceIds: new Set(),
+		        statementIds: new Set(),
+		        graphMap: new Map(),
+		      }
+		      edgeDrafts.set(key, draft)
 		    }
+		    draft.count += 1
+		    noteProvenance(subject, triple, 'subject')
+		    noteProvenance(object, triple, 'object')
+		    noteProvenance(predicate, triple, 'predicate')
+		    if (typeof triple.sourceId === 'string' && triple.sourceId) draft.sourceIds.add(triple.sourceId)
+		    if (typeof triple.statementId === 'string' && triple.statementId) {
+		      draft.statementIds.add(triple.statementId)
+		    }
+		    noteDraftGraph(draft, triple)
 		  }
 
 		  function degreeOf(id) {
@@ -3521,6 +4558,18 @@ window.__ModuleLoader__.load({
 
 		  // Emit edges in first-occurrence order so ids stay stable across budgets.
 		  const edges = []
+		  function graphsOf(draft) {
+		    const list = []
+		    for (const entry of draft.graphMap.values()) {
+		      const item = { kind: entry.kind }
+		      if (entry.value !== undefined) item.value = entry.value
+		      item.sourceIds = sortedValues(entry.sourceIds)
+		      list.push(item)
+		    }
+		    list.sort((a, b) => compareStrings(a.kind, b.kind) ||
+		      compareStrings(String(a.value || ''), String(b.value || '')))
+		    return list
+		  }
 		  for (const draft of edgeDrafts.values()) {
 		    if (!keptDraftSet.has(draft)) continue
 		    let kind = 'object'
@@ -3535,6 +4584,9 @@ window.__ModuleLoader__.load({
 		      label: shortenIri(draft.p, prefixes),
 		      kind,
 		      count: draft.count,
+		      sourceIds: sortedValues(draft.sourceIds),
+		      statementIds: sortedValues(draft.statementIds),
+		      graphs: graphsOf(draft),
 		    })
 		  }
 
@@ -3552,7 +4604,7 @@ window.__ModuleLoader__.load({
 
 		  const nodes = []
 		  const stats = emptyStats()
-		  stats.triples = triples.length || Number(input.stats && input.stats.tripleCount) || 0
+		  stats.triples = statements.length || Number(input.stats && input.stats.tripleCount) || 0
 		  let literalCandidates = 0
 		  let keptLiteralCount = 0
 		  let droppedLiteralCount = 0
@@ -3585,6 +4637,8 @@ window.__ModuleLoader__.load({
 		        p: literal.p,
 		        pLabel: shortenIri(literal.p, prefixes),
 		        value: literal.value,
+		        sourceIds: Array.isArray(literal.sourceIds) ? literal.sourceIds.slice() : [],
+		        statementIds: Array.isArray(literal.statementIds) ? literal.statementIds.slice() : [],
 		      }
 		      if (literal.dt) item.dt = literal.dt
 		      if (literal.lang) item.lang = literal.lang
@@ -3595,6 +4649,7 @@ window.__ModuleLoader__.load({
 		    const rawLocal = localName(record.id)
 		    const local = rawLocal || record.id
 		    const label = record.label || local
+		    const origin = provenance.get(record.id)
 
 		    if (kind === 'class') stats.classes += 1
 		    else if (kind === 'property') stats.properties += 1
@@ -3612,6 +4667,14 @@ window.__ModuleLoader__.load({
 		      literals,
 		      outEdges: out,
 		      inEdges: incoming,
+		      provenance: {
+		        sourceIds: origin === undefined ? [] : sortedValues(origin.sourceIds),
+		        statementIds: origin === undefined ? [] : sortedValues(origin.statementIds),
+		        roles: origin === undefined ? [] : sortedValues(origin.roles),
+		        bySource: origin === undefined ? [] : Array.from(origin.bySource, ([sourceId, value]) => ({
+		          sourceId: sourceId, roles: sortedValues(value.roles), statementIds: sortedValues(value.statementIds),
+		        })),
+		      },
 		      // Reserved source location: always null in this change (spec
 		      // "源位置预留"); never inferred from filenames or document order.
 		      literalsTruncated: droppedForNode,
@@ -3649,7 +4712,79 @@ window.__ModuleLoader__.load({
 		    ),
 		  }
 
-		  return { nodes, edges, stats, warnings, truncation, source }
+		  return { nodes, edges, stats, warnings, truncation, sources, source }
+		}
+
+		/**
+		 * Source-contribution projection (L1 → L2).
+		 *
+		 * An empty or absent selection means "all sources". Otherwise an edge is kept
+		 * only when at least one selected source contributed it, a node only when a
+		 * selected source contributed to it or it touches a kept edge, and a literal
+		 * only when a selected source contributed it. The input graph is never
+		 * mutated: nodes are shallow-copied when their literal list changes.
+		 *
+		 * This projection runs before the existing type/predicate/direction filter and
+		 * exploration, so a shared node cannot drag another source's edges back in.
+		 *
+		 * @param {any} graph L1 graph produced by buildGraph
+		 * @param {string[]} sourceIds selected source ids (empty = all)
+		 * @returns {{nodes: any[], edges: any[], stats: any, hidden: object}}
+		 */
+		function filterBySources(graph, sourceIds) {
+		  const input = isObject(graph) ? graph : {}
+		  const nodes = Array.isArray(input.nodes) ? input.nodes : []
+		  const edges = Array.isArray(input.edges) ? input.edges : []
+		  const selected = new Set(
+		    (Array.isArray(sourceIds) ? sourceIds : []).filter((id) => typeof id === 'string'),
+		  )
+		  const all = selected.size === 0
+		  const contributes = (ids) => all || (Array.isArray(ids) && ids.some((id) => selected.has(id)))
+
+		  const keptEdges = edges.filter((edge) => contributes(edge && edge.sourceIds))
+		  const keptEdgeSet = new Set(keptEdges)
+		  const touched = new Set()
+		  for (const edge of keptEdges) {
+		    touched.add(edge.source)
+		    touched.add(edge.target)
+		  }
+
+		  const keptNodes = []
+		  let hiddenNodes = 0
+		  let hiddenLiterals = 0
+		  for (const node of nodes) {
+		    if (!isObject(node)) continue
+		    const origin = isObject(node.provenance) ? node.provenance : null
+		    const literals = Array.isArray(node.literals) ? node.literals : []
+		    const keptLiterals = all
+		      ? literals
+		      : literals.filter((literal) => contributes(literal && literal.sourceIds))
+		    const droppedHere = literals.length - keptLiterals.length
+		    if (!all && !touched.has(node.id) && !contributes(origin && origin.sourceIds)) {
+		      hiddenNodes += 1
+		      hiddenLiterals += literals.length
+		      continue
+		    }
+		    if (droppedHere > 0 || keptLiterals !== literals) {
+		      hiddenLiterals += droppedHere
+		      keptNodes.push(Object.assign({}, node, { literals: keptLiterals }))
+		    } else {
+		      keptNodes.push(node)
+		    }
+		  }
+
+		  const stats = statsFor(keptNodes, keptEdges, input.stats && input.stats.triples)
+		  return {
+		    nodes: keptNodes,
+		    edges: keptEdges,
+		    stats: stats,
+		    hidden: {
+		      nodes: hiddenNodes,
+		      edges: edges.length - keptEdges.length,
+		      literals: hiddenLiterals,
+		    },
+		    sourceIds: all ? [] : Array.from(selected),
+		  }
 		}
 
 		/**
@@ -4874,8 +6009,1958 @@ window.__ModuleLoader__.load({
 		  return { step, result, cancel }
 		}
 
-		// ==== embedded worker source (generated from src/rdf-parse.js, src/graph-model.js, src/worker-entry.js) ====
-		const ONTOLOGY_WORKER_SOURCE = "(function () {\n'use strict';\n// ==== src/rdf-parse.js ====\n/**\n * Dependency-free RDF reader used by the ontology viewer.\n *\n * Supported serializations: Turtle/N3/TriG (graphs ignored), N-Triples/N-Quads\n * (graph term ignored), RDF/XML and a practical JSON-LD 1.1 subset.\n *\n * The module is deliberately plain ECMAScript: no imports, no DOM APIs, no\n * Node globals and no decoding helpers.  The build script concatenates this\n * file with the other Client modules inside one closure, so every internal\n * helper is prefixed with `ontoRdf`/`OntoRdf` to avoid collisions.\n *\n * Every parser returns the same plain-object shape and never throws:\n *   { format, prefixes, base, triples, stats, warnings, errors }\n */\n\nconst ONTO_RDF_NS = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#'\nconst ONTO_RDF_TYPE = ONTO_RDF_NS + 'type'\nconst ONTO_RDF_FIRST = ONTO_RDF_NS + 'first'\nconst ONTO_RDF_REST = ONTO_RDF_NS + 'rest'\nconst ONTO_RDF_NIL = ONTO_RDF_NS + 'nil'\nconst ONTO_RDF_LANG_STRING = ONTO_RDF_NS + 'langString'\nconst ONTO_RDF_XML_LITERAL = ONTO_RDF_NS + 'XMLLiteral'\nconst ONTO_RDF_JSON = ONTO_RDF_NS + 'JSON'\nconst ONTO_XSD_NS = 'http://www.w3.org/2001/XMLSchema#'\nconst ONTO_XSD_STRING = ONTO_XSD_NS + 'string'\nconst ONTO_XSD_INTEGER = ONTO_XSD_NS + 'integer'\nconst ONTO_XSD_DECIMAL = ONTO_XSD_NS + 'decimal'\nconst ONTO_XSD_DOUBLE = ONTO_XSD_NS + 'double'\nconst ONTO_XSD_BOOLEAN = ONTO_XSD_NS + 'boolean'\nconst ONTO_XML_NS = 'http://www.w3.org/XML/1998/namespace'\nconst ONTO_DEFAULT_MAX_TRIPLES = 100000\nconst ONTO_DEFAULT_MAX_LITERAL_LENGTH = 16384\nconst ONTO_DEFAULT_MAX_DEPTH = 256\nconst ONTO_DEFAULT_MAX_DIAGNOSTICS = 200\nconst ONTO_DIAGNOSTIC_SAMPLE_LIMIT = 3\n\n/* ------------------------------------------------------------------ */\n/* Small generic helpers                                              */\n/* ------------------------------------------------------------------ */\n\nfunction ontoRdfHas(object, key) {\n  return Object.prototype.hasOwnProperty.call(object, key)\n}\n\nfunction ontoRdfNormalizeText(text) {\n  if (typeof text !== 'string') return ''\n  return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text\n}\n\nfunction ontoRdfIsWhitespace(character) {\n  return character === ' ' || character === '\\t' || character === '\\r' || character === '\\n'\n}\n\nfunction ontoRdfBuildLineIndex(text) {\n  const starts = [0]\n  for (let i = 0; i < text.length; i++) {\n    if (text.charCodeAt(i) === 10) starts.push(i + 1)\n  }\n  return starts\n}\n\nfunction ontoRdfLineAt(starts, index) {\n  let low = 0\n  let high = starts.length - 1\n  while (low < high) {\n    const middle = (low + high + 1) >> 1\n    if (starts[middle] <= index) low = middle\n    else high = middle - 1\n  }\n  return low + 1\n}\n\nfunction ontoRdfFormatDiagnostic(message, line) {\n  if (typeof line === 'number' && isFinite(line) && line >= 1) {\n    return message + ' (line ' + Math.floor(line) + ')'\n  }\n  return message\n}\n\nfunction ontoRdfMaxTriples(value) {\n  if (value === undefined || value === null) return ONTO_DEFAULT_MAX_TRIPLES\n  const number = typeof value === 'number' ? value : Number(value)\n  if (!isFinite(number) || number < 0) return ONTO_DEFAULT_MAX_TRIPLES\n  return Math.floor(number)\n}\n\nfunction ontoRdfLimit(value, fallback) {\n  if (value === undefined || value === null) return fallback\n  const number = typeof value === 'number' ? value : Number(value)\n  if (!isFinite(number) || number < 0) return fallback\n  return Math.floor(number)\n}\n\nfunction ontoRdfIsAbsoluteIri(value) {\n  return typeof value === 'string' && /^[A-Za-z][A-Za-z0-9+.-]*:/.test(value)\n}\n\nfunction ontoRdfNormalizeIri(value, base, builder, line) {\n  if (typeof value !== 'string' || value === '') return value\n  if (value.slice(0, 2) === '_:') return value\n  if (ontoRdfIsAbsoluteIri(value)) return value\n  if (base) return resolveIri(base, value)\n  if (builder) {\n    builder.diagnose(\n      'base-unavailable',\n      'warning',\n      'relative IRI \"' + value + '\" could not be resolved (no base)',\n      line,\n    )\n  }\n  return value\n}\n\nfunction ontoRdfFileExtension(fileName) {\n  if (typeof fileName !== 'string') return ''\n  let name = fileName.trim()\n  if (!name) return ''\n  const hash = name.indexOf('#')\n  if (hash >= 0) name = name.slice(0, hash)\n  const query = name.indexOf('?')\n  if (query >= 0) name = name.slice(0, query)\n  const slash = Math.max(name.lastIndexOf('/'), name.lastIndexOf('\\\\'))\n  const leaf = slash < 0 ? name : name.slice(slash + 1)\n  const dot = leaf.lastIndexOf('.')\n  if (dot < 0 || dot === leaf.length - 1) return ''\n  return leaf.slice(dot + 1).toLowerCase()\n}\n\nfunction ontoRdfEncodeFilePath(path) {\n  return path\n    .replace(/%/g, '%25')\n    .replace(/ /g, '%20')\n    .replace(/#/g, '%23')\n    .replace(/\\?/g, '%3F')\n}\n\n/* ------------------------------------------------------------------ */\n/* Resource address mapping (display name is never an identity)        */\n/* ------------------------------------------------------------------ */\n\nconst ONTO_WINDOWS_DRIVE_PATH = /^[A-Za-z]:[\\\\/]/\n\nfunction ontoRdfStripFragment(value) {\n  const hash = value.indexOf('#')\n  return hash < 0 ? value : value.slice(0, hash)\n}\n\n/**\n * Map a real resource address to an RDF base IRI, or null when it cannot be\n * mapped reliably. `resourceAddress` is not guaranteed to be a file URI: the\n * host may hand us an http(s) URL, a custom-scheme address, or a plain file\n * path from a different integration. A display file name is a relative path\n * and is therefore never mapped.\n */\nfunction ontoRdfMapResourceAddress(address) {\n  if (typeof address !== 'string') return null\n  const value = address.trim()\n  if (value === '') return null\n  if (ONTO_WINDOWS_DRIVE_PATH.test(value)) {\n    return 'file:///' + ontoRdfEncodeFilePath(value.replace(/\\\\/g, '/'))\n  }\n  if (value.slice(0, 2) === '\\\\\\\\') {\n    return 'file://' + ontoRdfEncodeFilePath(value.replace(/\\\\/g, '/'))\n  }\n  if (value.charAt(0) === '/') {\n    return 'file://' + ontoRdfEncodeFilePath(value)\n  }\n  if (!ontoRdfIsAbsoluteIri(value)) return null\n  const parts = ontoRdfParseIri(value)\n  const scheme = typeof parts.scheme === 'string' ? parts.scheme.toLowerCase() : ''\n  if (scheme === 'http' || scheme === 'https' || scheme === 'file') {\n    return ontoRdfStripFragment(value)\n  }\n  // Custom schemes are used verbatim only when they form an absolute\n  // hierarchical URI; otherwise we refuse to guess and report no base.\n  if (parts.authority !== undefined || parts.path.charAt(0) === '/') {\n    return ontoRdfStripFragment(value)\n  }\n  return null\n}\n\n/**\n * Initial base for one parse: document declarations may override it later.\n * @returns {{ base: string, source: 'document'|'resource'|'none' }}\n */\nfunction ontoRdfInitialBase(options) {\n  const opts = options || {}\n  if (opts.resourceAddress !== undefined && opts.resourceAddress !== null) {\n    const mapped = ontoRdfMapResourceAddress(opts.resourceAddress)\n    if (mapped) return { base: mapped, source: 'resource' }\n    return { base: '', source: 'none' }\n  }\n  // Legacy compatibility for library callers that passed a real path as\n  // `fileName`: only address-like values still contribute a base. A bare\n  // display name MUST NOT fabricate a `file:///` identity.\n  const legacy = ontoRdfMapResourceAddress(opts.fileName)\n  if (legacy) return { base: legacy, source: 'resource' }\n  return { base: '', source: 'none' }\n}\n\n/* ------------------------------------------------------------------ */\n/* RDF document builder                                               */\n/* ------------------------------------------------------------------ */\n\nclass OntoRdfBuilder {\n  constructor(format, text, options) {\n    const opts = options || {}\n    this.format = format\n    this.text = typeof text === 'string' ? text : ''\n    this.maxTriples = ontoRdfMaxTriples(opts.maxTriples)\n    this.maxLiteralLength = ontoRdfLimit(opts.maxLiteralLength, ONTO_DEFAULT_MAX_LITERAL_LENGTH)\n    this.maxDepth = ontoRdfLimit(opts.maxDepth, ONTO_DEFAULT_MAX_DEPTH)\n    this.maxDiagnostics = ontoRdfLimit(opts.maxDiagnostics, ONTO_DEFAULT_MAX_DIAGNOSTICS)\n    this.triples = []\n    this.prefixes = {}\n    this.base = ''\n    this.baseSource = 'none'\n    this.warnings = []\n    this.errors = []\n    this.diagnostics = []\n    this.diagnosticIndex = Object.create(null)\n    this.rawMessageCount = 0\n    this.suppressedMessages = 0\n    this.suppressedSamples = []\n    this.truncated = false\n    this.blankCounter = 0\n    this.usedBlankLabels = Object.create(null)\n    this.lineIndex = null\n    if (typeof text !== 'string') this.error('input is not a string')\n  }\n\n  lineAt(index) {\n    if (this.lineIndex === null) this.lineIndex = ontoRdfBuildLineIndex(this.text)\n    return ontoRdfLineAt(this.lineIndex, index)\n  }\n\n  /** Append one raw message, honouring the retained-message cap. */\n  pushRaw(severity, message, line) {\n    const text = ontoRdfFormatDiagnostic(message, line)\n    if (this.rawMessageCount >= this.maxDiagnostics) {\n      this.suppressedMessages++\n      if (this.suppressedSamples.length < ONTO_DIAGNOSTIC_SAMPLE_LIMIT) {\n        this.suppressedSamples.push(text)\n      }\n      return\n    }\n    this.rawMessageCount++\n    if (severity === 'error') this.errors.push(text)\n    else this.warnings.push(text)\n  }\n\n  warn(message, line) {\n    this.pushRaw('warning', message, line)\n  }\n\n  error(message, line) {\n    this.pushRaw('error', message, line)\n  }\n\n  /**\n   * Record one classified diagnostic and its raw message. Aggregates by code:\n   * `count` accumulates every occurrence while `sample` keeps at most three.\n   */\n  diagnose(code, severity, message, line) {\n    const level = severity === 'error' ? 'error' : 'warning'\n    const text = ontoRdfFormatDiagnostic(message, line)\n    let entry = this.diagnosticIndex[code]\n    if (!entry) {\n      entry = { code: code, severity: level, message: message, count: 0, sample: [] }\n      this.diagnosticIndex[code] = entry\n      this.diagnostics.push(entry)\n    }\n    entry.count++\n    if (entry.sample.length < ONTO_DIAGNOSTIC_SAMPLE_LIMIT) entry.sample.push(text)\n    this.pushRaw(level, message, line)\n    return entry\n  }\n\n  add(subject, predicate, object, objectKind, datatype, language) {\n    if (this.triples.length >= this.maxTriples) {\n      if (!this.truncated) {\n        this.truncated = true\n        this.diagnose(\n          'triple-limit',\n          'warning',\n          'triple limit of ' + this.maxTriples + ' reached; remaining triples were skipped',\n        )\n      }\n      return false\n    }\n    let term = object\n    let literalTruncated = false\n    if ((objectKind || 'iri') === 'literal' && typeof term === 'string' &&\n      term.length > this.maxLiteralLength) {\n      literalTruncated = true\n      this.diagnose(\n        'literal-limit',\n        'warning',\n        'literal value of ' + term.length + ' characters was truncated to ' +\n          this.maxLiteralLength + ' characters',\n      )\n      term = term.slice(0, this.maxLiteralLength)\n    }\n    const triple = { s: subject, p: predicate, o: term, oKind: objectKind || 'iri' }\n    if (literalTruncated) triple.literalTruncated = true\n    if (datatype !== undefined) triple.dt = datatype\n    if (language !== undefined) triple.lang = language\n    this.triples.push(triple)\n    return true\n  }\n\n  freshBlank() {\n    let candidate = '_:b' + this.blankCounter\n    while (this.usedBlankLabels[candidate] === true) {\n      this.blankCounter++\n      candidate = '_:b' + this.blankCounter\n    }\n    this.blankCounter++\n    this.usedBlankLabels[candidate] = true\n    return candidate\n  }\n\n  useBlank(label) {\n    const id = label.slice(0, 2) === '_:' ? label : '_:' + label\n    this.usedBlankLabels[id] = true\n    return id\n  }\n\n  finish() {\n    const subjects = new Set()\n    const predicates = new Set()\n    const objects = new Set()\n    for (let i = 0; i < this.triples.length; i++) {\n      const triple = this.triples[i]\n      subjects.add(triple.s)\n      predicates.add(triple.p)\n      objects.add(triple.o)\n    }\n    if (this.suppressedMessages > 0) {\n      const message = this.suppressedMessages + ' diagnostic message' +\n        (this.suppressedMessages === 1 ? '' : 's') +\n        ' were suppressed after the limit of ' + this.maxDiagnostics\n      this.diagnostics.push({\n        code: 'diagnostics-truncated',\n        severity: 'warning',\n        message: message,\n        count: this.suppressedMessages,\n        sample: this.suppressedSamples.slice(),\n      })\n    }\n    return {\n      format: this.format,\n      prefixes: this.prefixes,\n      base: this.base || '',\n      baseSource: this.baseSource || 'none',\n      triples: this.triples,\n      stats: {\n        tripleCount: this.triples.length,\n        subjectCount: subjects.size,\n        predicateCount: predicates.size,\n        objectCount: objects.size,\n        truncated: this.truncated,\n        truncation: this.truncated\n          ? { reason: 'triple-limit', limit: this.maxTriples, kept: this.triples.length }\n          : null,\n      },\n      diagnostics: this.diagnostics,\n      warnings: this.warnings,\n      errors: this.errors,\n    }\n  }\n}\n\n/* ------------------------------------------------------------------ */\n/* IRI reference resolution (RFC 3986 section 5.2, string math only)   */\n/* ------------------------------------------------------------------ */\n\nconst ONTO_IRI_PATTERN = /^(?:([A-Za-z][A-Za-z0-9+.-]*):)?(?:\\/\\/([^/?#]*))?([^?#]*)(?:\\?([^#]*))?(?:#([\\s\\S]*))?$/\n\nfunction ontoRdfParseIri(value) {\n  const match = ONTO_IRI_PATTERN.exec(value)\n  if (!match) {\n    return { scheme: undefined, authority: undefined, path: value, query: undefined, fragment: undefined }\n  }\n  return {\n    scheme: match[1],\n    authority: match[2],\n    path: match[3] === undefined ? '' : match[3],\n    query: match[4],\n    fragment: match[5],\n  }\n}\n\nfunction ontoRdfDropLastSegment(output) {\n  const slash = output.lastIndexOf('/')\n  return slash < 0 ? '' : output.slice(0, slash)\n}\n\nfunction ontoRdfRemoveDotSegments(path) {\n  let input = path\n  let output = ''\n  while (input.length > 0) {\n    if (input.slice(0, 3) === '../') {\n      input = input.slice(3)\n    } else if (input.slice(0, 2) === './') {\n      input = input.slice(2)\n    } else if (input.slice(0, 3) === '/./') {\n      input = '/' + input.slice(3)\n    } else if (input === '/.') {\n      input = '/'\n    } else if (input.slice(0, 4) === '/../') {\n      input = '/' + input.slice(4)\n      output = ontoRdfDropLastSegment(output)\n    } else if (input === '/..') {\n      input = '/'\n      output = ontoRdfDropLastSegment(output)\n    } else if (input === '.' || input === '..') {\n      input = ''\n    } else {\n      const end = input.charAt(0) === '/' ? input.indexOf('/', 1) : input.indexOf('/')\n      if (end < 0) {\n        output += input\n        input = ''\n      } else {\n        output += input.slice(0, end)\n        input = input.slice(end)\n      }\n    }\n  }\n  return output\n}\n\nfunction ontoRdfMergePath(baseParts, referencePath) {\n  if (baseParts.authority !== undefined && baseParts.path === '') return '/' + referencePath\n  const slash = baseParts.path.lastIndexOf('/')\n  return slash < 0 ? referencePath : baseParts.path.slice(0, slash + 1) + referencePath\n}\n\nfunction ontoRdfBuildIri(parts) {\n  let result = ''\n  if (parts.scheme !== undefined) result += parts.scheme + ':'\n  if (parts.authority !== undefined) result += '//' + parts.authority\n  result += parts.path\n  if (parts.query !== undefined) result += '?' + parts.query\n  if (parts.fragment !== undefined) result += '#' + parts.fragment\n  return result\n}\n\n/** Resolve a relative IRI reference against an absolute base IRI. */\nfunction resolveIri(base, reference) {\n  const baseText = typeof base === 'string' ? base : ''\n  const referenceText = typeof reference === 'string' ? reference : ''\n  if (baseText === '') return referenceText\n  const ref = ontoRdfParseIri(referenceText)\n  const baseParts = ontoRdfParseIri(baseText)\n  if (ref.scheme !== undefined) {\n    return ontoRdfBuildIri({\n      scheme: ref.scheme,\n      authority: ref.authority,\n      path: ontoRdfRemoveDotSegments(ref.path),\n      query: ref.query,\n      fragment: ref.fragment,\n    })\n  }\n  if (ref.authority !== undefined) {\n    return ontoRdfBuildIri({\n      scheme: baseParts.scheme,\n      authority: ref.authority,\n      path: ontoRdfRemoveDotSegments(ref.path),\n      query: ref.query,\n      fragment: ref.fragment,\n    })\n  }\n  if (ref.path === '') {\n    return ontoRdfBuildIri({\n      scheme: baseParts.scheme,\n      authority: baseParts.authority,\n      path: baseParts.path,\n      query: ref.query !== undefined ? ref.query : baseParts.query,\n      fragment: ref.fragment,\n    })\n  }\n  const path = ref.path.charAt(0) === '/'\n    ? ontoRdfRemoveDotSegments(ref.path)\n    : ontoRdfRemoveDotSegments(ontoRdfMergePath(baseParts, ref.path))\n  return ontoRdfBuildIri({\n    scheme: baseParts.scheme,\n    authority: baseParts.authority,\n    path: path,\n    query: ref.query,\n    fragment: ref.fragment,\n  })\n}\n\n/** Expand 'foaf:Person' with a prefix map, or return null. */\nfunction expandPrefixedName(name, prefixes) {\n  if (typeof name !== 'string' || !prefixes || typeof prefixes !== 'object') return null\n  const colon = name.indexOf(':')\n  if (colon < 0) return null\n  const prefix = name.slice(0, colon)\n  if (!ontoRdfHas(prefixes, prefix)) return null\n  const namespace = prefixes[prefix]\n  if (typeof namespace !== 'string' || namespace === '') return null\n  return namespace + name.slice(colon + 1)\n}\n\n/* ------------------------------------------------------------------ */\n/* Escape decoding                                                    */\n/* ------------------------------------------------------------------ */\n\nfunction ontoRdfDecodeUnicode(raw, marker, line, builder) {\n  const size = marker === 'u' ? 4 : 8\n  const hex = raw.slice(0, size)\n  if (hex.length !== size || !/^[0-9A-Fa-f]+$/.test(hex)) {\n    builder.warn('invalid unicode escape \"\\\\' + marker + hex + '\"', line)\n    return null\n  }\n  const code = parseInt(hex, 16)\n  if (code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) {\n    builder.warn('invalid code point in unicode escape', line)\n    return { value: '\\uFFFD', used: size }\n  }\n  return { value: String.fromCodePoint(code), used: size }\n}\n\nfunction ontoRdfDecodeEscapes(raw, line, builder) {\n  let output = ''\n  let i = 0\n  while (i < raw.length) {\n    const character = raw.charAt(i)\n    if (character !== '\\\\') {\n      output += character\n      i++\n      continue\n    }\n    const marker = raw.charAt(i + 1)\n    if (marker === '') {\n      builder.warn('trailing backslash in literal', line)\n      break\n    }\n    if (marker === 't') {\n      output += '\\t'\n      i += 2\n    } else if (marker === 'b') {\n      output += '\\b'\n      i += 2\n    } else if (marker === 'n') {\n      output += '\\n'\n      i += 2\n    } else if (marker === 'r') {\n      output += '\\r'\n      i += 2\n    } else if (marker === 'f') {\n      output += '\\f'\n      i += 2\n    } else if (marker === '\"') {\n      output += '\"'\n      i += 2\n    } else if (marker === \"'\") {\n      output += \"'\"\n      i += 2\n    } else if (marker === '\\\\') {\n      output += '\\\\'\n      i += 2\n    } else if (marker === 'u' || marker === 'U') {\n      const decoded = ontoRdfDecodeUnicode(raw.slice(i + 2), marker, line, builder)\n      if (decoded === null) {\n        output += marker\n        i += 2\n      } else {\n        output += decoded.value\n        i += 2 + decoded.used\n      }\n    } else {\n      builder.warn('unknown escape sequence \"\\\\' + marker + '\"', line)\n      output += marker\n      i += 2\n    }\n  }\n  return output\n}\n\nfunction ontoRdfDecodeIriEscapes(raw, line, builder) {\n  let output = ''\n  let i = 0\n  while (i < raw.length) {\n    const character = raw.charAt(i)\n    if (character !== '\\\\') {\n      output += character\n      i++\n      continue\n    }\n    const marker = raw.charAt(i + 1)\n    if (marker === 'u' || marker === 'U') {\n      const decoded = ontoRdfDecodeUnicode(raw.slice(i + 2), marker, line, builder)\n      if (decoded === null) {\n        output += marker\n        i += 2\n      } else {\n        output += decoded.value\n        i += 2 + decoded.used\n      }\n      continue\n    }\n    if (marker === '') {\n      builder.warn('trailing backslash in IRI', line)\n      break\n    }\n    builder.warn('invalid escape sequence \"\\\\' + marker + '\" in IRI', line)\n    output += marker\n    i += 2\n  }\n  return output\n}\n\n/* ------------------------------------------------------------------ */\n/* Turtle / N3 / TriG                                                 */\n/* ------------------------------------------------------------------ */\n\nconst ONTO_TURTLE_NUMBER = /[+-]?(?:(?:(?:\\d+\\.\\d*)|(?:\\.\\d+)|(?:\\d+))[eE][+-]?\\d+|(?:\\d*\\.\\d+)|(?:\\d+))/y\n\nfunction ontoRdfTurtleBoundary(character) {\n  return character === undefined ||\n    character === ' ' || character === '\\t' || character === '\\r' || character === '\\n' ||\n    character === ';' || character === ',' || character === '.' || character === '(' ||\n    character === ')' || character === '[' || character === ']' || character === '{' ||\n    character === '}' || character === '<' || character === '>' || character === '\"' ||\n    character === \"'\" || character === '#' || character === '^'\n}\n\nclass OntoTurtleParser {\n  constructor(text, options) {\n    const opts = options || {}\n    this.builder = new OntoRdfBuilder('turtle', ontoRdfNormalizeText(text), opts)\n    this.source = this.builder.text\n    this.length = this.source.length\n    this.pos = 0\n    const initial = ontoRdfInitialBase(opts)\n    this.base = initial.base\n    this.builder.base = initial.base\n    this.builder.baseSource = initial.source\n    this.depth = 0\n    this.prefixes = this.builder.prefixes\n    if (opts.prefixes && typeof opts.prefixes === 'object') {\n      const keys = Object.keys(opts.prefixes)\n      for (let i = 0; i < keys.length; i++) {\n        const value = opts.prefixes[keys[i]]\n        if (typeof value === 'string') this.prefixes[keys[i]] = value\n      }\n    }\n  }\n\n  parse() {\n    try {\n      this.parseDocument()\n    } catch (error) {\n      if (!error || !error.ontoRdfFatal) {\n        this.builder.error(\n          'parser failed: ' + (error && error.message ? error.message : String(error)),\n          this.builder.lineAt(this.pos),\n        )\n      }\n    }\n    return this.builder.finish()\n  }\n\n  /* ---------------------------- scanner ---------------------------- */\n\n  peek(offset) {\n    return this.source[this.pos + (offset || 0)]\n  }\n\n  atEnd() {\n    return this.pos >= this.length\n  }\n\n  lineAt(index) {\n    return this.builder.lineAt(index)\n  }\n\n  fatal(message, index) {\n    this.builder.error(message, this.lineAt(index === undefined ? this.pos : index))\n    const error = new Error(message)\n    error.ontoRdfFatal = true\n    throw error\n  }\n\n  skipWhitespace() {\n    while (this.pos < this.length) {\n      const character = this.source[this.pos]\n      if (character === ' ' || character === '\\t' || character === '\\r' || character === '\\n') {\n        this.pos++\n        continue\n      }\n      if (character === '#') {\n        const newline = this.source.indexOf('\\n', this.pos)\n        this.pos = newline < 0 ? this.length : newline + 1\n        continue\n      }\n      break\n    }\n  }\n\n  isNameDelimiter(character) {\n    return character === undefined ||\n      character === ' ' || character === '\\t' || character === '\\r' || character === '\\n' ||\n      character === ';' || character === ',' || character === '(' || character === ')' ||\n      character === '[' || character === ']' || character === '<' || character === '>' ||\n      character === '\"' || character === \"'\" || character === '#' || character === '{' ||\n      character === '}' || character === '^'\n  }\n\n  matchWord(word) {\n    const end = this.pos + word.length\n    if (this.source.slice(this.pos, end) !== word) return false\n    return ontoRdfTurtleBoundary(this.source[end])\n  }\n\n  readWord() {\n    let end = this.pos\n    while (end < this.length && /[A-Za-z]/.test(this.source[end])) end++\n    return this.source.slice(this.pos, end)\n  }\n\n  isDirectiveBoundary(index) {\n    const character = this.source[index]\n    return character === undefined || character === ' ' || character === '\\t' ||\n      character === '\\r' || character === '\\n' || character === '<'\n  }\n\n  /* --------------------------- directives -------------------------- */\n\n  tryDirective() {\n    const start = this.pos\n    if (this.peek() === '@') {\n      if (this.source.slice(start, start + 7).toLowerCase() === '@prefix' && this.isDirectiveBoundary(start + 7)) {\n        this.parsePrefixDirective(7, true)\n        return true\n      }\n      if (this.source.slice(start, start + 5).toLowerCase() === '@base' && this.isDirectiveBoundary(start + 5)) {\n        this.parseBaseDirective(5, true)\n        return true\n      }\n      return false\n    }\n    const word = this.readWord()\n    const lower = word.toLowerCase()\n    if (lower === 'prefix' && this.isDirectiveBoundary(start + word.length)) {\n      this.parsePrefixDirective(word.length, false)\n      return true\n    }\n    if (lower === 'base' && this.isDirectiveBoundary(start + word.length)) {\n      this.parseBaseDirective(word.length, false)\n      return true\n    }\n    return false\n  }\n\n  parsePrefixDirective(keywordLength, requireDot) {\n    const start = this.pos\n    this.pos += keywordLength\n    this.skipWhitespace()\n    const prefix = this.readPrefixLabel()\n    this.skipWhitespace()\n    if (this.peek() !== '<') this.fatal('expected an IRI after the prefix name', this.pos)\n    const iri = this.readIriReference()\n    this.declarePrefix(prefix, iri, start)\n    this.skipWhitespace()\n    if (requireDot) {\n      if (this.peek() !== '.') this.fatal(\"expected '.' after @prefix\", this.pos)\n      this.pos++\n    } else if (this.peek() === '.') {\n      this.pos++\n    }\n  }\n\n  parseBaseDirective(keywordLength, requireDot) {\n    const start = this.pos\n    this.pos += keywordLength\n    this.skipWhitespace()\n    if (this.peek() !== '<') this.fatal('expected an IRI after @base', this.pos)\n    const iri = this.readIriReference()\n    this.setBase(iri, start)\n    this.skipWhitespace()\n    if (requireDot) {\n      if (this.peek() !== '.') this.fatal(\"expected '.' after @base\", this.pos)\n      this.pos++\n    } else if (this.peek() === '.') {\n      this.pos++\n    }\n  }\n\n  readPrefixLabel() {\n    const start = this.pos\n    let prefix = ''\n    while (!this.atEnd()) {\n      const character = this.peek()\n      if (character === ':') {\n        this.pos++\n        return prefix\n      }\n      if (this.isNameDelimiter(character) || character === '\\\\') break\n      prefix += character\n      this.pos++\n    }\n    this.fatal('expected \":\" after the prefix name', start)\n    return ''\n  }\n\n  declarePrefix(prefix, iri, index) {\n    let value = iri\n    if (!ontoRdfIsAbsoluteIri(value)) {\n      if (this.base) value = resolveIri(this.base, value)\n      else {\n        this.builder.diagnose(\n          'base-unavailable',\n          'warning',\n          'prefix IRI \"' + iri + '\" is relative and no base is available',\n          this.lineAt(index),\n        )\n      }\n    }\n    this.prefixes[prefix] = value\n  }\n\n  setBase(iri, index) {\n    let value = iri\n    if (!ontoRdfIsAbsoluteIri(value)) {\n      if (this.base) {\n        value = resolveIri(this.base, value)\n      } else {\n        this.builder.diagnose(\n          'base-unavailable',\n          'warning',\n          '@base \"' + iri + '\" is relative and no base is available',\n          this.lineAt(index),\n        )\n        return\n      }\n    }\n    this.base = value\n    this.builder.base = value\n    if (value !== '') this.builder.baseSource = 'document'\n  }\n\n  /** Record that a TriG graph label was recognised and ignored. */\n  noteNamedGraph(label, index) {\n    const name = typeof label === 'string' && label !== '' ? label : 'anonymous graph'\n    this.builder.diagnose(\n      'named-graph-ignored',\n      'warning',\n      'named graph \"' + name + '\" was ignored; its triples were kept in the default graph',\n      this.lineAt(index),\n    )\n  }\n\n  /** Skip one balanced bracket construct without recursing (depth-limit escape). */\n  skipBalanced(openCharacter, closeCharacter) {\n    if (this.peek() !== openCharacter) return\n    this.pos++\n    let depth = 1\n    while (this.pos < this.length) {\n      const character = this.peek()\n      if (character === '\\\\') {\n        this.pos += 2\n        continue\n      }\n      if (character === '#') {\n        const newline = this.source.indexOf('\\n', this.pos)\n        this.pos = newline < 0 ? this.length : newline + 1\n        continue\n      }\n      if (character === '\"' || character === \"'\") {\n        const quote = character\n        const long = this.peek(1) === quote && this.peek(2) === quote\n        this.pos += long ? 3 : 1\n        while (this.pos < this.length) {\n          if (this.source[this.pos] === '\\\\') {\n            this.pos += 2\n            continue\n          }\n          if (long) {\n            if (this.source[this.pos] === quote && this.source[this.pos + 1] === quote &&\n              this.source[this.pos + 2] === quote) {\n              this.pos += 3\n              break\n            }\n          } else if (this.source[this.pos] === quote) {\n            this.pos++\n            break\n          }\n          this.pos++\n        }\n        continue\n      }\n      if (character === openCharacter) {\n        depth++\n      } else if (character === closeCharacter) {\n        depth--\n        this.pos++\n        if (depth === 0) return\n        continue\n      }\n      this.pos++\n    }\n  }\n\n  noteNestingLimit(index) {\n    this.builder.diagnose(\n      'nesting-limit',\n      'error',\n      'nesting depth limit of ' + this.builder.maxDepth +\n        ' reached; the nested branch was skipped',\n      this.lineAt(index),\n    )\n  }\n\n  /* ---------------------------- tokens ----------------------------- */\n\n  readIriReference() {\n    const start = this.pos\n    if (this.peek() !== '<') this.fatal('expected an IRI reference', start)\n    this.pos++\n    let raw = ''\n    while (this.pos < this.length) {\n      const character = this.source[this.pos]\n      if (character === '>') {\n        this.pos++\n        return ontoRdfDecodeIriEscapes(raw, this.lineAt(start), this.builder)\n      }\n      if (character === '\\n' || character === '\\r') this.fatal('newline inside an IRI reference', start)\n      raw += character\n      this.pos++\n    }\n    this.fatal('unterminated IRI reference', start)\n    return ''\n  }\n\n  readNameToken() {\n    const start = this.pos\n    let value = ''\n    while (!this.atEnd()) {\n      const character = this.peek()\n      if (character === '\\\\') {\n        const marker = this.peek(1)\n        if (marker === 'u' || marker === 'U') {\n          const size = marker === 'u' ? 4 : 8\n          const hex = this.source.slice(this.pos + 2, this.pos + 2 + size)\n          if (hex.length === size && /^[0-9A-Fa-f]+$/.test(hex)) {\n            const code = parseInt(hex, 16)\n            if (code <= 0x10ffff && !(code >= 0xd800 && code <= 0xdfff)) value += String.fromCodePoint(code)\n            this.pos += 2 + size\n            continue\n          }\n        }\n        if (marker === undefined) {\n          this.pos++\n          break\n        }\n        value += marker\n        this.pos += 2\n        continue\n      }\n      if (this.isNameDelimiter(character)) break\n      value += character\n      this.pos++\n    }\n    while (value.charAt(value.length - 1) === '.' && this.pos > start &&\n      this.source[this.pos - 1] === '.' && this.source[this.pos - 2] !== '\\\\') {\n      value = value.slice(0, -1)\n      this.pos--\n    }\n    return { value: value, start: start }\n  }\n\n  readBlankNode(token, start) {\n    const label = token.slice(2)\n    if (!label) this.fatal('empty blank node label', start)\n    if (!/^[A-Za-z0-9_][A-Za-z0-9_.-]*$/.test(label)) {\n      this.builder.warn('blank node label \"' + label + '\" may not be valid', this.lineAt(start))\n    }\n    return this.builder.useBlank(label)\n  }\n\n  expandNameToken(token) {\n    const value = token.value\n    const colon = value.indexOf(':')\n    if (colon < 0) return null\n    const prefix = value.slice(0, colon)\n    const local = value.slice(colon + 1)\n    const namespace = ontoRdfHas(this.prefixes, prefix) ? this.prefixes[prefix] : undefined\n    if (typeof namespace !== 'string') this.fatal('undefined prefix \"' + prefix + ':\": \"' + value + '\"', token.start)\n    return ontoRdfNormalizeIri(namespace + local, this.base, this.builder, this.lineAt(token.start))\n  }\n\n  readStringRaw() {\n    const quote = this.peek()\n    const start = this.pos\n    const long = this.peek(1) === quote && this.peek(2) === quote\n    this.pos += long ? 3 : 1\n    let raw = ''\n    while (this.pos < this.length) {\n      const character = this.source[this.pos]\n      if (long) {\n        if (character === quote && this.source[this.pos + 1] === quote && this.source[this.pos + 2] === quote) {\n          this.pos += 3\n          return raw\n        }\n      } else if (character === quote) {\n        this.pos++\n        return raw\n      }\n      if (character === '\\\\') {\n        raw += character\n        this.pos++\n        if (this.pos < this.length) {\n          raw += this.source[this.pos]\n          this.pos++\n        }\n        continue\n      }\n      if (!long && (character === '\\n' || character === '\\r')) {\n        this.fatal('newline inside a short string literal', start)\n      }\n      raw += character\n      this.pos++\n    }\n    this.fatal('unterminated string literal', start)\n    return ''\n  }\n\n  parseStringLiteral() {\n    const start = this.pos\n    const raw = this.readStringRaw()\n    const value = ontoRdfDecodeEscapes(raw, this.lineAt(start), this.builder)\n    let language\n    let datatype\n    if (this.peek() === '@') {\n      this.pos++\n      const tagStart = this.pos\n      while (!this.atEnd() && /[A-Za-z0-9-]/.test(this.peek())) this.pos++\n      const tag = this.source.slice(tagStart, this.pos)\n      if (!tag) {\n        this.builder.warn('empty language tag', this.lineAt(tagStart))\n      } else {\n        language = tag.toLowerCase()\n        if (!/^[A-Za-z]+(?:-[A-Za-z0-9]+)*$/.test(tag)) {\n          this.builder.warn('invalid language tag \"' + tag + '\"', this.lineAt(tagStart))\n        }\n      }\n    } else if (this.peek() === '^' && this.peek(1) === '^') {\n      this.pos += 2\n      this.skipWhitespace()\n      const datatypeStart = this.pos\n      if (this.peek() === '<') {\n        datatype = ontoRdfNormalizeIri(this.readIriReference(), this.base, this.builder, this.lineAt(datatypeStart))\n      } else {\n        const token = this.readNameToken()\n        datatype = this.expandNameToken(token)\n        if (!datatype) this.fatal('expected a datatype IRI', datatypeStart)\n      }\n    }\n    return { term: value, kind: 'literal', dt: datatype, lang: language }\n  }\n\n  readNumber() {\n    const start = this.pos\n    ONTO_TURTLE_NUMBER.lastIndex = this.pos\n    const match = ONTO_TURTLE_NUMBER.exec(this.source)\n    if (!match) this.fatal('invalid numeric literal', start)\n    const raw = match[0]\n    const end = start + raw.length\n    if (!ontoRdfTurtleBoundary(this.source[end])) {\n      this.fatal('invalid numeric literal \"' + raw + '\"', start)\n    }\n    this.pos = end\n    let datatype = ONTO_XSD_INTEGER\n    if (raw.indexOf('e') >= 0 || raw.indexOf('E') >= 0) datatype = ONTO_XSD_DOUBLE\n    else if (raw.indexOf('.') >= 0) datatype = ONTO_XSD_DECIMAL\n    return { term: raw, kind: 'literal', dt: datatype }\n  }\n\n  /* --------------------------- grammar ----------------------------- */\n\n  parseDocument() {\n    this.skipWhitespace()\n    while (!this.atEnd()) {\n      if (this.builder.truncated) break\n      const character = this.peek()\n      if (character === '{' || character === '}') {\n        this.pos++\n        this.skipWhitespace()\n        continue\n      }\n      if (this.tryDirective()) {\n        this.skipWhitespace()\n        continue\n      }\n      if (this.tryGraphHeader()) {\n        this.skipWhitespace()\n        continue\n      }\n      this.parseTriples()\n      if (this.builder.truncated) break\n      this.skipWhitespace()\n      if (this.atEnd()) break\n      if (this.peek() === '.') {\n        this.pos++\n        this.skipWhitespace()\n        continue\n      }\n      if (this.peek() === '}') {\n        this.pos++\n        this.skipWhitespace()\n        continue\n      }\n      this.fatal(\"expected '.' after the triples\", this.pos)\n    }\n  }\n\n  tryGraphHeader() {\n    const save = this.pos\n    if (this.peek() === '<') {\n      const end = this.findIriEnd(save)\n      if (end < 0) return false\n      this.pos = end + 1\n      this.skipWhitespace()\n      if (this.peek() === '{') {\n        this.noteNamedGraph(this.source.slice(save, end + 1), save)\n        this.pos++\n        return true\n      }\n      this.pos = save\n      return false\n    }\n    if (this.peek() === '_' && this.peek(1) === ':') {\n      this.pos += 2\n      const labelStart = save\n      while (!this.atEnd() && !this.isNameDelimiter(this.peek())) this.pos++\n      this.skipWhitespace()\n      if (this.peek() === '{') {\n        this.noteNamedGraph(this.source.slice(labelStart, this.pos).trim(), save)\n        this.pos++\n        return true\n      }\n      this.pos = save\n      return false\n    }\n    const word = this.readWord()\n    if (word.toLowerCase() === 'graph' && ontoRdfIsWhitespace(this.source[this.pos + word.length])) {\n      this.pos += word.length\n      this.skipWhitespace()\n      let label = ''\n      if (this.peek() === '<') {\n        const labelStart = this.pos\n        const end = this.findIriEnd(labelStart)\n        if (end < 0) {\n          this.pos = save\n          return false\n        }\n        this.readIriReference()\n        label = this.source.slice(labelStart, end + 1)\n      } else if (this.peek() === '_' && this.peek(1) === ':') {\n        const labelStart = this.pos\n        this.pos += 2\n        while (!this.atEnd() && !this.isNameDelimiter(this.peek())) this.pos++\n        label = this.source.slice(labelStart, this.pos)\n      } else {\n        const labelToken = this.readNameToken()\n        if (!labelToken.value) {\n          this.pos = save\n          return false\n        }\n        label = labelToken.value\n      }\n      this.skipWhitespace()\n      if (this.peek() === '{') {\n        this.noteNamedGraph(label, save)\n        this.pos++\n        return true\n      }\n      this.pos = save\n      return false\n    }\n    const token = this.readNameToken()\n    this.skipWhitespace()\n    if (token.value && this.peek() === '{') {\n      this.noteNamedGraph(token.value, save)\n      this.pos++\n      return true\n    }\n    this.pos = save\n    return false\n  }\n\n  findIriEnd(start) {\n    let index = start + 1\n    while (index < this.length) {\n      const character = this.source[index]\n      if (character === '\\\\') {\n        index += 2\n        continue\n      }\n      if (character === '>') return index\n      if (character === '\\n' || character === '\\r') return -1\n      index++\n    }\n    return -1\n  }\n\n  parseTriples() {\n    const subject = this.parseSubject()\n    this.skipWhitespace()\n    if (this.peek() === '{') {\n      this.pos++\n      return\n    }\n    if (this.peek() === '.') {\n      if (!subject.propertyList) this.fatal('expected a predicate and object', this.pos)\n      return\n    }\n    const found = this.parsePredicateObjectList(subject.term)\n    if (!found && !subject.propertyList) this.fatal('expected a predicate and object', this.pos)\n  }\n\n  parseSubject() {\n    this.skipWhitespace()\n    const start = this.pos\n    const character = this.peek()\n    if (character === undefined) this.fatal('unexpected end of input, expected a subject', start)\n    if (character === '<') {\n      return {\n        term: ontoRdfNormalizeIri(this.readIriReference(), this.base, this.builder, this.lineAt(start)),\n        propertyList: false,\n      }\n    }\n    if (character === '[') {\n      return { term: this.parseBlankNodePropertyList(), propertyList: true }\n    }\n    if (character === '(') {\n      const head = this.parseCollection()\n      return { term: head, propertyList: false }\n    }\n    if (character === '_' && this.peek(1) === ':') {\n      const token = this.readNameToken()\n      return { term: this.readBlankNode(token.value, start), propertyList: false }\n    }\n    const token = this.readNameToken()\n    const iri = this.expandNameToken(token)\n    if (!iri) this.fatal('invalid subject \"' + token.value + '\"', start)\n    return { term: iri, propertyList: false }\n  }\n\n  parsePredicate() {\n    this.skipWhitespace()\n    const start = this.pos\n    if (this.matchWord('a')) {\n      this.pos++\n      return ONTO_RDF_TYPE\n    }\n    if (this.peek() === '<') {\n      return ontoRdfNormalizeIri(this.readIriReference(), this.base, this.builder, this.lineAt(start))\n    }\n    const token = this.readNameToken()\n    const iri = this.expandNameToken(token)\n    if (!iri) this.fatal('expected a predicate', start)\n    return iri\n  }\n\n  parseObject() {\n    this.skipWhitespace()\n    const start = this.pos\n    const character = this.peek()\n    if (character === undefined) this.fatal('unexpected end of input, expected an object', start)\n    if (character === '<') {\n      return {\n        term: ontoRdfNormalizeIri(this.readIriReference(), this.base, this.builder, this.lineAt(start)),\n        kind: 'iri',\n      }\n    }\n    if (character === '[') {\n      return { term: this.parseBlankNodePropertyList(), kind: 'blank' }\n    }\n    if (character === '(') {\n      const head = this.parseCollection()\n      return { term: head, kind: head === ONTO_RDF_NIL ? 'iri' : 'blank' }\n    }\n    if (character === '_' && this.peek(1) === ':') {\n      const token = this.readNameToken()\n      return { term: this.readBlankNode(token.value, start), kind: 'blank' }\n    }\n    if (character === '\"' || character === \"'\") return this.parseStringLiteral()\n    if (character === '+' || character === '-' || character === '.' ||\n      (character >= '0' && character <= '9')) {\n      if (character === '.' && !(this.peek(1) >= '0' && this.peek(1) <= '9')) {\n        this.fatal('unexpected \".\" where an object was expected', start)\n      }\n      return this.readNumber()\n    }\n    if (this.matchWord('true')) {\n      this.pos += 4\n      return { term: 'true', kind: 'literal', dt: ONTO_XSD_BOOLEAN }\n    }\n    if (this.matchWord('false')) {\n      this.pos += 5\n      return { term: 'false', kind: 'literal', dt: ONTO_XSD_BOOLEAN }\n    }\n    const token = this.readNameToken()\n    const iri = this.expandNameToken(token)\n    if (!iri) this.fatal('expected an object at \"' + token.value + '\"', start)\n    return { term: iri, kind: 'iri' }\n  }\n\n  parsePredicateObjectList(subject) {\n    let found = false\n    while (true) {\n      if (this.builder.truncated) break\n      this.skipWhitespace()\n      if (this.atEnd()) break\n      const character = this.peek()\n      if (character === '.' || character === ']' || character === ')' ||\n        character === '}' || character === '{') break\n      if (character === ';') {\n        this.pos++\n        continue\n      }\n      const predicate = this.parsePredicate()\n      this.parseObjectList(subject, predicate)\n      found = true\n      this.skipWhitespace()\n      if (this.peek() !== ';') break\n      this.pos++\n    }\n    return found\n  }\n\n  parseObjectList(subject, predicate) {\n    while (true) {\n      const object = this.parseObject()\n      const added = this.builder.add(subject, predicate, object.term, object.kind, object.dt, object.lang)\n      this.skipWhitespace()\n      if (!added || this.peek() !== ',') break\n      this.pos++\n      this.skipWhitespace()\n    }\n  }\n\n  parseBlankNodePropertyList() {\n    const start = this.pos\n    if (this.depth >= this.builder.maxDepth) {\n      this.noteNestingLimit(start)\n      this.skipBalanced('[', ']')\n      return this.builder.freshBlank()\n    }\n    this.depth++\n    try {\n      this.pos++\n      const node = this.builder.freshBlank()\n      this.skipWhitespace()\n      if (this.peek() === ']') {\n        this.pos++\n        return node\n      }\n      this.parsePredicateObjectList(node)\n      if (this.builder.truncated) return node\n      this.skipWhitespace()\n      if (this.peek() !== ']') this.fatal(\"expected ']' to close the blank node property list\", this.pos)\n      this.pos++\n      return node\n    } finally {\n      this.depth--\n    }\n  }\n\n  parseCollection() {\n    const start = this.pos\n    if (this.depth >= this.builder.maxDepth) {\n      this.noteNestingLimit(start)\n      this.skipBalanced('(', ')')\n      return ONTO_RDF_NIL\n    }\n    this.depth++\n    try {\n      this.pos++\n      this.skipWhitespace()\n      if (this.peek() === ')') {\n        this.pos++\n        return ONTO_RDF_NIL\n      }\n      const head = this.builder.freshBlank()\n      let current = head\n      while (true) {\n        const item = this.parseObject()\n        const added = this.builder.add(current, ONTO_RDF_FIRST, item.term, item.kind, item.dt, item.lang)\n        if (!added) return head\n        this.skipWhitespace()\n        if (this.peek() === ')') {\n          this.pos++\n          this.builder.add(current, ONTO_RDF_REST, ONTO_RDF_NIL, 'iri')\n          break\n        }\n        if (this.peek() === undefined) this.fatal('unterminated RDF collection', start)\n        const next = this.builder.freshBlank()\n        this.builder.add(current, ONTO_RDF_REST, next, 'blank')\n        current = next\n      }\n      return head\n    } finally {\n      this.depth--\n    }\n  }\n}\n\n/* ------------------------------------------------------------------ */\n/* N-Triples / N-Quads                                                */\n/* ------------------------------------------------------------------ */\n\nclass OntoNTriplesParser {\n  constructor(text, options) {\n    const opts = options || {}\n    this.builder = new OntoRdfBuilder('ntriples', ontoRdfNormalizeText(text), opts)\n    this.source = this.builder.text\n    const initial = ontoRdfInitialBase(opts)\n    this.base = initial.base\n    this.builder.base = initial.base\n    this.builder.baseSource = initial.source\n  }\n\n  parse() {\n    const lines = this.source.split('\\n')\n    for (let i = 0; i < lines.length; i++) {\n      if (this.builder.truncated) break\n      let line = lines[i]\n      if (line.charCodeAt(line.length - 1) === 13) line = line.slice(0, -1)\n      const trimmed = line.trim()\n      if (!trimmed || trimmed.charAt(0) === '#') continue\n      this.parseLine(trimmed, i + 1)\n    }\n    return this.builder.finish()\n  }\n\n  parseLine(line, lineNumber) {\n    const length = line.length\n    let pos = 0\n    const builder = this.builder\n    const base = this.base\n    const self = this\n\n    const fail = (message) => {\n      builder.error(message, lineNumber)\n      const error = new Error(message)\n      error.ontoRdfFatal = true\n      throw error\n    }\n\n    const skip = () => {\n      while (pos < length && (line[pos] === ' ' || line[pos] === '\\t')) pos++\n    }\n\n    const readIri = () => {\n      if (line[pos] !== '<') fail('expected an IRI reference')\n      pos++\n      let raw = ''\n      while (pos < length) {\n        const character = line[pos]\n        if (character === '\\\\') {\n          raw += character\n          pos++\n          if (pos < length) {\n            raw += line[pos]\n            pos++\n          }\n          continue\n        }\n        if (character === '>') {\n          pos++\n          return ontoRdfNormalizeIri(ontoRdfDecodeIriEscapes(raw, lineNumber, builder), base, builder, lineNumber)\n        }\n        raw += character\n        pos++\n      }\n      fail('unterminated IRI reference')\n      return ''\n    }\n\n    const readBlank = () => {\n      const pattern = /_:([A-Za-z0-9_][A-Za-z0-9_.-]*)/y\n      pattern.lastIndex = pos\n      const match = pattern.exec(line)\n      if (!match) fail('expected a blank node label')\n      pos = pattern.lastIndex\n      return builder.useBlank(match[1])\n    }\n\n    const readLiteral = () => {\n      if (line[pos] !== '\"') fail('expected a literal')\n      pos++\n      let raw = ''\n      let closed = false\n      while (pos < length) {\n        const character = line[pos]\n        if (character === '\\\\') {\n          raw += character\n          pos++\n          if (pos < length) {\n            raw += line[pos]\n            pos++\n          }\n          continue\n        }\n        if (character === '\"') {\n          pos++\n          closed = true\n          break\n        }\n        raw += character\n        pos++\n      }\n      if (!closed) fail('unterminated string literal')\n      let language\n      let datatype\n      if (line[pos] === '@') {\n        pos++\n        const tagStart = pos\n        while (pos < length && /[A-Za-z0-9-]/.test(line[pos])) pos++\n        const tag = line.slice(tagStart, pos)\n        if (!tag) builder.warn('empty language tag', lineNumber)\n        else language = tag.toLowerCase()\n      } else if (line[pos] === '^' && line[pos + 1] === '^') {\n        pos += 2\n        datatype = readIri()\n      }\n      return {\n        term: ontoRdfDecodeEscapes(raw, lineNumber, builder),\n        kind: 'literal',\n        dt: datatype,\n        lang: language,\n      }\n    }\n\n    try {\n      skip()\n      let subject\n      if (line[pos] === '<') subject = readIri()\n      else if (line[pos] === '_' && line[pos + 1] === ':') subject = readBlank()\n      else fail('expected a subject IRI or blank node')\n\n      skip()\n      if (line[pos] !== '<') fail('expected a predicate IRI')\n      const predicate = readIri()\n\n      skip()\n      let object\n      if (line[pos] === '<') object = { term: readIri(), kind: 'iri' }\n      else if (line[pos] === '_' && line[pos + 1] === ':') object = { term: readBlank(), kind: 'blank' }\n      else if (line[pos] === '\"') object = readLiteral()\n      else fail('expected an object')\n\n      skip()\n      let graphLabel\n      if (line[pos] === '<' || (line[pos] === '_' && line[pos + 1] === ':')) {\n        if (line[pos] === '<') graphLabel = readIri()\n        else graphLabel = readBlank()\n        skip()\n      }\n\n      if (line[pos] !== '.') fail(\"expected '.' at the end of the statement\")\n      pos++\n      skip()\n      if (pos < length && line[pos] !== '#') {\n        builder.warn('extra content after the statement was ignored', lineNumber)\n      }\n\n      if (graphLabel !== undefined) {\n        builder.diagnose(\n          'named-graph-ignored',\n          'warning',\n          'graph term \"' + graphLabel + '\" was ignored; N-Quads datasets are not supported',\n          lineNumber,\n        )\n      }\n      builder.add(subject, predicate, object.term, object.kind, object.dt, object.lang)\n    } catch (error) {\n      if (error && error.ontoRdfFatal) return\n      builder.error(\n        'failed to parse line: ' + (error && error.message ? error.message : String(error)),\n        lineNumber,\n      )\n    }\n  }\n}\n\n/* ------------------------------------------------------------------ */\n/* RDF/XML                                                            */\n/* ------------------------------------------------------------------ */\n\nfunction ontoRdfDecodeXmlEntity(body, builder, line) {\n  if (body === 'amp') return '&'\n  if (body === 'lt') return '<'\n  if (body === 'gt') return '>'\n  if (body === 'quot') return '\"'\n  if (body === 'apos') return \"'\"\n  if (body.charAt(0) === '#') {\n    let code\n    if (body.charAt(1) === 'x' || body.charAt(1) === 'X') code = parseInt(body.slice(2), 16)\n    else code = parseInt(body.slice(1), 10)\n    if (!isFinite(code) || code < 0 || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) {\n      builder.warn('invalid XML character reference &' + body + ';', line)\n      return '\\uFFFD'\n    }\n    return String.fromCodePoint(code)\n  }\n  if (/^[A-Za-z][A-Za-z0-9._-]*$/.test(body)) {\n    builder.warn('unknown XML entity &' + body + ';', line)\n  }\n  return null\n}\n\nfunction ontoRdfDecodeXmlEntities(raw, builder, line) {\n  let output = ''\n  let index = 0\n  while (index < raw.length) {\n    const amp = raw.indexOf('&', index)\n    if (amp < 0) {\n      output += raw.slice(index)\n      break\n    }\n    output += raw.slice(index, amp)\n    const semi = raw.indexOf(';', amp + 1)\n    if (semi < 0) {\n      output += raw.slice(amp)\n      break\n    }\n    const body = raw.slice(amp + 1, semi)\n    const decoded = ontoRdfDecodeXmlEntity(body, builder, line)\n    output += decoded === null ? raw.slice(amp, semi + 1) : decoded\n    index = semi + 1\n  }\n  return output\n}\n\nfunction ontoRdfXmlSplitName(qname) {\n  const colon = qname.indexOf(':')\n  if (colon < 0) return { prefix: '', local: qname }\n  return { prefix: qname.slice(0, colon), local: qname.slice(colon + 1) }\n}\n\nclass OntoRdfXmlParser {\n  constructor(text, options) {\n    const opts = options || {}\n    this.builder = new OntoRdfBuilder('rdfxml', ontoRdfNormalizeText(text), opts)\n    this.source = this.builder.text\n    const initial = ontoRdfInitialBase(opts)\n    this.initialBase = initial.base\n    this.initialBaseSource = initial.source\n    this.builder.base = initial.base\n    this.builder.baseSource = initial.source\n    this.depth = 0\n    this.warnedReification = false\n    this.warnedMultipleObjectsSubjects = Object.create(null)\n  }\n\n  /** Resolve xmlns declarations iteratively so deep XML cannot overflow the stack. */\n  resolveNamespaces(root) {\n    const stack = [{ element: root, inherited: {}, depth: 0 }]\n    while (stack.length > 0) {\n      const frame = stack.pop()\n      const element = frame.element\n      const namespaces = Object.assign({}, frame.inherited)\n      const keys = Object.keys(element.attrs)\n      for (let i = 0; i < keys.length; i++) {\n        const key = keys[i]\n        if (key === 'xmlns') {\n          if (element.attrs[key]) namespaces[''] = element.attrs[key]\n          else delete namespaces['']\n        } else if (key.slice(0, 6) === 'xmlns:') {\n          const prefix = key.slice(6)\n          if (element.attrs[key]) namespaces[prefix] = element.attrs[key]\n          else delete namespaces[prefix]\n        }\n      }\n      element.namespaces = namespaces\n      if (frame.depth >= this.builder.maxDepth) continue\n      for (let i = element.children.length - 1; i >= 0; i--) {\n        stack.push({ element: element.children[i], inherited: namespaces, depth: frame.depth + 1 })\n      }\n    }\n  }\n\n  parse() {\n    try {\n      const root = this.tokenize()\n      if (!root) {\n        if (this.builder.errors.length === 0) this.builder.error('no root element found')\n      } else {\n        this.mapDocument(root)\n      }\n    } catch (error) {\n      this.builder.error(\n        'XML parser failed: ' + (error && error.message ? error.message : String(error)),\n      )\n    }\n    return this.builder.finish()\n  }\n\n  /* ------------------------- XML tokenizer ------------------------- */\n\n  tokenize() {\n    const source = this.source\n    const length = source.length\n    const builder = this.builder\n    const root = {\n      qname: '#document',\n      attrs: {},\n      children: [],\n      text: '',\n      namespaces: {},\n      line: 1,\n      openEnd: 0,\n      closeStart: -1,\n    }\n    const stack = [root]\n    let pos = 0\n\n    const current = () => stack[stack.length - 1]\n\n    const skipSpace = () => {\n      while (pos < length && ontoRdfIsWhitespace(source[pos])) pos++\n    }\n\n    const appendText = (value) => {\n      if (!value) return\n      const element = current()\n      if (element === root) {\n        if (value.trim() !== '') builder.warn('text outside the document element was ignored', builder.lineAt(pos))\n        return\n      }\n      element.text += value\n    }\n\n    const skipDeclaration = () => {\n      let index = pos + 2\n      let brackets = 0\n      let quote = ''\n      while (index < length) {\n        const character = source[index]\n        if (quote) {\n          if (character === quote) quote = ''\n          index++\n          continue\n        }\n        if (character === '\"' || character === \"'\") {\n          quote = character\n          index++\n          continue\n        }\n        if (character === '[') brackets++\n        else if (character === ']' && brackets > 0) brackets--\n        else if (character === '>' && brackets === 0) {\n          pos = index + 1\n          return\n        }\n        index++\n      }\n      builder.error('unterminated markup declaration', builder.lineAt(pos))\n      pos = length\n    }\n\n    const closeTag = () => {\n      const start = pos\n      pos += 2\n      skipSpace()\n      const nameStart = pos\n      while (pos < length && !ontoRdfIsWhitespace(source[pos]) && source[pos] !== '>') pos++\n      const qname = source.slice(nameStart, pos)\n      skipSpace()\n      if (source[pos] !== '>') {\n        builder.error('expected \">\" in closing tag </' + qname + '>', builder.lineAt(start))\n        const next = source.indexOf('>', pos)\n        pos = next < 0 ? length : next + 1\n      } else {\n        pos++\n      }\n      if (stack.length <= 1) {\n        builder.error('unexpected closing tag </' + qname + '>', builder.lineAt(start))\n        return\n      }\n      const element = stack.pop()\n      if (element.qname !== qname) {\n        builder.error(\n          'mismatched closing tag </' + qname + '> for <' + element.qname + '>',\n          builder.lineAt(start),\n        )\n      }\n      element.closeStart = start\n    }\n\n    const openTag = () => {\n      const start = pos\n      pos++\n      const nameStart = pos\n      while (pos < length && !ontoRdfIsWhitespace(source[pos]) && source[pos] !== '>' && source[pos] !== '/') pos++\n      const qname = source.slice(nameStart, pos)\n      if (!qname) {\n        builder.error('invalid element name', builder.lineAt(start))\n        const next = source.indexOf('>', pos)\n        pos = next < 0 ? length : next + 1\n        return\n      }\n      const attrs = {}\n      let selfClosing = false\n      while (true) {\n        skipSpace()\n        if (pos >= length) {\n          builder.error('unterminated start tag <' + qname + '>', builder.lineAt(start))\n          return\n        }\n        if (source[pos] === '>') {\n          pos++\n          break\n        }\n        if (source[pos] === '/' && source[pos + 1] === '>') {\n          pos += 2\n          selfClosing = true\n          break\n        }\n        const attrStart = pos\n        while (pos < length && !ontoRdfIsWhitespace(source[pos]) && source[pos] !== '=' &&\n          source[pos] !== '>' && source[pos] !== '/') pos++\n        const attrName = source.slice(attrStart, pos)\n        if (!attrName) {\n          builder.error('invalid attribute in <' + qname + '>', builder.lineAt(pos))\n          pos++\n          continue\n        }\n        skipSpace()\n        if (source[pos] !== '=') {\n          builder.error('expected \"=\" after attribute \"' + attrName + '\"', builder.lineAt(attrStart))\n          const next = source.indexOf('>', pos)\n          pos = next < 0 ? length : next + 1\n          return\n        }\n        pos++\n        skipSpace()\n        const quote = source[pos]\n        if (quote !== '\"' && quote !== \"'\") {\n          builder.error('expected a quoted attribute value for \"' + attrName + '\"', builder.lineAt(pos))\n          const next = source.indexOf('>', pos)\n          pos = next < 0 ? length : next + 1\n          return\n        }\n        pos++\n        const valueStart = pos\n        while (pos < length && source[pos] !== quote) pos++\n        const rawValue = source.slice(valueStart, pos)\n        if (pos >= length) {\n          builder.error('unterminated attribute value for \"' + attrName + '\"', builder.lineAt(valueStart))\n        } else {\n          pos++\n        }\n        if (ontoRdfHas(attrs, attrName)) {\n          builder.warn('duplicate attribute \"' + attrName + '\"', builder.lineAt(attrStart))\n        }\n        attrs[attrName] = ontoRdfDecodeXmlEntities(rawValue, builder, builder.lineAt(valueStart))\n      }\n      const element = {\n        qname: qname,\n        attrs: attrs,\n        children: [],\n        text: '',\n        namespaces: {},\n        line: builder.lineAt(start),\n        openEnd: pos,\n        closeStart: selfClosing ? pos : -1,\n      }\n      if (current() === root) {\n        if (root.children.length > 0) builder.error('multiple root elements are not allowed', element.line)\n      }\n      current().children.push(element)\n      if (!selfClosing) stack.push(element)\n    }\n\n    while (pos < length) {\n      const lessThan = source.indexOf('<', pos)\n      if (lessThan < 0) {\n        appendText(ontoRdfDecodeXmlEntities(source.slice(pos), builder, builder.lineAt(pos)))\n        pos = length\n        break\n      }\n      if (lessThan > pos) {\n        appendText(ontoRdfDecodeXmlEntities(source.slice(pos, lessThan), builder, builder.lineAt(pos)))\n      }\n      pos = lessThan\n      if (source.slice(pos, pos + 4) === '<!--') {\n        const end = source.indexOf('-->', pos + 4)\n        if (end < 0) {\n          builder.error('unterminated XML comment', builder.lineAt(pos))\n          pos = length\n        } else {\n          pos = end + 3\n        }\n      } else if (source.slice(pos, pos + 9) === '<![CDATA[') {\n        const end = source.indexOf(']]>', pos + 9)\n        if (end < 0) {\n          builder.error('unterminated CDATA section', builder.lineAt(pos))\n          appendText(source.slice(pos + 9))\n          pos = length\n        } else {\n          appendText(source.slice(pos + 9, end))\n          pos = end + 3\n        }\n      } else if (source.slice(pos, pos + 2) === '<?') {\n        const end = source.indexOf('?>', pos + 2)\n        if (end < 0) {\n          builder.error('unterminated processing instruction', builder.lineAt(pos))\n          pos = length\n        } else {\n          pos = end + 2\n        }\n      } else if (source.slice(pos, pos + 2) === '<!') {\n        skipDeclaration()\n      } else if (source.slice(pos, pos + 2) === '</') {\n        closeTag()\n      } else {\n        openTag()\n      }\n    }\n\n    while (stack.length > 1) {\n      const element = stack.pop()\n      element.closeStart = length\n      builder.error('unclosed element <' + element.qname + '>', element.line)\n    }\n\n    return root.children[0] || null\n  }\n\n  /* --------------------------- mapping ---------------------------- */\n\n  elementIri(element) {\n    const parts = ontoRdfXmlSplitName(element.qname)\n    if (parts.prefix === '') {\n      const namespace = element.namespaces['']\n      return namespace ? namespace + parts.local : null\n    }\n    if (parts.prefix === 'xml') return ONTO_XML_NS + parts.local\n    const namespace = element.namespaces[parts.prefix]\n    return namespace ? namespace + parts.local : null\n  }\n\n  attributeIri(element, qname) {\n    const parts = ontoRdfXmlSplitName(qname)\n    if (parts.prefix === '') return null\n    if (parts.prefix === 'xml') return ONTO_XML_NS + parts.local\n    const namespace = element.namespaces[parts.prefix]\n    return namespace ? namespace + parts.local : null\n  }\n\n  getAttribute(element, iri) {\n    const keys = Object.keys(element.attrs)\n    for (let i = 0; i < keys.length; i++) {\n      if (this.attributeIri(element, keys[i]) === iri) return element.attrs[keys[i]]\n    }\n    return undefined\n  }\n\n  isSyntaxAttribute(iri) {\n    return iri === ONTO_RDF_NS + 'about' ||\n      iri === ONTO_RDF_NS + 'ID' ||\n      iri === ONTO_RDF_NS + 'nodeID' ||\n      iri === ONTO_RDF_NS + 'resource' ||\n      iri === ONTO_RDF_NS + 'datatype' ||\n      iri === ONTO_RDF_NS + 'parseType' ||\n      iri === ONTO_RDF_NS + 'li'\n  }\n\n  propertyAttributes(element) {\n    const result = []\n    const keys = Object.keys(element.attrs)\n    for (let i = 0; i < keys.length; i++) {\n      const key = keys[i]\n      if (key === 'xmlns' || key.slice(0, 6) === 'xmlns:') continue\n      const iri = this.attributeIri(element, key)\n      if (!iri) continue\n      if (iri.indexOf(ONTO_XML_NS) === 0) continue\n      if (this.isSyntaxAttribute(iri)) continue\n      result.push({ iri: iri, value: element.attrs[key] })\n    }\n    return result\n  }\n\n  contextFor(element, parent) {\n    let base = parent.base || ''\n    let baseSource = parent.baseSource || 'none'\n    const xmlBase = this.getAttribute(element, ONTO_XML_NS + 'base')\n    if (xmlBase !== undefined) {\n      if (xmlBase === '') {\n        // XML Base: an empty value keeps the base URI of the enclosing scope.\n        base = parent.base || ''\n      } else if (ontoRdfIsAbsoluteIri(xmlBase)) {\n        base = xmlBase\n        baseSource = 'document'\n      } else if (base) {\n        base = resolveIri(base, xmlBase)\n        baseSource = 'document'\n      } else {\n        this.builder.diagnose(\n          'base-unavailable',\n          'warning',\n          'relative xml:base \"' + xmlBase + '\" has no base to resolve against',\n          element.line,\n        )\n        base = ''\n      }\n    }\n    let language = parent.language\n    const xmlLang = this.getAttribute(element, ONTO_XML_NS + 'lang')\n    if (xmlLang !== undefined) language = xmlLang === '' ? undefined : xmlLang.toLowerCase()\n    return { base: base, language: language, baseSource: baseSource }\n  }\n\n  resolveTerm(value, base, line) {\n    return ontoRdfNormalizeIri(value, base, this.builder, line)\n  }\n\n  resolveId(value, base, line) {\n    if (!/^[A-Za-z_][A-Za-z0-9_.-]*$/.test(value)) {\n      this.builder.warn('rdf:ID \"' + value + '\" is not a valid XML name', line)\n    }\n    if (!base) {\n      this.builder.diagnose(\n        'base-unavailable',\n        'warning',\n        'rdf:ID \"' + value + '\" cannot be resolved without a base IRI',\n        line,\n      )\n      return '#' + value\n    }\n    return resolveIri(base, '#' + value)\n  }\n\n  collectXmlPrefixes(root) {\n    const stack = [root]\n    while (stack.length > 0) {\n      const element = stack.pop()\n      const keys = Object.keys(element.attrs)\n      for (let i = 0; i < keys.length; i++) {\n        const key = keys[i]\n        if (key.slice(0, 6) !== 'xmlns:') continue\n        const prefix = key.slice(6)\n        const iri = element.attrs[key]\n        if (prefix && iri) this.builder.prefixes[prefix] = iri\n      }\n      for (let i = element.children.length - 1; i >= 0; i--) {\n        stack.push(element.children[i])\n      }\n    }\n  }\n\n  mapDocument(root) {\n    this.resolveNamespaces(root)\n    this.collectXmlPrefixes(root)\n    const iri = this.elementIri(root)\n    if (!iri) {\n      this.builder.error('cannot resolve the root element name <' + root.qname + '>', root.line)\n      return\n    }\n    const context = this.contextFor(root, {\n      base: this.initialBase,\n      language: undefined,\n      baseSource: this.initialBaseSource,\n    })\n    if (iri === ONTO_RDF_NS + 'RDF') {\n      this.builder.base = context.base || ''\n      this.builder.baseSource = context.baseSource || 'none'\n      for (let i = 0; i < root.children.length; i++) {\n        if (this.builder.truncated) break\n        this.mapNodeElement(root.children[i], context)\n      }\n    } else {\n      this.builder.base = context.base || ''\n      this.builder.baseSource = context.baseSource || 'none'\n      this.mapNodeElement(root, context)\n    }\n  }\n\n  mapNodeElement(element, parentContext) {\n    if (this.builder.truncated) return null\n    const context = this.contextFor(element, parentContext)\n    if (this.depth >= this.builder.maxDepth) {\n      this.noteXmlNestingLimit(element)\n      return null\n    }\n    this.depth++\n    try {\n      return this.mapNodeElementBody(element, context)\n    } finally {\n      this.depth--\n    }\n  }\n\n  noteXmlNestingLimit(element) {\n    this.builder.diagnose(\n      'nesting-limit',\n      'error',\n      'XML nesting depth limit of ' + this.builder.maxDepth +\n        ' reached; the nested branch was skipped',\n      element.line,\n    )\n  }\n\n  mapNodeElementBody(element, context) {\n    const nameIri = this.elementIri(element)\n    if (!nameIri) {\n      this.builder.error('cannot resolve the element name <' + element.qname + '>', element.line)\n      return null\n    }\n    if (nameIri === ONTO_RDF_NS + 'RDF') {\n      this.builder.base = context.base || ''\n      this.builder.baseSource = context.baseSource || 'none'\n      for (let i = 0; i < element.children.length; i++) {\n        if (this.builder.truncated) break\n        this.mapNodeElement(element.children[i], context)\n      }\n      return null\n    }\n\n    const about = this.getAttribute(element, ONTO_RDF_NS + 'about')\n    const id = this.getAttribute(element, ONTO_RDF_NS + 'ID')\n    const nodeId = this.getAttribute(element, ONTO_RDF_NS + 'nodeID')\n    let subject\n    if (about !== undefined) {\n      subject = this.resolveTerm(about, context.base, element.line)\n    } else if (id !== undefined) {\n      subject = this.resolveId(id, context.base, element.line)\n    } else if (nodeId !== undefined) {\n      subject = this.builder.useBlank(nodeId)\n    } else {\n      subject = this.builder.freshBlank()\n    }\n\n    if (nameIri !== ONTO_RDF_NS + 'Description') {\n      this.builder.add(subject, ONTO_RDF_TYPE, nameIri, 'iri')\n    }\n\n    this.addAttributeTriples(element, subject, context)\n    this.mapChildProperties(element, subject, context)\n    return subject\n  }\n\n  addAttributeTriples(element, subject, context) {\n    const attributes = this.propertyAttributes(element)\n    for (let i = 0; i < attributes.length; i++) {\n      const attribute = attributes[i]\n      if (attribute.iri === ONTO_RDF_TYPE) {\n        this.builder.add(\n          subject,\n          ONTO_RDF_TYPE,\n          this.resolveTerm(attribute.value, context.base, element.line),\n          'iri',\n        )\n      } else {\n        this.builder.add(subject, attribute.iri, attribute.value, 'literal', undefined, context.language)\n      }\n    }\n  }\n\n  mapChildProperties(element, subject, context) {\n    let liIndex = 0\n    for (let i = 0; i < element.children.length; i++) {\n      if (this.builder.truncated) break\n      const child = element.children[i]\n      let predicate = this.elementIri(child)\n      if (!predicate) {\n        this.builder.error('cannot resolve the property element <' + child.qname + '>', child.line)\n        continue\n      }\n      if (predicate === ONTO_RDF_NS + 'li') {\n        liIndex++\n        predicate = ONTO_RDF_NS + '_' + liIndex\n      }\n      this.mapPropertyElement(child, subject, predicate, context)\n    }\n  }\n\n  mapPropertyElement(element, subject, predicate, parentContext) {\n    if (this.builder.truncated) return\n    const context = this.contextFor(element, parentContext)\n    if (this.depth >= this.builder.maxDepth) {\n      this.noteXmlNestingLimit(element)\n      return\n    }\n    this.depth++\n    try {\n      this.mapPropertyElementBody(element, subject, predicate, context)\n    } finally {\n      this.depth--\n    }\n  }\n\n  mapPropertyElementBody(element, subject, predicate, context) {\n    const parseType = this.getAttribute(element, ONTO_RDF_NS + 'parseType')\n    const resource = this.getAttribute(element, ONTO_RDF_NS + 'resource')\n    const nodeId = this.getAttribute(element, ONTO_RDF_NS + 'nodeID')\n    const datatype = this.getAttribute(element, ONTO_RDF_NS + 'datatype')\n    const id = this.getAttribute(element, ONTO_RDF_NS + 'ID')\n\n    if (id !== undefined && !this.warnedReification) {\n      this.warnedReification = true\n      this.builder.diagnose(\n        'rdfxml-reification-ignored',\n        'warning',\n        'rdf:ID reification is not implemented; the statement itself was kept',\n        element.line,\n      )\n    }\n\n    if (parseType === 'Resource') {\n      const blank = this.builder.freshBlank()\n      this.builder.add(subject, predicate, blank, 'blank')\n      this.addAttributeTriples(element, blank, context)\n      this.mapChildProperties(element, blank, context)\n      return\n    }\n\n    if (parseType === 'Collection') {\n      const head = this.mapCollection(element.children, context)\n      this.builder.add(subject, predicate, head, head === ONTO_RDF_NIL ? 'iri' : 'blank')\n      return\n    }\n\n    if (parseType === 'Literal') {\n      const raw = element.closeStart >= 0 ? this.source.slice(element.openEnd, element.closeStart) : ''\n      this.builder.add(subject, predicate, raw, 'literal', ONTO_RDF_XML_LITERAL)\n      return\n    }\n\n    if (parseType !== undefined && parseType !== '') {\n      this.builder.diagnose(\n        'rdfxml-parsetype-unsupported',\n        'warning',\n        'unsupported rdf:parseType=\"' + parseType + '\"; treated as a plain property',\n        element.line,\n      )\n    }\n\n    if (resource !== undefined) {\n      if (element.children.length > 0) {\n        this.builder.warn('rdf:resource with nested elements is not valid; nested elements were ignored', element.line)\n      }\n      this.builder.add(subject, predicate, this.resolveTerm(resource, context.base, element.line), 'iri')\n      return\n    }\n\n    if (nodeId !== undefined) {\n      this.builder.add(subject, predicate, this.builder.useBlank(nodeId), 'blank')\n      return\n    }\n\n    if (element.children.length > 0) {\n      const childSubject = this.mapNodeElement(element.children[0], context)\n      if (childSubject) {\n        this.builder.add(\n          subject,\n          predicate,\n          childSubject,\n          childSubject.slice(0, 2) === '_:' ? 'blank' : 'iri',\n        )\n      }\n      if (element.children.length > 1 && this.warnedMultipleObjectsSubjects[subject] !== true) {\n        this.warnedMultipleObjectsSubjects[subject] = true\n        this.builder.diagnose(\n          'rdfxml-multiple-objects',\n          'warning',\n          'property element <' + element.qname + '> has multiple objects; only the first was used',\n          element.line,\n        )\n      }\n      return\n    }\n\n    let value = element.text\n    const attributes = this.propertyAttributes(element)\n    if (value === '' && attributes.length > 0) {\n      const blank = this.builder.freshBlank()\n      this.builder.add(subject, predicate, blank, 'blank')\n      for (let i = 0; i < attributes.length; i++) {\n        this.builder.add(\n          blank,\n          attributes[i].iri,\n          attributes[i].value,\n          'literal',\n          undefined,\n          context.language,\n        )\n      }\n      return\n    }\n\n    if (datatype !== undefined) {\n      this.builder.add(\n        subject,\n        predicate,\n        value,\n        'literal',\n        this.resolveTerm(datatype, context.base, element.line),\n      )\n    } else {\n      this.builder.add(subject, predicate, value, 'literal', undefined, context.language)\n    }\n  }\n\n  mapCollection(children, context) {\n    if (children.length === 0) return ONTO_RDF_NIL\n    const head = this.builder.freshBlank()\n    const items = []\n    for (let i = 0; i < children.length; i++) {\n      if (this.builder.truncated) break\n      const item = this.mapNodeElement(children[i], context)\n      if (item) items.push(item)\n    }\n    if (items.length === 0) return ONTO_RDF_NIL\n    let current = head\n    for (let i = 0; i < items.length; i++) {\n      this.builder.add(\n        current,\n        ONTO_RDF_FIRST,\n        items[i],\n        items[i].slice(0, 2) === '_:' ? 'blank' : 'iri',\n      )\n      if (i < items.length - 1) {\n        const next = this.builder.freshBlank()\n        this.builder.add(current, ONTO_RDF_REST, next, 'blank')\n        current = next\n      } else {\n        this.builder.add(current, ONTO_RDF_REST, ONTO_RDF_NIL, 'iri')\n      }\n    }\n    return head\n  }\n}\n\n/* ------------------------------------------------------------------ */\n/* JSON-LD (practical subset)                                         */\n/* ------------------------------------------------------------------ */\n\nclass OntoJsonLdParser {\n  constructor(text, options) {\n    const opts = options || {}\n    this.builder = new OntoRdfBuilder('jsonld', ontoRdfNormalizeText(text), opts)\n    this.source = this.builder.text\n    const initial = ontoRdfInitialBase(opts)\n    this.initialBase = initial.base\n    this.initialBaseSource = initial.source\n    this.builder.base = initial.base\n    this.builder.baseSource = initial.source\n    this.depth = 0\n    this.warnedContainers = Object.create(null)\n    this.appliedContextNodes = new WeakSet()\n  }\n\n  parse() {\n    let data\n    try {\n      data = JSON.parse(this.source)\n    } catch (error) {\n      this.builder.error('invalid JSON: ' + (error && error.message ? error.message : String(error)))\n      return this.builder.finish()\n    }\n    try {\n      const context = this.newContext(this.initialBase, this.initialBaseSource)\n      this.processTop(data, context)\n    } catch (error) {\n      this.builder.error(\n        'JSON-LD parser failed: ' + (error && error.message ? error.message : String(error)),\n      )\n    }\n    return this.builder.finish()\n  }\n\n  newContext(base, baseSource) {\n    return {\n      terms: Object.create(null),\n      vocab: '',\n      base: base || '',\n      baseSource: baseSource || 'none',\n      language: '',\n    }\n  }\n\n  withContext(context, raw) {\n    const next = {\n      terms: Object.assign(Object.create(null), context.terms),\n      vocab: context.vocab,\n      base: context.base,\n      baseSource: context.baseSource,\n      language: context.language,\n    }\n    this.applyContext(next, raw)\n    return next\n  }\n\n  applyContext(context, raw) {\n    if (raw === null) {\n      context.terms = Object.create(null)\n      context.vocab = ''\n      context.language = ''\n      context.base = this.initialBase\n      context.baseSource = this.initialBaseSource\n      this.syncPrefixes(context)\n      return\n    }\n    const items = Array.isArray(raw) ? raw : [raw]\n    for (let i = 0; i < items.length; i++) {\n      const item = items[i]\n      if (typeof item === 'string') {\n        this.builder.diagnose(\n          'jsonld-remote-context-skipped',\n          'warning',\n          'remote @context \"' + item + '\" was not fetched and was skipped',\n        )\n        continue\n      }\n      if (!item || typeof item !== 'object' || Array.isArray(item)) {\n        this.builder.warn('unsupported @context entry was skipped')\n        continue\n      }\n      if (ontoRdfHas(item, '@base')) {\n        const base = item['@base']\n        if (base === null) {\n          context.base = ''\n          context.baseSource = 'none'\n        } else if (typeof base === 'string') {\n          if (ontoRdfIsAbsoluteIri(base)) {\n            context.base = base\n            context.baseSource = 'document'\n          } else if (context.base) {\n            context.base = resolveIri(context.base, base)\n            context.baseSource = 'document'\n          } else {\n            this.builder.diagnose(\n              'base-unavailable',\n              'warning',\n              'relative @base \"' + base + '\" has no base to resolve against',\n            )\n            context.base = ''\n            context.baseSource = 'none'\n          }\n        }\n      }\n      if (ontoRdfHas(item, '@vocab')) {\n        const vocab = item['@vocab']\n        if (vocab === null) context.vocab = ''\n        else if (typeof vocab === 'string') {\n          context.vocab = this.expandIri(vocab, context, { vocab: false, document: true }) || ''\n        }\n      }\n      if (ontoRdfHas(item, '@language')) {\n        const language = item['@language']\n        context.language = typeof language === 'string' ? language.toLowerCase() : ''\n      }\n      const keys = Object.keys(item)\n      for (let k = 0; k < keys.length; k++) {\n        const key = keys[k]\n        if (key === '@base' || key === '@vocab' || key === '@language' || key === '@version') continue\n        if (key.charAt(0) === '@') {\n          if (key !== '@context') this.builder.warn('unsupported context keyword \"' + key + '\" was skipped')\n          continue\n        }\n        this.defineTerm(context, key, item[key])\n      }\n    }\n    this.syncPrefixes(context)\n  }\n\n  syncPrefixes(context) {\n    const terms = Object.keys(context.terms)\n    for (let i = 0; i < terms.length; i++) {\n      const term = terms[i]\n      const definition = context.terms[term]\n      if (!definition) continue\n      const id = definition.id\n      if (typeof id !== 'string' || id === '' || id.charAt(0) === '@') continue\n      if (definition.prefix || /[/#]$/.test(id)) this.builder.prefixes[term] = id\n    }\n  }\n\n  defineTerm(context, term, value) {\n    if (term.indexOf(':') >= 0) {\n      this.builder.warn('term \"' + term + '\" contains a colon and was ignored')\n      return\n    }\n    if (value === null) {\n      context.terms[term] = { id: null, type: null, language: undefined, container: null, prefix: false }\n      return\n    }\n    if (typeof value === 'string') {\n      const id = this.expandIri(value, context, { vocab: true, document: true })\n      context.terms[term] = {\n        id: id,\n        type: null,\n        language: undefined,\n        container: null,\n        prefix: typeof id === 'string' && /[/#]$/.test(id),\n      }\n      return\n    }\n    if (typeof value !== 'object' || Array.isArray(value)) {\n      this.builder.warn('unsupported definition for term \"' + term + '\" was skipped')\n      return\n    }\n    const definition = {\n      id: null,\n      type: null,\n      language: undefined,\n      container: null,\n      prefix: false,\n    }\n    if (ontoRdfHas(value, '@reverse')) {\n      definition.id = this.expandIri(value['@reverse'], context, { vocab: true, document: true })\n      this.builder.diagnose(\n        'jsonld-reverse-term-forward',\n        'warning',\n        '@reverse term definitions are treated as forward properties',\n      )\n    } else if (ontoRdfHas(value, '@id')) {\n      const id = value['@id']\n      if (id === null) definition.id = null\n      else if (typeof id === 'string') {\n        definition.id = this.expandIri(id, context, { vocab: true, document: true })\n      }\n    } else {\n      definition.id = this.expandIri(term, context, { vocab: true, document: false })\n    }\n    if (ontoRdfHas(value, '@type')) {\n      const type = value['@type']\n      if (typeof type === 'string') {\n        if (type === '@id' || type === '@vocab' || type === '@json') definition.type = type\n        else definition.type = this.expandIri(type, context, { vocab: true, document: true })\n      }\n    }\n    if (ontoRdfHas(value, '@language')) {\n      const language = value['@language']\n      definition.language = typeof language === 'string' ? language.toLowerCase() : null\n    }\n    if (ontoRdfHas(value, '@container')) {\n      const container = value['@container']\n      definition.container = Array.isArray(container) ? container.slice() : container\n      this.noteContainer(container, term)\n    }\n    if (ontoRdfHas(value, '@prefix')) definition.prefix = value['@prefix'] === true\n    if (ontoRdfHas(value, '@context')) this.builder.warn('nested @context in term \"' + term + '\" was skipped')\n    if (typeof definition.id === 'string' && /[/#]$/.test(definition.id)) definition.prefix = true\n    context.terms[term] = definition\n  }\n\n  noteContainer(container, term) {\n    const list = Array.isArray(container) ? container : [container]\n    for (let i = 0; i < list.length; i++) {\n      const name = list[i]\n      if (name === '@set' || name === '@list' || name === '@language' || name === '@index') continue\n      const key = term + '|' + name\n      if (this.warnedContainers[key]) continue\n      this.warnedContainers[key] = true\n      this.builder.diagnose(\n        'jsonld-container-unsupported',\n        'warning',\n        '@container \"' + name + '\" on term \"' + term + '\" is not supported',\n      )\n    }\n  }\n\n  expandIri(value, context, options) {\n    if (typeof value !== 'string') return null\n    if (value === '') return options.document ? context.base : null\n    if (value.charAt(0) === '@') return value\n    if (value.slice(0, 2) === '_:') return value\n    if (ontoRdfHas(context.terms, value)) {\n      const definition = context.terms[value]\n      return definition && typeof definition.id === 'string' ? definition.id : null\n    }\n    const colon = value.indexOf(':')\n    if (colon > 0) {\n      const prefix = value.slice(0, colon)\n      const suffix = value.slice(colon + 1)\n      if (ontoRdfHas(context.terms, prefix)) {\n        const definition = context.terms[prefix]\n        if (definition && typeof definition.id === 'string') return definition.id + suffix\n      }\n      return value\n    }\n    if (options.vocab && context.vocab) return context.vocab + value\n    if (options.document && context.base) return resolveIri(context.base, value)\n    return null\n  }\n\n  normalizeIri(value, context) {\n    if (typeof value !== 'string' || value === '') return value\n    if (value.slice(0, 2) === '_:') {\n      this.builder.useBlank(value)\n      return value\n    }\n    if (ontoRdfIsAbsoluteIri(value)) return value\n    if (context.base) return resolveIri(context.base, value)\n    this.builder.diagnose(\n      'base-unavailable',\n      'warning',\n      'relative IRI \"' + value + '\" could not be resolved (no base)',\n    )\n    return value\n  }\n\n  literalLanguage(definition, context) {\n    if (definition && definition.language !== undefined) {\n      return definition.language === null ? undefined : definition.language\n    }\n    return context.language || undefined\n  }\n\n  processTop(data, context) {\n    if (Array.isArray(data)) {\n      for (let i = 0; i < data.length; i++) {\n        if (this.builder.truncated) break\n        this.processNode(data[i], context)\n      }\n      return\n    }\n    if (data === null || typeof data !== 'object') {\n      this.builder.error('JSON-LD document must be an object or an array')\n      return\n    }\n    let local = context\n    if (ontoRdfHas(data, '@context')) {\n      local = this.withContext(context, data['@context'])\n      this.appliedContextNodes.add(data)\n    }\n    this.builder.base = local.base || ''\n    this.builder.baseSource = local.baseSource || 'none'\n    // processNode handles a top-level @graph object, including its sibling keys.\n    this.processNode(data, local)\n  }\n\n  processNode(node, inheritedContext) {\n    if (Array.isArray(node)) {\n      if (this.depth >= this.builder.maxDepth) {\n        this.noteJsonLdNestingLimit()\n        return null\n      }\n      this.depth++\n      try {\n        for (let i = 0; i < node.length; i++) {\n          if (this.builder.truncated) break\n          this.processNode(node[i], inheritedContext)\n        }\n      } finally {\n        this.depth--\n      }\n      return null\n    }\n    if (node === null || typeof node !== 'object') return null\n    let context = inheritedContext\n    if (ontoRdfHas(node, '@context') && !this.appliedContextNodes.has(node)) {\n      context = this.withContext(inheritedContext, node['@context'])\n      this.appliedContextNodes.add(node)\n    }\n    if (ontoRdfHas(node, '@value') || ontoRdfHas(node, '@list') || ontoRdfHas(node, '@set')) {\n      this.builder.diagnose(\n        'jsonld-value-object-dropped',\n        'warning',\n        'value object used where a node was expected was ignored',\n      )\n      return null\n    }\n    if (this.depth >= this.builder.maxDepth) {\n      this.noteJsonLdNestingLimit()\n      return null\n    }\n    this.depth++\n    try {\n      return this.processNodeBody(node, context)\n    } finally {\n      this.depth--\n    }\n  }\n\n  noteJsonLdNestingLimit() {\n    this.builder.diagnose(\n      'nesting-limit',\n      'error',\n      'JSON-LD nesting depth limit of ' + this.builder.maxDepth +\n        ' reached; the nested branch was skipped',\n    )\n  }\n\n  processNodeBody(node, context) {\n    const graphWithoutId = ontoRdfHas(node, '@graph') && !ontoRdfHas(node, '@id')\n    if (graphWithoutId) {\n      const graph = node['@graph']\n      const items = Array.isArray(graph) ? graph : [graph]\n      for (let i = 0; i < items.length; i++) {\n        if (this.builder.truncated) break\n        this.processNode(items[i], context)\n      }\n    }\n\n    let subject\n    if (ontoRdfHas(node, '@id')) {\n      const id = node['@id']\n      if (typeof id !== 'string') {\n        this.builder.warn('non-string @id was replaced by a blank node')\n        subject = this.builder.freshBlank()\n      } else {\n        const expanded = this.expandIri(id, context, { vocab: false, document: true })\n        subject = this.normalizeIri(expanded || id, context)\n        if (typeof subject === 'string' && subject.charAt(0) === '@') {\n          this.builder.warn('keyword \"' + subject + '\" cannot be used as @id')\n          subject = this.builder.freshBlank()\n        }\n      }\n    } else {\n      subject = this.builder.freshBlank()\n    }\n\n    if (ontoRdfHas(node, '@type')) {\n      const types = Array.isArray(node['@type']) ? node['@type'] : [node['@type']]\n      for (let i = 0; i < types.length; i++) {\n        if (this.builder.truncated) break\n        const type = types[i]\n        if (typeof type !== 'string') continue\n        const expanded = this.expandIri(type, context, { vocab: true, document: true })\n        if (!expanded || expanded.charAt(0) === '@') {\n          this.builder.warn('could not expand @type \"' + type + '\"')\n          continue\n        }\n        const iri = this.normalizeIri(expanded, context)\n        this.builder.add(subject, ONTO_RDF_TYPE, iri, iri.slice(0, 2) === '_:' ? 'blank' : 'iri')\n      }\n    }\n\n    const keys = Object.keys(node)\n    for (let i = 0; i < keys.length; i++) {\n      if (this.builder.truncated) break\n      const key = keys[i]\n      if (key === '@context' || key === '@id' || key === '@type' || key === '@index') continue\n      if (key === '@graph') {\n        if (graphWithoutId) continue\n        const graph = node[key]\n        const items = Array.isArray(graph) ? graph : [graph]\n        for (let g = 0; g < items.length; g++) {\n          if (this.builder.truncated) break\n          this.processNode(items[g], context)\n        }\n        continue\n      }\n      if (key === '@reverse') {\n        this.builder.diagnose(\n          'jsonld-node-reverse-ignored',\n          'warning',\n          '@reverse is not supported and was skipped',\n        )\n        continue\n      }\n      if (key === '@included' || key === '@nest') {\n        this.builder.diagnose(\n          'jsonld-included-nest-ignored',\n          'warning',\n          '\"' + key + '\" is not supported and was skipped',\n        )\n        continue\n      }\n      if (key === '@value' || key === '@list' || key === '@set' || key === '@language') continue\n\n      const definition = ontoRdfHas(context.terms, key) ? context.terms[key] : null\n      const predicate = this.expandIri(key, context, { vocab: true, document: false })\n      if (!predicate || predicate.charAt(0) === '@') {\n        this.builder.warn('term \"' + key + '\" has no IRI mapping and was skipped')\n        continue\n      }\n      this.addValue(subject, predicate, node[key], context, definition)\n    }\n    return subject\n  }\n\n  addValue(subject, predicate, value, context, definition) {\n    if (this.builder.truncated) return\n    if (value === null || value === undefined) return\n    const container = definition ? definition.container : null\n    const containers = Array.isArray(container) ? container : (container ? [container] : [])\n\n    // A term-level `@container: \"@list\"` must become an RDF list, so this has to\n    // be decided before arrays are flattened into separate triples.\n    if (containers.indexOf('@list') !== -1) {\n      const items = Array.isArray(value) ? value : [value]\n      const head = this.buildList(items, context, definition)\n      this.builder.add(subject, predicate, head, this.kindOf(head))\n      return\n    }\n\n    if (Array.isArray(value)) {\n      if (this.depth >= this.builder.maxDepth) {\n        this.noteJsonLdNestingLimit()\n        return\n      }\n      this.depth++\n      try {\n        for (let i = 0; i < value.length; i++) {\n          if (this.builder.truncated) break\n          this.addValue(subject, predicate, value[i], context, definition)\n        }\n      } finally {\n        this.depth--\n      }\n      return\n    }\n\n    if (containers.indexOf('@language') !== -1 && value && typeof value === 'object' && !Array.isArray(value) &&\n      !ontoRdfHas(value, '@value') && !ontoRdfHas(value, '@id')) {\n      const languages = Object.keys(value)\n      for (let i = 0; i < languages.length; i++) {\n        const language = languages[i] === '@none' ? undefined : languages[i].toLowerCase()\n        const entries = Array.isArray(value[languages[i]]) ? value[languages[i]] : [value[languages[i]]]\n        for (let e = 0; e < entries.length; e++) {\n          const entry = entries[e]\n          if (entry === null || entry === undefined || typeof entry === 'object') continue\n          this.builder.add(subject, predicate, String(entry), 'literal', undefined, language)\n        }\n      }\n      return\n    }\n\n    if (containers.indexOf('@index') !== -1 && value && typeof value === 'object' && !Array.isArray(value) &&\n      !ontoRdfHas(value, '@value') && !ontoRdfHas(value, '@id')) {\n      const indexes = Object.keys(value)\n      for (let i = 0; i < indexes.length; i++) {\n        this.addValue(subject, predicate, value[indexes[i]], context, definition)\n      }\n      return\n    }\n\n    if (value && typeof value === 'object') {\n      if (ontoRdfHas(value, '@list')) {\n        const head = this.buildList(value['@list'], context, definition)\n        this.builder.add(subject, predicate, head, this.kindOf(head))\n        return\n      }\n      if (ontoRdfHas(value, '@set')) {\n        this.addValue(subject, predicate, value['@set'], context, definition)\n        return\n      }\n      if (ontoRdfHas(value, '@value')) {\n        const descriptor = this.literalDescriptor(value, context, definition)\n        if (descriptor) {\n          this.builder.add(subject, predicate, descriptor.term, 'literal', descriptor.dt, descriptor.lang)\n        }\n        return\n      }\n      const child = this.processNode(value, context)\n      if (child) this.builder.add(subject, predicate, child, this.kindOf(child))\n      return\n    }\n\n    if (definition && (definition.type === '@id' || definition.type === '@vocab') && typeof value === 'string') {\n      const expanded = this.expandIri(value, context, {\n        vocab: definition.type === '@vocab',\n        document: definition.type === '@id',\n      })\n      const iri = this.normalizeIri(expanded || value, context)\n      this.builder.add(subject, predicate, iri, this.kindOf(iri))\n      return\n    }\n\n    if (definition && definition.type && definition.type !== '@id' && definition.type !== '@json' &&\n      definition.type !== '@vocab') {\n      this.builder.add(subject, predicate, this.primitiveLexical(value), 'literal', definition.type)\n      return\n    }\n\n    if (typeof value === 'string') {\n      this.builder.add(\n        subject,\n        predicate,\n        value,\n        'literal',\n        undefined,\n        this.literalLanguage(definition, context),\n      )\n      return\n    }\n    if (typeof value === 'boolean') {\n      this.builder.add(subject, predicate, value ? 'true' : 'false', 'literal', ONTO_XSD_BOOLEAN)\n      return\n    }\n    if (typeof value === 'number') {\n      this.builder.add(\n        subject,\n        predicate,\n        String(value),\n        'literal',\n        Number.isInteger(value) ? ONTO_XSD_INTEGER : ONTO_XSD_DOUBLE,\n      )\n    }\n  }\n\n  primitiveLexical(value) {\n    if (typeof value === 'boolean') return value ? 'true' : 'false'\n    if (value === null || value === undefined) return ''\n    return String(value)\n  }\n\n  literalDescriptor(valueObject, context, definition) {\n    const raw = valueObject['@value']\n    if (raw === null || raw === undefined) return null\n    let language\n    let datatype\n    if (ontoRdfHas(valueObject, '@type')) {\n      const type = valueObject['@type']\n      if (typeof type === 'string') {\n        if (type === '@json') {\n          return { term: JSON.stringify(raw), dt: ONTO_RDF_JSON, lang: undefined }\n        }\n        const expanded = this.expandIri(type, context, { vocab: true, document: true })\n        datatype = this.normalizeIri(expanded || type, context)\n      }\n    } else if (ontoRdfHas(valueObject, '@language')) {\n      const explicit = valueObject['@language']\n      if (typeof explicit === 'string') language = explicit.toLowerCase()\n    } else if (typeof raw === 'string') {\n      language = this.literalLanguage(definition, context)\n    } else if (definition && definition.type && definition.type !== '@id' &&\n      definition.type !== '@json' && definition.type !== '@vocab') {\n      datatype = definition.type\n    }\n\n    let term\n    if (typeof raw === 'string') {\n      term = raw\n    } else if (typeof raw === 'number') {\n      term = String(raw)\n      if (!datatype) datatype = Number.isInteger(raw) ? ONTO_XSD_INTEGER : ONTO_XSD_DOUBLE\n    } else if (typeof raw === 'boolean') {\n      term = raw ? 'true' : 'false'\n      if (!datatype) datatype = ONTO_XSD_BOOLEAN\n    } else {\n      term = JSON.stringify(raw)\n      if (!datatype) datatype = ONTO_RDF_JSON\n    }\n    return { term: term, dt: datatype, lang: language }\n  }\n\n  buildList(items, context, definition) {\n    if (!Array.isArray(items) || items.length === 0) return ONTO_RDF_NIL\n    if (this.depth >= this.builder.maxDepth) {\n      this.noteJsonLdNestingLimit()\n      return ONTO_RDF_NIL\n    }\n    this.depth++\n    try {\n      const head = this.builder.freshBlank()\n      let current = head\n      for (let i = 0; i < items.length; i++) {\n        if (this.builder.truncated) break\n        const descriptor = this.itemDescriptor(items[i], context, definition)\n        if (descriptor) {\n          this.builder.add(current, ONTO_RDF_FIRST, descriptor.term, descriptor.kind, descriptor.dt, descriptor.lang)\n        }\n        if (i < items.length - 1) {\n          const next = this.builder.freshBlank()\n          this.builder.add(current, ONTO_RDF_REST, next, 'blank')\n          current = next\n        } else {\n          this.builder.add(current, ONTO_RDF_REST, ONTO_RDF_NIL, 'iri')\n        }\n      }\n      return head\n    } finally {\n      this.depth--\n    }\n  }\n\n  itemDescriptor(item, context, definition) {\n    if (item === null || item === undefined) return null\n    if (typeof item === 'object') {\n      if (ontoRdfHas(item, '@value')) {\n        const descriptor = this.literalDescriptor(item, context, definition)\n        return descriptor ? { term: descriptor.term, kind: 'literal', dt: descriptor.dt, lang: descriptor.lang } : null\n      }\n      if (ontoRdfHas(item, '@list')) {\n        const head = this.buildList(item['@list'], context, definition)\n        return { term: head, kind: this.kindOf(head) }\n      }\n      const child = this.processNode(item, context)\n      return child ? { term: child, kind: this.kindOf(child) } : null\n    }\n    if (typeof item === 'string') {\n      return { term: item, kind: 'literal', lang: this.literalLanguage(definition, context) }\n    }\n    if (typeof item === 'boolean') {\n      return { term: item ? 'true' : 'false', kind: 'literal', dt: ONTO_XSD_BOOLEAN }\n    }\n    if (typeof item === 'number') {\n      return {\n        term: String(item),\n        kind: 'literal',\n        dt: Number.isInteger(item) ? ONTO_XSD_INTEGER : ONTO_XSD_DOUBLE,\n      }\n    }\n    return null\n  }\n\n  kindOf(term) {\n    return typeof term === 'string' && term.slice(0, 2) === '_:' ? 'blank' : 'iri'\n  }\n}\n\n/* ------------------------------------------------------------------ */\n/* Public parsers                                                     */\n/* ------------------------------------------------------------------ */\n\n/** Parse Turtle (also used for N3 and TriG, whose graph labels are ignored). */\nfunction parseTurtle(text, options) {\n  return new OntoTurtleParser(text, options).parse()\n}\n\n/** Parse N-Triples (N-Quads graph terms are ignored). */\nfunction parseNTriples(text, options) {\n  return new OntoNTriplesParser(text, options).parse()\n}\n\n/** Parse RDF/XML. */\nfunction parseRdfXml(text, options) {\n  return new OntoRdfXmlParser(text, options).parse()\n}\n\n/** Parse a JSON-LD document (practical 1.1 expansion subset). */\nfunction parseJsonLd(text, options) {\n  return new OntoJsonLdParser(text, options).parse()\n}\n\n/** Detect the RDF serialization from a file name and/or the document text. */\nfunction detectFormat(text, fileName) {\n  const source = ontoRdfNormalizeText(text)\n  const extension = ontoRdfFileExtension(fileName)\n  if (extension === 'ttl' || extension === 'turtle' || extension === 'n3' || extension === 'trig') return 'turtle'\n  if (extension === 'nt' || extension === 'nq') return 'ntriples'\n  if (extension === 'jsonld') return 'jsonld'\n  if (extension === 'rdf' || extension === 'owl' || extension === 'xml') return 'rdfxml'\n\n  const start = ontoRdfSkipLeadingSpace(source)\n  const first = source.charAt(start)\n  if (first === '{' || first === '[') return 'jsonld'\n  const head = source.slice(start, start + 4096).toLowerCase()\n  if (head.slice(0, 5) === '<?xml' || head.indexOf('<rdf:') >= 0) return 'rdfxml'\n  if (/<rdf:RDF/i.test(source)) return 'rdfxml'\n  if (source.indexOf('@prefix') >= 0) return 'turtle'\n  if (/(^|[\\r\\n])\\s*(?:PREFIX|BASE)\\s/i.test(source)) return 'turtle'\n  if (extension === 'ttl' || extension === 'turtle') return 'turtle'\n  return 'ntriples'\n}\n\nfunction ontoRdfSkipLeadingSpace(source) {\n  let index = 0\n  if (source.charCodeAt(0) === 0xfeff) index = 1\n  while (index < source.length && ontoRdfIsWhitespace(source.charAt(index))) index++\n  return index\n}\n\nfunction ontoRdfNormalizeFormat(value) {\n  if (typeof value !== 'string') return null\n  const format = value.trim().toLowerCase()\n  if (format === 'ttl' || format === 'turtle' || format === 'n3' || format === 'trig') return 'turtle'\n  if (format === 'nt' || format === 'ntriples' || format === 'n-triples' ||\n    format === 'nq' || format === 'nquads' || format === 'n-quads') return 'ntriples'\n  if (format === 'rdf' || format === 'rdfxml' || format === 'rdf/xml' ||\n    format === 'xml' || format === 'owl') return 'rdfxml'\n  if (format === 'jsonld' || format === 'json-ld' || format === 'json') return 'jsonld'\n  return null\n}\n\nfunction ontoRdfEmptyDocument(format, text, options) {\n  return new OntoRdfBuilder(format, text, options).finish()\n}\n\n/**\n * Parse any supported serialization. Never throws.\n * options: {\n *   fileName?: string,          // display name, used for format detection only\n *   resourceAddress?: string,   // real resource address, used for the base IRI\n *   format?: string,\n *   maxTriples?: number,\n *   maxLiteralLength?: number,\n *   maxDepth?: number,\n *   maxDiagnostics?: number\n * }\n */\nfunction parseOntology(text, options) {\n  const opts = options || {}\n  if (typeof text !== 'string') {\n    const result = ontoRdfEmptyDocument('unknown', '', opts)\n    result.errors.push('input is not a string')\n    return result\n  }\n  const parserOptions = {\n    fileName: opts.fileName,\n    resourceAddress: opts.resourceAddress,\n    maxTriples: opts.maxTriples,\n    maxLiteralLength: opts.maxLiteralLength,\n    maxDepth: opts.maxDepth,\n    maxDiagnostics: opts.maxDiagnostics,\n  }\n  let format\n  const declared = typeof opts.format === 'string' && opts.format.trim() !== ''\n  if (declared) {\n    format = ontoRdfNormalizeFormat(opts.format)\n    if (!format) {\n      const result = ontoRdfEmptyDocument('unknown', text, parserOptions)\n      result.errors.push('unsupported RDF format: ' + opts.format)\n      return result\n    }\n  } else {\n    format = detectFormat(text, opts.fileName)\n  }\n  try {\n    if (format === 'turtle') return parseTurtle(text, parserOptions)\n    if (format === 'ntriples') return parseNTriples(text, parserOptions)\n    if (format === 'rdfxml') return parseRdfXml(text, parserOptions)\n    if (format === 'jsonld') return parseJsonLd(text, parserOptions)\n  } catch (error) {\n    const result = ontoRdfEmptyDocument('unknown', text, parserOptions)\n    result.errors.push(\n      'parser crashed: ' + (error && error.message ? error.message : String(error)),\n    )\n    return result\n  }\n  const result = ontoRdfEmptyDocument('unknown', text, parserOptions)\n  result.errors.push('unsupported RDF format: ' + String(format))\n  return result\n}\n\n// ==== src/graph-model.js ====\n/**\n * Graph model + deterministic layout for the ontology viewer.\n *\n * This module is pure ECMAScript on purpose: it is concatenated into the\n * browser Client bundle (see build/build.mjs) and also imported directly by\n * the Node test runner. No DOM, no React, no Node globals, no imports.\n *\n * The input contract is the parsed-RDF shape produced by src/rdf-parse.js:\n *   { prefixes, base, triples: [{ s, p, o, oKind, lang?, dt? }], stats, warnings }\n *\n * Export surface (additive; the first seven keep their V1.0.0 signatures and\n * defaults, see design §10):\n *   buildGraph, shortenIri, localName, matchNodes, subgraph, neighborhood,\n *   layoutGraph,\n *   filterGraph, applyEdgeBudget, exploreNeighborhood, connectionGroups,\n *   createLayoutTask, budgetRecord.\n *\n * Data layers (design §1.5) that callers must state when they read them:\n *   L1 fullGraph      -- buildGraph output, read by search/details/exploration/totals\n *   L2 filteredGraph  -- filterGraph projection, read by exploration start\n *   L3 exploredGraph  -- exploreNeighborhood output, read for exploration counts\n *   L4 drawnGraph     -- applyEdgeBudget projection, read ONLY by rendering\n */\n\nconst RDF_NS = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#'\nconst RDFS_NS = 'http://www.w3.org/2000/01/rdf-schema#'\nconst OWL_NS = 'http://www.w3.org/2002/07/owl#'\nconst SKOS_NS = 'http://www.w3.org/2004/02/skos/core#'\nconst FOAF_NS = 'http://xmlns.com/foaf/0.1/'\nconst DCTERMS_NS = 'http://purl.org/dc/terms/'\nconst XSD_NS = 'http://www.w3.org/2001/XMLSchema#'\n\nconst RDF_TYPE = RDF_NS + 'type'\nconst RDF_FIRST = RDF_NS + 'first'\nconst RDF_REST = RDF_NS + 'rest'\nconst RDF_NIL = RDF_NS + 'nil'\nconst RDF_PROPERTY = RDF_NS + 'Property'\nconst RDFS_LABEL = RDFS_NS + 'label'\nconst RDFS_COMMENT = RDFS_NS + 'comment'\nconst RDFS_SUBCLASSOF = RDFS_NS + 'subClassOf'\nconst RDFS_CLASS = RDFS_NS + 'Class'\nconst OWL_CLASS = OWL_NS + 'Class'\nconst OWL_OBJECT_PROPERTY = OWL_NS + 'ObjectProperty'\nconst OWL_DATATYPE_PROPERTY = OWL_NS + 'DatatypeProperty'\nconst SKOS_PREFLABEL = SKOS_NS + 'prefLabel'\nconst FOAF_NAME = FOAF_NS + 'name'\nconst DCTERMS_TITLE = DCTERMS_NS + 'title'\n\n/** Common XSD datatypes, kept for callers that need to recognise literal types. */\nconst XSD_COMMON = new Set([\n  XSD_NS + 'string', XSD_NS + 'boolean', XSD_NS + 'decimal', XSD_NS + 'integer',\n  XSD_NS + 'int', XSD_NS + 'long', XSD_NS + 'short', XSD_NS + 'byte',\n  XSD_NS + 'float', XSD_NS + 'double', XSD_NS + 'date', XSD_NS + 'dateTime',\n  XSD_NS + 'time', XSD_NS + 'duration', XSD_NS + 'anyURI', XSD_NS + 'nonNegativeInteger',\n  XSD_NS + 'positiveInteger', XSD_NS + 'unsignedInt', XSD_NS + 'unsignedLong',\n])\n\nconst CLASS_TYPES = new Set([OWL_CLASS, RDFS_CLASS])\nconst PROPERTY_TYPES = new Set([OWL_OBJECT_PROPERTY, OWL_DATATYPE_PROPERTY, RDF_PROPERTY])\n\n/** Predicates that are list plumbing, not semantic edges. */\nconst LIST_PREDICATES = new Set([RDF_FIRST, RDF_REST])\n\n/**\n * Preferred label predicates, best first. Lower rank wins; a later lower-rank\n * literal replaces an earlier weaker label so the result does not depend on\n * triple order in a surprising way.\n */\nconst LABEL_RANK = new Map([\n  [RDFS_LABEL, 0],\n  [SKOS_PREFLABEL, 1],\n  [FOAF_NAME, 2],\n  [DCTERMS_TITLE, 3],\n  [RDFS_COMMENT, 4],\n])\n\nconst BLANK_PREFIX = '_:'\n\nfunction isObject(value) {\n  return value !== null && typeof value === 'object'\n}\n\nfunction stringValue(value) {\n  return value === null || value === undefined ? '' : String(value)\n}\n\nfunction labelRank(predicate) {\n  const rank = LABEL_RANK.get(predicate)\n  return rank === undefined ? 9 : rank\n}\n\nfunction compareStrings(a, b) {\n  if (a === b) return 0\n  return a < b ? -1 : 1\n}\n\n/**\n * Structured budget record. Every truncation level reports the same\n * `{ total, kept, truncated, reason }` shape (design §1.5 / §8.2) so the UI can\n * derive counts and notices from one representation. `truncated` is a number\n * (kept vs total delta), `reason` is null when nothing was dropped.\n *\n * @param {number} total\n * @param {number} kept\n * @param {string} [reason]\n * @returns {{total: number, kept: number, truncated: number, reason: string|null}}\n */\nfunction budgetRecord(total, kept, reason) {\n  const totalValue = typeof total === 'number' && Number.isFinite(total) && total > 0 ? Math.floor(total) : 0\n  let keptValue = typeof kept === 'number' && Number.isFinite(kept) && kept > 0 ? Math.floor(kept) : 0\n  if (keptValue > totalValue) keptValue = totalValue\n  const truncated = totalValue - keptValue\n  return {\n    total: totalValue,\n    kept: keptValue,\n    truncated,\n    reason: truncated > 0 ? (typeof reason === 'string' && reason ? reason : 'budget') : null,\n  }\n}\n\nfunction emptyStats() {\n  return {\n    triples: 0,\n    nodes: 0,\n    edges: 0,\n    literals: 0,\n    classes: 0,\n    properties: 0,\n    individuals: 0,\n    blanks: 0,\n    droppedNodes: 0,\n    droppedEdges: 0,\n    droppedLiterals: 0,\n  }\n}\n\n/**\n * Resolve how an object term should be treated. Parsers normally set `oKind`,\n * but a wrong/absent value must never turn a literal into a node.\n */\nfunction resolveObjectKind(triple, value) {\n  const declared = typeof triple.oKind === 'string' ? triple.oKind : ''\n  if (declared === 'literal' || declared === 'iri' || declared === 'blank') return declared\n  if (typeof value !== 'string') return 'literal'\n  if (value.startsWith(BLANK_PREFIX)) return 'blank'\n  if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(value) && !/\\s/.test(value)) return 'iri'\n  return 'literal'\n}\n\n/**\n * Resolve graph-level source metadata (spec \"源位置预留\", design §1.4).\n *\n * `options.source` is the authoritative explicit input; otherwise the parsed\n * document is consulted defensively (`resourceAddress` first, then a\n * resource-derived `base`). A document-declared `@base` is not a resource\n * address and must not be reported as one. Missing values are empty strings,\n * never a fabricated address or display name.\n *\n * @param {any} opts buildGraph options\n * @param {any} input parsed document\n * @returns {{address: string, displayName: string, format: string}}\n */\nfunction resolveGraphSource(opts, input) {\n  const explicit = isObject(opts.source) ? opts.source : {}\n  let address = ''\n  if (typeof explicit.address === 'string') address = explicit.address\n  else if (typeof input.resourceAddress === 'string') address = input.resourceAddress\n  else if (typeof input.base === 'string' && input.baseSource !== 'document') address = input.base\n  let displayName = ''\n  if (typeof explicit.displayName === 'string') displayName = explicit.displayName\n  else if (typeof input.displayName === 'string') displayName = input.displayName\n  else if (typeof input.fileName === 'string') displayName = input.fileName\n  let format = ''\n  if (typeof explicit.format === 'string') format = explicit.format\n  else if (typeof input.format === 'string') format = input.format\n  return { address, displayName, format }\n}\n\n/**\n * Turn parsed triples into a renderable node-link graph.\n *\n * Classification (deterministic precedence, first match wins):\n *   1. blank      -- the id starts with \"_:\"\n *   2. property   -- typed owl:ObjectProperty / owl:DatatypeProperty / rdf:Property\n *   3. class      -- typed owl:Class / rdfs:Class, used as the object of an\n *                    rdf:type statement, or involved in rdfs:subClassOf\n *   4. external   -- a leaf target (no outgoing edges, no literals, no types,\n *                    at most one incoming edge); a reference to something the\n *                    document does not describe\n *   5. individual -- everything else\n *\n * Literals never become nodes; they are collected on the subject as\n * `node.literals`. rdf:first / rdf:rest triples are list plumbing and are\n * dropped from the graph (they still count in `stats.triples`).\n *\n * Budgets (all optional, all structured, none silent):\n *   - maxNodes (default 1200): highest total degree first, id as stable tie-break.\n *   - maxLiteralsPerNode (default 60): per-node literal statements kept.\n *   - maxEdges (default off): model-level distinct edge budget. Kept edges are\n *     ordered by combined parallel `count` desc, full-graph degree sum desc,\n *     then (source, predicate, target) lexicographic; output order stays the\n *     first-occurrence order so ids remain stable.\n *   - maxLiteralLength (default off): single literal value `length` cap; a\n *     truncated value is marked with `literal.truncated = true`.\n *\n * @param {{triples?: any[], prefixes?: Record<string, string>}} parsed\n * @param {{maxNodes?: number, maxLiteralsPerNode?: number, maxEdges?: number,\n *          maxLiteralLength?: number,\n *          source?: {address?: string, displayName?: string, format?: string}}} [options]\n * @returns {{nodes: any[], edges: any[], stats: any, warnings: string[],\n *            truncation: any, source: {address: string, displayName: string, format: string}}}\n */\nfunction buildGraph(parsed, options) {\n  const opts = isObject(options) ? options : {}\n  const maxNodes = positiveInteger(opts.maxNodes, 1200)\n  const maxLiterals = positiveInteger(opts.maxLiteralsPerNode, 60)\n  const maxLiteralLength = optionalPositiveInteger(opts.maxLiteralLength)\n  const maxEdges = optionalPositiveInteger(opts.maxEdges)\n\n  const input = isObject(parsed) ? parsed : {}\n  const triples = Array.isArray(input.triples) ? input.triples : []\n  const prefixes = isObject(input.prefixes) ? input.prefixes : {}\n  const warnings = []\n  const source = resolveGraphSource(opts, input)\n\n  /** id -> { id, types, literals, out, in, label, labelRank } */\n  const records = new Map()\n  /** id -> true when the node is used as the object of rdf:type (i.e. a class-like IRI) */\n  const usedAsType = new Set()\n  /** ids involved in rdfs:subClassOf (subject or IRI object) */\n  const subclassNodes = new Set()\n  /** \"s\\0p\\0o\" -> collapsed edge draft */\n  const edgeDrafts = new Map()\n  /** literal value truncations applied because of maxLiteralLength */\n  let truncatedValues = 0\n\n  function ensureRecord(id) {\n    let record = records.get(id)\n    if (record === undefined) {\n      record = { id, types: [], literals: [], out: 0, in: 0, label: '', labelRank: 99 }\n      records.set(id, record)\n    }\n    return record\n  }\n\n  for (const triple of triples) {\n    if (!isObject(triple)) continue\n    const subject = typeof triple.s === 'string' ? triple.s : ''\n    const predicate = typeof triple.p === 'string' ? triple.p : ''\n    if (!subject || !predicate) continue\n    if (triple.o === null || triple.o === undefined) continue\n\n    const objectKind = resolveObjectKind(triple, triple.o)\n    const objectText = stringValue(triple.o)\n\n    if (objectKind === 'literal') {\n      // List plumbing literals are irrelevant once the list is skipped.\n      if (LIST_PREDICATES.has(predicate)) continue\n      const record = ensureRecord(subject)\n      const rank = labelRank(predicate)\n      let value = objectText\n      let valueTruncated = false\n      if (maxLiteralLength > 0 && value.length > maxLiteralLength) {\n        value = value.slice(0, maxLiteralLength)\n        valueTruncated = true\n        truncatedValues += 1\n      }\n      const literal = {\n        p: predicate,\n        value,\n        order: record.literals.length,\n        rank,\n      }\n      if (valueTruncated) literal.truncated = true\n      if (typeof triple.dt === 'string' && triple.dt) literal.dt = triple.dt\n      if (typeof triple.lang === 'string' && triple.lang) literal.lang = triple.lang\n      record.literals.push(literal)\n      // rdfs:comment is useful in the detail panel but must not become the\n      // node label; only ranks 0..3 are label predicates.\n      if (rank <= 3 && rank < record.labelRank) {\n        record.labelRank = rank\n        record.label = value\n      }\n      continue\n    }\n\n    if (LIST_PREDICATES.has(predicate)) continue\n\n    const object = objectText\n    if (!object) continue\n    const sourceRecord = ensureRecord(subject)\n    const targetRecord = ensureRecord(object)\n    sourceRecord.out += 1\n    targetRecord.in += 1\n\n    if (predicate === RDF_TYPE) {\n      if (!sourceRecord.types.includes(object)) sourceRecord.types.push(object)\n      if (objectKind === 'iri') usedAsType.add(object)\n    } else if (predicate === RDFS_SUBCLASSOF) {\n      subclassNodes.add(subject)\n      subclassNodes.add(object)\n    }\n\n    const key = subject + '\\u0000' + predicate + '\\u0000' + object\n    const draft = edgeDrafts.get(key)\n    if (draft === undefined) {\n      edgeDrafts.set(key, { source: subject, target: object, p: predicate, count: 1 })\n    } else {\n      draft.count += 1\n    }\n  }\n\n  function degreeOf(id) {\n    const record = records.get(id)\n    return record === undefined ? 0 : record.out + record.in\n  }\n\n  // Rank before capping: highest degree first, id as a stable tie-breaker.\n  const ranked = []\n  for (const record of records.values()) {\n    ranked.push({ record, rank: record.out + record.in })\n  }\n  ranked.sort((a, b) => b.rank - a.rank || compareStrings(a.record.id, b.record.id))\n\n  const droppedNodes = Math.max(0, ranked.length - maxNodes)\n  const keptRecords = ranked.slice(0, maxNodes).map((entry) => entry.record)\n  const keptIds = new Set(keptRecords.map((record) => record.id))\n  if (droppedNodes > 0) {\n    warnings.push(\n      'Graph node limit reached: kept ' + maxNodes + ' of ' + ranked.length +\n      ' nodes (highest degree first), dropped ' + droppedNodes + '.'\n    )\n  }\n\n  // Keep only edges whose endpoints survived capping, then optionally apply\n  // the model-level distinct-edge budget.\n  const totalEdgeCandidates = edgeDrafts.size\n  const retainedDrafts = []\n  for (const draft of edgeDrafts.values()) {\n    if (!keptIds.has(draft.source) || !keptIds.has(draft.target)) continue\n    retainedDrafts.push(draft)\n  }\n  const droppedByNodeLimit = totalEdgeCandidates - retainedDrafts.length\n  let keptDrafts = retainedDrafts\n  let droppedByBudget = 0\n  if (maxEdges > 0 && retainedDrafts.length > maxEdges) {\n    // Deterministic priority: parallel count first, then full-graph degree\n    // sum, then the canonical (source, predicate, target) key.\n    const rankedEdges = retainedDrafts.slice()\n    rankedEdges.sort((a, b) => {\n      if (a.count !== b.count) return b.count - a.count\n      const degreeA = degreeOf(a.source) + degreeOf(a.target)\n      const degreeB = degreeOf(b.source) + degreeOf(b.target)\n      if (degreeA !== degreeB) return degreeB - degreeA\n      return compareStrings(a.source, b.source) ||\n        compareStrings(a.p, b.p) ||\n        compareStrings(a.target, b.target)\n    })\n    const keptSet = new Set(rankedEdges.slice(0, maxEdges))\n    keptDrafts = retainedDrafts.filter((draft) => keptSet.has(draft))\n    droppedByBudget = retainedDrafts.length - keptDrafts.length\n    warnings.push(\n      'Graph edge limit reached: kept ' + keptDrafts.length + ' of ' +\n      retainedDrafts.length + ' edges, dropped ' + droppedByBudget + '.'\n    )\n  }\n  const keptDraftSet = new Set(keptDrafts)\n\n  // Emit edges in first-occurrence order so ids stay stable across budgets.\n  const edges = []\n  for (const draft of edgeDrafts.values()) {\n    if (!keptDraftSet.has(draft)) continue\n    let kind = 'object'\n    if (draft.p === RDF_TYPE) kind = 'type'\n    else if (draft.p === RDFS_SUBCLASSOF) kind = 'subclass'\n    else if (draft.source.startsWith(BLANK_PREFIX) || draft.target.startsWith(BLANK_PREFIX)) kind = 'blank'\n    edges.push({\n      id: 'e' + edges.length,\n      source: draft.source,\n      target: draft.target,\n      p: draft.p,\n      label: shortenIri(draft.p, prefixes),\n      kind,\n      count: draft.count,\n    })\n  }\n\n  // Recompute degrees from the retained edges so width/radius match what is drawn.\n  const outEdges = new Map()\n  const inEdges = new Map()\n  for (const record of keptRecords) {\n    outEdges.set(record.id, 0)\n    inEdges.set(record.id, 0)\n  }\n  for (const edge of edges) {\n    outEdges.set(edge.source, (outEdges.get(edge.source) || 0) + 1)\n    inEdges.set(edge.target, (inEdges.get(edge.target) || 0) + 1)\n  }\n\n  const nodes = []\n  const stats = emptyStats()\n  stats.triples = triples.length || Number(input.stats && input.stats.tripleCount) || 0\n  let literalCandidates = 0\n  let keptLiteralCount = 0\n  let droppedLiteralCount = 0\n  let truncatedLiteralNodes = 0\n\n  for (const record of keptRecords) {\n    const out = outEdges.get(record.id) || 0\n    const incoming = inEdges.get(record.id) || 0\n    const types = record.types.slice()\n    let kind\n    if (record.id.startsWith(BLANK_PREFIX)) kind = 'blank'\n    else if (types.some((type) => PROPERTY_TYPES.has(type))) kind = 'property'\n    else if (types.some((type) => CLASS_TYPES.has(type)) || usedAsType.has(record.id) || subclassNodes.has(record.id)) kind = 'class'\n    else if (out === 0 && incoming <= 1 && record.literals.length === 0 && types.length === 0) kind = 'external'\n    else kind = 'individual'\n\n    // Labels first, then rdfs:comment, then the rest in document order.\n    record.literals.sort((a, b) => a.rank - b.rank || a.order - b.order)\n    const totalForNode = record.literals.length\n    literalCandidates += totalForNode\n    const keptLiterals = record.literals.slice(0, maxLiterals)\n    const droppedForNode = totalForNode - keptLiterals.length\n    if (droppedForNode > 0) {\n      truncatedLiteralNodes += 1\n      droppedLiteralCount += droppedForNode\n    }\n    keptLiteralCount += keptLiterals.length\n    const literals = keptLiterals.map((literal) => {\n      const item = {\n        p: literal.p,\n        pLabel: shortenIri(literal.p, prefixes),\n        value: literal.value,\n      }\n      if (literal.dt) item.dt = literal.dt\n      if (literal.lang) item.lang = literal.lang\n      if (literal.truncated) item.truncated = true\n      return item\n    })\n\n    const rawLocal = localName(record.id)\n    const local = rawLocal || record.id\n    const label = record.label || local\n\n    if (kind === 'class') stats.classes += 1\n    else if (kind === 'property') stats.properties += 1\n    else if (kind === 'blank') stats.blanks += 1\n    else if (kind === 'individual') stats.individuals += 1\n\n    nodes.push({\n      id: record.id,\n      label,\n      iri: record.id,\n      local,\n      kind,\n      types,\n      degree: out + incoming,\n      literals,\n      outEdges: out,\n      inEdges: incoming,\n      // Reserved source location: always null in this change (spec\n      // \"源位置预留\"); never inferred from filenames or document order.\n      literalsTruncated: droppedForNode,\n      source: null,\n    })\n  }\n\n  if (truncatedLiteralNodes > 0) {\n    warnings.push('Literal properties were truncated to ' + maxLiterals + ' per node.')\n  }\n  if (truncatedValues > 0) {\n    warnings.push('Literal values were truncated to ' + maxLiteralLength + ' characters.')\n  }\n\n  stats.nodes = nodes.length\n  stats.edges = edges.length\n  stats.literals = keptLiteralCount\n  stats.droppedNodes = droppedNodes\n  stats.droppedEdges = totalEdgeCandidates - edges.length\n  stats.droppedLiterals = droppedLiteralCount\n\n  const truncation = {\n    nodes: budgetRecord(ranked.length, keptRecords.length, 'max-nodes'),\n    literals: Object.assign(\n      budgetRecord(literalCandidates, keptLiteralCount, 'max-literals-per-node'),\n      {\n        perNodeLimit: maxLiterals,\n        truncatedNodes: truncatedLiteralNodes,\n        valueTruncated: truncatedValues,\n      },\n    ),\n    edges: Object.assign(\n      budgetRecord(totalEdgeCandidates, edges.length, droppedByBudget > 0 ? 'max-edges' : 'node-limit'),\n      { droppedByNodeLimit, droppedByBudget },\n    ),\n  }\n\n  return { nodes, edges, stats, warnings, truncation, source }\n}\n\n/**\n * Shorten an IRI with a prefix map: \"foaf:Person\", else the local name, else\n * the original IRI. The longest matching namespace wins; an empty prefix\n * expands to the bare local name.\n */\nfunction shortenIri(iri, prefixes) {\n  if (typeof iri !== 'string' || !iri) return ''\n  if (isObject(prefixes)) {\n    let bestPrefix = null\n    let bestNamespace = ''\n    for (const prefix of Object.keys(prefixes)) {\n      const namespace = prefixes[prefix]\n      if (typeof namespace !== 'string' || !namespace) continue\n      if (!iri.startsWith(namespace)) continue\n      if (namespace.length > bestNamespace.length ||\n          (namespace.length === bestNamespace.length && bestPrefix !== null && prefix < bestPrefix)) {\n        bestPrefix = prefix\n        bestNamespace = namespace\n      }\n    }\n    if (bestPrefix !== null && iri.length > bestNamespace.length) {\n      const local = iri.slice(bestNamespace.length)\n      return bestPrefix ? bestPrefix + ':' + local : local\n    }\n  }\n  const local = localName(iri)\n  return local || iri\n}\n\n/**\n * Local name after the last \"#\" or \"/\". For URNs the part after the last \":\"\n * is used, and blank-node ids lose their \"_:\" marker. May be empty for an IRI\n * whose last segment is empty.\n */\nfunction localName(iri) {\n  if (typeof iri !== 'string') return ''\n  let value = iri.trim()\n  if (!value) return ''\n  if (value.startsWith(BLANK_PREFIX)) value = value.slice(2)\n  const hash = value.lastIndexOf('#')\n  const slash = value.lastIndexOf('/')\n  const cut = hash > slash ? hash : slash\n  if (cut >= 0) return value.slice(cut + 1)\n  const colon = value.lastIndexOf(':')\n  if (colon >= 0) return value.slice(colon + 1)\n  return value\n}\n\n/**\n * Find nodes whose label, IRI or local name contains the query\n * (case-insensitive). Results are ordered best match first: exact, prefix,\n * label substring, then local/IRI substring. Returns node ids.\n */\nfunction matchNodes(graph, query, limit) {\n  const nodes = isObject(graph) && Array.isArray(graph.nodes) ? graph.nodes : []\n  const needle = typeof query === 'string' ? query.trim().toLowerCase() : ''\n  if (!needle) return []\n  const max = typeof limit === 'number' && Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : nodes.length\n  const scored = []\n\n  for (let index = 0; index < nodes.length; index += 1) {\n    const node = nodes[index]\n    if (!isObject(node) || typeof node.id !== 'string') continue\n    const label = stringValue(node.label).toLowerCase()\n    const iri = stringValue(node.iri || node.id).toLowerCase()\n    const local = stringValue(node.local).toLowerCase()\n    let score = 0\n    if (label === needle || local === needle || iri === needle) score = 100\n    else if (label.startsWith(needle) || local.startsWith(needle)) score = 60\n    else if (label.indexOf(needle) >= 0) score = 40\n    else if (local.indexOf(needle) >= 0 || iri.indexOf(needle) >= 0) score = 20\n    if (score > 0) scored.push({ id: node.id, score, index })\n  }\n\n  scored.sort((a, b) => b.score - a.score || a.index - b.index)\n  return scored.slice(0, max).map((entry) => entry.id)\n}\n\n/** Statistics for an already-selected node/edge subset. */\nfunction statsFor(nodes, edges, triples) {\n  const stats = emptyStats()\n  stats.triples = Number.isFinite(triples) ? triples : 0\n  stats.nodes = nodes.length\n  stats.edges = edges.length\n  for (const node of nodes) {\n    if (!isObject(node)) continue\n    if (Array.isArray(node.literals)) stats.literals += node.literals.length\n    if (node.kind === 'class') stats.classes += 1\n    else if (node.kind === 'property') stats.properties += 1\n    else if (node.kind === 'blank') stats.blanks += 1\n    else if (node.kind === 'individual') stats.individuals += 1\n  }\n  return stats\n}\n\n/**\n * Subgraph induced by the given node ids; edges survive only when both ends\n * are inside. Node objects are reused as-is (their degree still reflects the\n * full graph), which keeps focus-mode filtering cheap.\n */\nfunction subgraph(graph, nodeIds) {\n  const input = isObject(graph) ? graph : {}\n  const nodes = Array.isArray(input.nodes) ? input.nodes : []\n  const edges = Array.isArray(input.edges) ? input.edges : []\n  const wanted = new Set(Array.isArray(nodeIds) ? nodeIds.filter((id) => typeof id === 'string') : [])\n\n  const keptNodes = nodes.filter((node) => isObject(node) && typeof node.id === 'string' && wanted.has(node.id))\n  const keptIds = new Set(keptNodes.map((node) => node.id))\n  const keptEdges = edges.filter((edge) =>\n    isObject(edge) && keptIds.has(edge.source) && keptIds.has(edge.target))\n\n  return {\n    nodes: keptNodes,\n    edges: keptEdges,\n    stats: statsFor(keptNodes, keptEdges, input.stats && input.stats.triples),\n    warnings: Array.isArray(input.warnings) ? input.warnings.slice() : [],\n  }\n}\n\n/**\n * Neighbour ids of one node within `depth` hops (default 1), including the\n * node itself. Unknown nodes return an empty array.\n */\nfunction neighborhood(graph, nodeId, depth) {\n  const input = isObject(graph) ? graph : {}\n  const nodes = Array.isArray(input.nodes) ? input.nodes : []\n  const edges = Array.isArray(input.edges) ? input.edges : []\n  if (typeof nodeId !== 'string' || !nodes.some((node) => isObject(node) && node.id === nodeId)) return []\n\n  const requestedDepth = Number.isFinite(depth) ? Math.floor(depth) : 1\n  const limit = Math.max(0, Math.min(10, requestedDepth))\n  const adjacency = new Map()\n  for (const node of nodes) {\n    if (isObject(node) && typeof node.id === 'string') adjacency.set(node.id, [])\n  }\n  for (const edge of edges) {\n    if (!isObject(edge) || typeof edge.source !== 'string' || typeof edge.target !== 'string') continue\n    if (edge.source === edge.target) continue\n    const from = adjacency.get(edge.source)\n    const to = adjacency.get(edge.target)\n    if (from) from.push(edge.target)\n    if (to) to.push(edge.source)\n  }\n\n  const seen = new Set([nodeId])\n  const order = [nodeId]\n  let frontier = [nodeId]\n  for (let step = 0; step < limit; step += 1) {\n    const next = []\n    for (const current of frontier) {\n      const neighbours = adjacency.get(current)\n      if (!neighbours) continue\n      for (const neighbour of neighbours) {\n        if (seen.has(neighbour)) continue\n        seen.add(neighbour)\n        order.push(neighbour)\n        next.push(neighbour)\n      }\n    }\n    if (next.length === 0) break\n    frontier = next\n  }\n  return order\n}\n\n// ---------------------------------------------------------------------------\n// Filter projection (L2, design §4)\n// ---------------------------------------------------------------------------\n\n/**\n * Pure display projection over the retained full graph (L1). Never mutates the\n * input graph or the parsed data, never re-parses.\n *\n * Criteria semantics (design §4.2):\n *   - `kinds`: node kind allow-list (class/property/individual/blank/external);\n *     empty/absent = all kinds.\n *   - `predicates`: edge predicate allow-list; empty/absent = all predicates.\n *   - `direction`: direction relative to `anchorId`, applied to direct relation\n *     edges only (1 hop): `'out'` keeps edges whose source is the anchor,\n *     `'in'` edges whose target is the anchor, `'both'` edges touching the\n *     anchor in either direction. This is a projection filter, not a traversal:\n *     multi-hop expansion belongs to `exploreNeighborhood`, which applies the\n *     direction again on every hop (so the filter layer must not pre-compute a\n *     reachability cone). Without a usable anchor, or when no direction is\n *     provided at all, the direction condition is inert (spec \"无锚点时方向条件\n *     不生效\").\n *   - `anchorId`: the selected node; it is always retained, even when it fails\n *     the kind filter, so the selection context cannot vanish.\n *\n * When a relation filter is active (predicates or a direction), nodes that have\n * no retained incident edge are dropped, except the anchor -- relation filtering\n * making isolated nodes disappear is expected behaviour (design §4.2). A pure\n * kind filter keeps matching nodes connected or not.\n *\n * The result is `{ nodes, edges, stats, hidden, graph }` where `graph` is the\n * same projection shaped like a graph model (design names this `{ graph, stats,\n * hidden }`; the flat fields are kept for direct use). `hidden` reports total\n * hidden counts plus independent marginal counts by kind / predicate / direction\n * (the marginals can overlap; totals are exact).\n *\n * @param {any} graph full (L1) or filtered (L2/L3) graph model\n * @param {{kinds?: string[], predicates?: string[], direction?: 'both'|'out'|'in', anchorId?: string}} criteria\n * @param {any} [_options] reserved\n */\nfunction filterGraph(graph, criteria, _options) {\n  const input = isObject(graph) ? graph : {}\n  const spec = isObject(criteria) ? criteria : {}\n  const allNodes = Array.isArray(input.nodes) ? input.nodes : []\n  const allEdges = Array.isArray(input.edges) ? input.edges : []\n\n  const kindSet = new Set(Array.isArray(spec.kinds) ? spec.kinds.filter((kind) => typeof kind === 'string') : [])\n  const predicateSet = new Set(Array.isArray(spec.predicates) ? spec.predicates.filter((predicate) => typeof predicate === 'string') : [])\n  const directionSpecified = spec.direction === 'out' || spec.direction === 'in' || spec.direction === 'both'\n  const requestedDirection = spec.direction === 'out' || spec.direction === 'in' ? spec.direction : 'both'\n  const anchorId = typeof spec.anchorId === 'string' ? spec.anchorId : ''\n  const hasAnchor = anchorId !== '' && allNodes.some((node) => isObject(node) && node.id === anchorId)\n  // Direction filtering only runs when the caller explicitly asks for it and an\n  // anchor exists. With an anchor all three directions are meaningful --\n  // including 'both', which keeps the anchor's direct in+out relations.\n  const directionActive = hasAnchor && directionSpecified\n  const kindsActive = kindSet.size > 0\n  const predicatesActive = predicateSet.size > 0\n  const relationActive = predicatesActive || directionActive\n\n  function nodeAllowed(node) {\n    if (!kindsActive) return true\n    return kindSet.has(node.kind)\n  }\n\n  const keptNodeIds = new Set()\n  const keptNodes = []\n  for (const node of allNodes) {\n    if (!isObject(node) || typeof node.id !== 'string') continue\n    if (node.id === anchorId || nodeAllowed(node)) {\n      keptNodeIds.add(node.id)\n      keptNodes.push(node)\n    }\n  }\n\n  function edgeAllowed(edge) {\n    if (!predicatesActive) return true\n    return predicateSet.has(edge.p)\n  }\n\n  const predicateEdges = allEdges.filter((edge) =>\n    isObject(edge) &&\n    keptNodeIds.has(edge.source) &&\n    keptNodeIds.has(edge.target) &&\n    edgeAllowed(edge))\n\n  // Direction filters direct relation edges relative to the anchor (1 hop).\n  // The filter layer never traverses: multi-hop expansion belongs to\n  // exploreNeighborhood, which re-applies the direction on every hop.\n  let finalEdges = predicateEdges\n  if (directionActive) {\n    finalEdges = predicateEdges.filter((edge) => {\n      if (requestedDirection === 'out') return edge.source === anchorId\n      if (requestedDirection === 'in') return edge.target === anchorId\n      return edge.source === anchorId || edge.target === anchorId\n    })\n  }\n\n  let finalNodes = keptNodes\n  if (relationActive) {\n    const incident = new Set()\n    for (const edge of finalEdges) {\n      incident.add(edge.source)\n      incident.add(edge.target)\n    }\n    finalNodes = keptNodes.filter((node) => node.id === anchorId || incident.has(node.id))\n  }\n\n  const stats = statsFor(finalNodes, finalEdges, input.stats && input.stats.triples)\n  stats.totalNodes = allNodes.length\n  stats.totalEdges = allEdges.length\n\n  let hiddenByKindNodes = 0\n  for (const node of allNodes) {\n    if (!isObject(node) || typeof node.id !== 'string' || node.id === anchorId) continue\n    if (!nodeAllowed(node)) hiddenByKindNodes += 1\n  }\n  let hiddenByPredicateEdges = 0\n  for (const edge of allEdges) {\n    if (!isObject(edge)) continue\n    if (!edgeAllowed(edge)) hiddenByPredicateEdges += 1\n  }\n  let hiddenByDirectionEdges = 0\n  if (directionActive) {\n    for (const edge of allEdges) {\n      if (!isObject(edge)) continue\n      if (!edgeAllowed(edge)) continue\n      if (!keptNodeIds.has(edge.source) || !keptNodeIds.has(edge.target)) continue\n      let incident\n      if (requestedDirection === 'out') incident = edge.source === anchorId\n      else if (requestedDirection === 'in') incident = edge.target === anchorId\n      else incident = edge.source === anchorId || edge.target === anchorId\n      if (!incident) hiddenByDirectionEdges += 1\n    }\n  }\n\n  const hidden = {\n    nodes: allNodes.length - finalNodes.length,\n    edges: allEdges.length - finalEdges.length,\n    byKind: { nodes: hiddenByKindNodes },\n    byPredicate: { edges: hiddenByPredicateEdges },\n    byDirection: { edges: hiddenByDirectionEdges },\n  }\n\n  const projectedGraph = {\n    nodes: finalNodes,\n    edges: finalEdges,\n    stats,\n    warnings: Array.isArray(input.warnings) ? input.warnings.slice() : [],\n    source: isObject(input.source) ? input.source : null,\n    truncation: isObject(input.truncation) ? input.truncation : null,\n  }\n\n  return { nodes: finalNodes, edges: finalEdges, stats, hidden, graph: projectedGraph }\n}\n\n// ---------------------------------------------------------------------------\n// Draw budget (L4, design §8 / spec \"绘制预算\")\n// ---------------------------------------------------------------------------\n\n/**\n * Deterministic drawing projection: keep at most `maxEdges` distinct edges\n * (optionally bounded further by `maxElements`, where one element is one node\n * plus one edge). The result is display-only: search, exploration, details and\n * totals must keep reading the retained full graph (L1).\n *\n * Priority (design §8.3): edges incident to `priorityIds` (selected node /\n * search hit) first, then higher parallel `count`, then edge id lexicographic.\n * Output keeps the input edge order so z-order stays stable.\n *\n * @param {any} graph\n * @param {{maxEdges?: number, maxElements?: number, priorityIds?: string[]}} [budget]\n * @returns {{nodes: any[], edges: any[], stats: {keptEdges: number, hiddenEdges: number, totalEdges: number},\n *            truncation: {edges: any}, displayOnly: true}}\n */\nfunction applyEdgeBudget(graph, budget) {\n  const input = isObject(graph) ? graph : {}\n  const spec = isObject(budget) ? budget : {}\n  const allNodes = Array.isArray(input.nodes) ? input.nodes : []\n  const allEdges = Array.isArray(input.edges) ? input.edges : []\n  const requestedMaxEdges = optionalPositiveInteger(spec.maxEdges)\n  const requestedMaxElements = optionalPositiveInteger(spec.maxElements)\n  const prioritySet = new Set(Array.isArray(spec.priorityIds) ? spec.priorityIds.filter((id) => typeof id === 'string') : [])\n\n  let limit = Infinity\n  let reason = null\n  if (requestedMaxEdges > 0) {\n    limit = requestedMaxEdges\n    reason = 'max-edges'\n  }\n  if (requestedMaxElements > 0) {\n    // One element per node plus one per edge is the approximate SVG cost.\n    const elementLimit = Math.max(0, requestedMaxElements - allNodes.length)\n    if (elementLimit < limit) {\n      limit = elementLimit\n      reason = 'max-elements'\n    }\n  }\n\n  const total = allEdges.length\n  let keptEdges = allEdges\n  if (Number.isFinite(limit) && total > limit) {\n    const ranked = allEdges.map((edge, index) => ({ edge, index }))\n    ranked.sort((a, b) => {\n      const aPriority = isPriorityEdge(a.edge, prioritySet) ? 0 : 1\n      const bPriority = isPriorityEdge(b.edge, prioritySet) ? 0 : 1\n      if (aPriority !== bPriority) return aPriority - bPriority\n      const aCount = isObject(a.edge) && Number.isFinite(a.edge.count) ? a.edge.count : 0\n      const bCount = isObject(b.edge) && Number.isFinite(b.edge.count) ? b.edge.count : 0\n      if (aCount !== bCount) return bCount - aCount\n      const aId = isObject(a.edge) && typeof a.edge.id === 'string' ? a.edge.id : ''\n      const bId = isObject(b.edge) && typeof b.edge.id === 'string' ? b.edge.id : ''\n      return compareStrings(aId, bId) || a.index - b.index\n    })\n    const keptIndexes = new Set(ranked.slice(0, limit).map((entry) => entry.index))\n    keptEdges = allEdges.filter((edge, index) => keptIndexes.has(index))\n  }\n\n  const truncation = {\n    edges: budgetRecord(total, keptEdges.length, reason === null ? 'max-edges' : reason),\n  }\n  return {\n    nodes: allNodes,\n    edges: keptEdges,\n    stats: {\n      keptEdges: keptEdges.length,\n      hiddenEdges: total - keptEdges.length,\n      totalEdges: total,\n    },\n    truncation,\n    displayOnly: true,\n  }\n}\n\nfunction isPriorityEdge(edge, prioritySet) {\n  if (prioritySet.size === 0 || !isObject(edge)) return false\n  return prioritySet.has(edge.source) || prioritySet.has(edge.target)\n}\n\n// ---------------------------------------------------------------------------\n// Multi-hop exploration (L3, design §5 / spec \"多跳探索与展开预算\")\n// ---------------------------------------------------------------------------\n\nfunction edgeIdentity(edge) {\n  return stringValue(edge.source) + '\\u0000' + stringValue(edge.p) + '\\u0000' + stringValue(edge.target)\n}\n\nfunction cursorExtension(cursor) {\n  let value = NaN\n  if (typeof cursor === 'number' && Number.isFinite(cursor)) value = cursor\n  else if (isObject(cursor)) {\n    if (Number.isFinite(cursor.extension)) value = cursor.extension\n    else if (Number.isFinite(cursor.extensions)) value = cursor.extensions\n  }\n  if (!Number.isFinite(value) || value < 0) return 0\n  return Math.min(1000, Math.floor(value))\n}\n\n/**\n * Budgeted BFS over an already-filtered graph (L2/L3). Hidden/filtered-away\n * nodes are simply absent, so they can never act as stepping stones.\n *\n *   - depth: clamped to 1..5 (hard cap); request > 5 reports `depthCapped`.\n *   - direction: applies to every hop (out edges / in edges / both).\n *   - predicates: predicate allow-list applied on every hop.\n *   - neighbour order: predicate IRI first, then neighbour node id (deterministic).\n *   - budget: `perHopNodes` new nodes per hop, `maxEdges` global distinct edges.\n *   - cursor: a deterministic effective-budget extension `{ extension: k }`.\n *     Continuing with the returned cursor increases the effective budgets\n *     (base * (k + 1)), so a continued result is always a superset of the\n *     previous result with no duplicate nodes/edges; identical input + cursor\n *     gives an identical result.\n *\n * Result: `{ nodes, edges, nodeIds, stats, truncation, truncated, nextCursor,\n * nextBudget, depthCapped, reachedDepthLimit }`. `stats` carries `nodes`,\n * `edges`, `hops`, `depth`, `totalNodes`, `totalEdges`, `perHopNodes`,\n * `maxEdges`, `extension`, `depthLimit`; `truncation.{nodes,edges}` are\n * `{ total, kept, truncated, reason }` records where `total` is the unbudgeted\n * expansion available within the requested depth (so the UI can show \"已展开\n * X / 共 Y\"). `truncated` is true when a budget cut the expansion or the\n * requested depth exceeded the hard cap; `nextCursor` is non-null only for\n * budget truncation.\n *\n * @param {any} graph\n * @param {{startId?: string, depth?: number, direction?: 'out'|'in'|'both',\n *          predicates?: string[], budget?: {perHopNodes?: number, maxEdges?: number},\n *          cursor?: number|{extension?: number}}} [options]\n */\nfunction exploreNeighborhood(graph, options) {\n  const input = isObject(graph) ? graph : {}\n  const opts = isObject(options) ? options : {}\n  const allNodes = Array.isArray(input.nodes) ? input.nodes : []\n  const allEdges = Array.isArray(input.edges) ? input.edges : []\n  const nodeById = new Map()\n  for (const node of allNodes) {\n    if (isObject(node) && typeof node.id === 'string' && !nodeById.has(node.id)) nodeById.set(node.id, node)\n  }\n\n  const requestedDepth = Number.isFinite(opts.depth) ? Math.floor(opts.depth) : 1\n  const depth = Math.max(1, Math.min(5, requestedDepth))\n  const depthCapped = requestedDepth > 5\n  const direction = opts.direction === 'out' || opts.direction === 'in' ? opts.direction : 'both'\n  const predicateSet = new Set(Array.isArray(opts.predicates)\n    ? opts.predicates.filter((predicate) => typeof predicate === 'string')\n    : [])\n  const budgetOptions = isObject(opts.budget) ? opts.budget : {}\n  const basePerHopNodes = positiveInteger(budgetOptions.perHopNodes, 300)\n  const baseMaxEdges = positiveInteger(budgetOptions.maxEdges, 800)\n  const extension = cursorExtension(opts.cursor)\n  const perHopNodes = basePerHopNodes * (1 + extension)\n  const maxEdges = baseMaxEdges * (1 + extension)\n\n  const stats = {\n    nodes: 0,\n    edges: 0,\n    hops: 0,\n    depth,\n    requestedDepth,\n    totalNodes: nodeById.size,\n    totalEdges: allEdges.length,\n    perHopNodes,\n    maxEdges,\n    extension,\n    depthLimit: 5,\n  }\n\n  const startId = typeof opts.startId === 'string' ? opts.startId : ''\n  if (!nodeById.has(startId)) {\n    return {\n      nodes: [],\n      edges: [],\n      nodeIds: [],\n      stats,\n      truncation: {\n        nodes: budgetRecord(0, 0, null),\n        edges: budgetRecord(0, 0, null),\n      },\n      truncated: false,\n      nextCursor: null,\n      nextBudget: null,\n      depthCapped,\n      reachedDepthLimit: false,\n    }\n  }\n\n  const outAdjacency = new Map()\n  const inAdjacency = new Map()\n  for (const id of nodeById.keys()) {\n    outAdjacency.set(id, [])\n    inAdjacency.set(id, [])\n  }\n  for (const edge of allEdges) {\n    if (!isObject(edge)) continue\n    if (!nodeById.has(edge.source) || !nodeById.has(edge.target)) continue\n    if (predicateSet.size > 0 && !predicateSet.has(edge.p)) continue\n    const p = stringValue(edge.p)\n    outAdjacency.get(edge.source).push({ edge, p, other: edge.target })\n    inAdjacency.get(edge.target).push({ edge, p, other: edge.source })\n  }\n\n  function byPredicateThenNode(a, b) {\n    return compareStrings(a.p, b.p) || compareStrings(a.other, b.other)\n  }\n  for (const list of outAdjacency.values()) list.sort(byPredicateThenNode)\n  for (const list of inAdjacency.values()) list.sort(byPredicateThenNode)\n\n  function candidatesFor(currentId) {\n    if (direction === 'out') return outAdjacency.get(currentId) || []\n    if (direction === 'in') return inAdjacency.get(currentId) || []\n    const outgoing = outAdjacency.get(currentId) || []\n    const incoming = inAdjacency.get(currentId) || []\n    if (outgoing.length === 0) return incoming\n    if (incoming.length === 0) return outgoing\n    const merged = outgoing.concat(incoming)\n    merged.sort(byPredicateThenNode)\n    const seen = new Set()\n    const unique = []\n    for (const candidate of merged) {\n      const key = edgeIdentity(candidate.edge)\n      if (seen.has(key)) continue\n      seen.add(key)\n      unique.push(candidate)\n    }\n    return unique\n  }\n\n  function runBfs(perHopLimit, edgeLimit) {\n    const included = new Set([startId])\n    const nodeOrder = [startId]\n    const includedEdges = []\n    const seenEdgeKeys = new Set()\n    let frontier = [startId]\n    let hops = 0\n    let truncated = false\n    let stopReason = null\n\n    for (let hop = 1; hop <= depth && stopReason === null; hop += 1) {\n      const nextFrontier = []\n      let addedInHop = 0\n      outer: for (const current of frontier) {\n        const candidates = candidatesFor(current)\n        for (const candidate of candidates) {\n          const key = edgeIdentity(candidate.edge)\n          const neighborId = candidate.other\n          if (included.has(neighborId)) {\n            if (seenEdgeKeys.has(key)) continue\n            if (includedEdges.length >= edgeLimit) {\n              truncated = true\n              stopReason = 'max-edges'\n              break outer\n            }\n            seenEdgeKeys.add(key)\n            includedEdges.push(candidate.edge)\n            continue\n          }\n          if (addedInHop >= perHopLimit) {\n            truncated = true\n            stopReason = 'per-hop-nodes'\n            break outer\n          }\n          if (includedEdges.length >= edgeLimit) {\n            truncated = true\n            stopReason = 'max-edges'\n            break outer\n          }\n          included.add(neighborId)\n          nodeOrder.push(neighborId)\n          nextFrontier.push(neighborId)\n          addedInHop += 1\n          seenEdgeKeys.add(key)\n          includedEdges.push(candidate.edge)\n        }\n      }\n      if (stopReason !== null) {\n        hops = hop\n        break\n      }\n      if (nextFrontier.length === 0) {\n        hops = hop - 1\n        break\n      }\n      hops = hop\n      frontier = nextFrontier\n    }\n\n    return { nodeOrder, edges: includedEdges, hops, truncated, stopReason }\n  }\n\n  const budgeted = runBfs(perHopNodes, maxEdges)\n  // Only pay for the unbudgeted reference run when a budget actually cut the\n  // expansion; it supplies the \"已展开 X / 共 Y\" totals without changing the\n  // deterministic budgeted result.\n  const unbudgeted = budgeted.truncated ? runBfs(Infinity, Infinity) : budgeted\n\n  const nodes = budgeted.nodeOrder.map((id) => nodeById.get(id))\n  stats.nodes = nodes.length\n  stats.edges = budgeted.edges.length\n  stats.hops = budgeted.hops\n\n  const truncation = {\n    nodes: budgetRecord(unbudgeted.nodeOrder.length, nodes.length, budgeted.stopReason),\n    edges: budgetRecord(unbudgeted.edges.length, budgeted.edges.length, budgeted.stopReason),\n  }\n\n  const nextCursor = budgeted.truncated ? { extension: extension + 1 } : null\n  const reachedDepthLimit = depth >= 5 && budgeted.hops >= 5\n  return {\n    nodes,\n    edges: budgeted.edges,\n    nodeIds: budgeted.nodeOrder,\n    stats,\n    truncation,\n    truncated: budgeted.truncated || depthCapped,\n    nextCursor,\n    nextBudget: nextCursor,\n    depthCapped,\n    reachedDepthLimit,\n  }\n}\n\n// ---------------------------------------------------------------------------\n// Detail connection groups (design §6 / spec \"详情连接分组\")\n// ---------------------------------------------------------------------------\n\n/**\n * Group a node's outgoing/incoming edges by predicate for the detail panel.\n * Read-only, deterministic, computed on demand from the retained full graph\n * (never from the draw-budget projection).\n *\n * Group order: `rdf:type` first, then group edge count descending, then\n * predicate IRI lexicographic. Items within a group are ordered by neighbour\n * node id. Each group keeps at most `maxPerGroup` items (default 10) and\n * reports `hidden` = count - items.length so the panel can offer \"show more\"\n * by re-calling with a larger `maxPerGroup`.\n *\n * @param {any} graph\n * @param {string} nodeId\n * @param {{maxPerGroup?: number}} [options]\n * @returns {{out: any[], in: any[], summary: {outEdges: number, inEdges: number, degree: number}}}\n */\nfunction connectionGroups(graph, nodeId, options) {\n  const input = isObject(graph) ? graph : {}\n  const opts = isObject(options) ? options : {}\n  const allNodes = Array.isArray(input.nodes) ? input.nodes : []\n  const allEdges = Array.isArray(input.edges) ? input.edges : []\n  const maxPerGroup = positiveInteger(opts.maxPerGroup, 10)\n  const nodeById = new Map()\n  for (const node of allNodes) {\n    if (isObject(node) && typeof node.id === 'string' && !nodeById.has(node.id)) nodeById.set(node.id, node)\n  }\n\n  if (typeof nodeId !== 'string' || !nodeById.has(nodeId)) {\n    return { out: [], in: [], summary: { outEdges: 0, inEdges: 0, degree: 0 } }\n  }\n\n  const outGroups = new Map()\n  const inGroups = new Map()\n\n  function addEdge(groupMap, predicate, neighborId, edge) {\n    let group = groupMap.get(predicate)\n    if (group === undefined) {\n      group = {\n        predicate,\n        label: stringValue(edge.label) || localName(predicate) || predicate,\n        count: 0,\n        neighbors: new Map(),\n      }\n      groupMap.set(predicate, group)\n    }\n    group.count += 1\n    if (group.neighbors.has(neighborId)) return\n    const neighbor = nodeById.get(neighborId)\n    group.neighbors.set(neighborId, {\n      id: neighborId,\n      label: stringValue(neighbor && neighbor.label) || localName(neighborId) || neighborId,\n      kind: neighbor && typeof neighbor.kind === 'string' ? neighbor.kind : 'external',\n    })\n  }\n\n  let outEdges = 0\n  let inEdges = 0\n  for (const edge of allEdges) {\n    if (!isObject(edge)) continue\n    const predicate = typeof edge.p === 'string' ? edge.p : ''\n    if (edge.source === nodeId) {\n      outEdges += 1\n      addEdge(outGroups, predicate, edge.target, edge)\n    }\n    if (edge.target === nodeId) {\n      inEdges += 1\n      addEdge(inGroups, predicate, edge.source, edge)\n    }\n  }\n\n  function finalize(groupMap) {\n    const groups = []\n    for (const group of groupMap.values()) {\n      const items = Array.from(group.neighbors.values())\n        .sort((a, b) => compareStrings(a.id, b.id))\n      const keptItems = items.slice(0, maxPerGroup)\n      groups.push({\n        predicate: group.predicate,\n        label: group.label,\n        count: group.count,\n        items: keptItems,\n        hidden: Math.max(0, group.count - keptItems.length),\n      })\n    }\n    groups.sort((a, b) => {\n      const aType = a.predicate === RDF_TYPE ? 0 : 1\n      const bType = b.predicate === RDF_TYPE ? 0 : 1\n      if (aType !== bType) return aType - bType\n      if (a.count !== b.count) return b.count - a.count\n      return compareStrings(a.predicate, b.predicate)\n    })\n    return groups\n  }\n\n  return {\n    out: finalize(outGroups),\n    in: finalize(inGroups),\n    summary: { outEdges, inEdges, degree: outEdges + inEdges },\n  }\n}\n\n// ---------------------------------------------------------------------------\n// Layout\n// ---------------------------------------------------------------------------\n\nfunction positiveInteger(value, fallback) {\n  if (typeof value !== 'number' || !Number.isFinite(value)) return fallback\n  const integer = Math.floor(value)\n  return integer > 0 ? integer : fallback\n}\n\n/** Positive integer or 0 meaning \"budget disabled\". */\nfunction optionalPositiveInteger(value) {\n  if (typeof value !== 'number' || !Number.isFinite(value)) return 0\n  const integer = Math.floor(value)\n  return integer > 0 ? integer : 0\n}\n\nfunction numberOption(value, fallback) {\n  return typeof value === 'number' && Number.isFinite(value) ? value : fallback\n}\n\nfunction finiteOr(value, fallback) {\n  return Number.isFinite(value) ? value : fallback\n}\n\n/** Mulberry32: tiny, fast, deterministic PRNG (never Math.random). */\nfunction mulberry32(seed) {\n  let state = seed >>> 0\n  return function random() {\n    state = (state + 0x6d2b79f5) >>> 0\n    let t = state\n    t = Math.imul(t ^ (t >>> 15), t | 1)\n    t ^= t + Math.imul(t ^ (t >>> 7), t | 61)\n    return ((t ^ (t >>> 14)) >>> 0) / 4294967296\n  }\n}\n\n/** Deterministic per-index pseudo-random value in [0, 1) for cheap sampling. */\nfunction hashUnit(a, b, c) {\n  let value = Math.imul(a + 1, 0x9e3779b1)\n  value ^= Math.imul(b + 1, 0x85ebca6b)\n  value ^= Math.imul(c + 1, 0xc2b2ae35)\n  value ^= value >>> 15\n  value = Math.imul(value, 0x2545f491)\n  value ^= value >>> 13\n  return (value >>> 0) / 4294967296\n}\n\nconst layoutNow = typeof performance !== 'undefined' && performance && typeof performance.now === 'function'\n  ? function now() { return performance.now() }\n  : function now() { return Date.now() }\n\n/**\n * Prepare the deterministic layout state shared by `layoutGraph` and\n * `createLayoutTask`: split connected components, seed them on a grid of\n * cells, and allocate all force-pass buffers. Only seeding consumes the seeded\n * PRNG, so stepping the force pass later cannot change the result.\n *\n * @param {any} graph\n * @param {any} options\n * @returns {any} layout state\n */\nfunction prepareLayout(graph, options) {\n  const opts = isObject(options) ? options : {}\n  const width = Math.max(1, numberOption(opts.width, 900))\n  const height = Math.max(1, numberOption(opts.height, 600))\n  const iterations = Math.max(0, Math.min(2000, Math.floor(numberOption(opts.iterations, 320))))\n  const seed = Number.isFinite(opts.seed) ? Math.floor(opts.seed) >>> 0 : 1\n  const requestedPadding = Math.max(0, numberOption(opts.padding, 24))\n  const padding = Math.min(requestedPadding, Math.min(width, height) * 0.45)\n\n  const nodes = isObject(graph) && Array.isArray(graph.nodes) ? graph.nodes : []\n  const edges = isObject(graph) && Array.isArray(graph.edges) ? graph.edges : []\n\n  // Deduplicate ids while preserving input order; the caller normally sends\n  // already-deduped buildGraph output.\n  const ids = []\n  const indexById = new Map()\n  for (const node of nodes) {\n    if (!isObject(node) || typeof node.id !== 'string') continue\n    if (indexById.has(node.id)) continue\n    indexById.set(node.id, ids.length)\n    ids.push(node.id)\n  }\n\n  const count = ids.length\n  if (count === 0) {\n    return { empty: true, single: false, count: 0, ids, width, height, iterations: 0, seed, padding }\n  }\n  if (count === 1) {\n    return { empty: false, single: true, count: 1, ids, width, height, iterations: 0, seed, padding }\n  }\n\n  const adjacency = []\n  for (let i = 0; i < count; i += 1) adjacency.push([])\n  const usableEdges = []\n  for (const edge of edges) {\n    if (!isObject(edge)) continue\n    const source = indexById.get(edge.source)\n    const target = indexById.get(edge.target)\n    if (source === undefined || target === undefined || source === target) continue\n    adjacency[source].push(target)\n    adjacency[target].push(source)\n    usableEdges.push([source, target])\n  }\n\n  // --- connected components -------------------------------------------------\n  const componentOf = new Int32Array(count).fill(-1)\n  const components = []\n  for (let start = 0; start < count; start += 1) {\n    if (componentOf[start] !== -1) continue\n    const componentIndex = components.length\n    const members = [start]\n    componentOf[start] = componentIndex\n    const stack = [start]\n    while (stack.length > 0) {\n      const current = stack.pop()\n      for (const neighbour of adjacency[current]) {\n        if (componentOf[neighbour] !== -1) continue\n        componentOf[neighbour] = componentIndex\n        members.push(neighbour)\n        stack.push(neighbour)\n      }\n    }\n    components.push(members)\n  }\n\n  const placement = components.map((members, index) => ({ members, index }))\n  placement.sort((a, b) => b.members.length - a.members.length || a.members[0] - b.members[0])\n\n  const random = mulberry32(seed)\n  const xs = new Float64Array(count)\n  const ys = new Float64Array(count)\n  const centerX = new Float64Array(components.length)\n  const centerY = new Float64Array(components.length)\n\n  const columns = Math.max(1, Math.ceil(Math.sqrt(components.length)))\n  const rows = Math.max(1, Math.ceil(components.length / columns))\n  const cellWidth = width / columns\n  const cellHeight = height / rows\n  const largest = placement[0].members.length\n  const ideal = Math.max(6, Math.min(0.45 * Math.min(width, height), 0.8 * Math.sqrt((width * height) / count)))\n  const goldenAngle = Math.PI * (3 - Math.sqrt(5))\n\n  for (let slot = 0; slot < placement.length; slot += 1) {\n    const entry = placement[slot]\n    const column = slot % columns\n    const row = Math.floor(slot / columns)\n    const cx = (column + 0.5) * cellWidth\n    const cy = (row + 0.5) * cellHeight\n    centerX[entry.index] = cx\n    centerY[entry.index] = cy\n\n    const members = entry.members\n    const sizeFactor = Math.sqrt(members.length / Math.max(1, largest))\n    const radius = 0.42 * Math.min(cellWidth, cellHeight) * sizeFactor\n    for (let position = 0; position < members.length; position += 1) {\n      const nodeIndex = members[position]\n      // Seeded jitter breaks the perfect rotational symmetry and makes a\n      // different seed produce a different (but still stable) drawing.\n      const angle = position * goldenAngle + (random() - 0.5) * 0.7\n      const distance = radius * Math.sqrt((position + 0.5) / members.length) * (0.9 + random() * 0.2)\n      xs[nodeIndex] = cx + Math.cos(angle) * distance\n      ys[nodeIndex] = cy + Math.sin(angle) * distance\n    }\n  }\n\n  const exactRepulsion = count <= 420\n  const sampleCount = Math.min(count - 1, 28)\n\n  return {\n    empty: false,\n    single: false,\n    count,\n    ids,\n    width,\n    height,\n    iterations,\n    seed,\n    padding,\n    usableEdges,\n    componentOf,\n    centerX,\n    centerY,\n    xs,\n    ys,\n    exactRepulsion,\n    sampleCount,\n    repulsionScale: exactRepulsion ? 1 : (count - 1) / sampleCount,\n    edgeStride: usableEdges.length > 30000 ? Math.ceil(usableEdges.length / 30000) : 1,\n    dispX: new Float64Array(count),\n    dispY: new Float64Array(count),\n    startTemperature: ideal * 0.9,\n    ideal,\n  }\n}\n\n/**\n * Run the Fruchterman-Reingold style force pass for iterations [from, to).\n * The body is the single source of truth shared by the one-shot layout and the\n * stepped layout task, which is what makes them mathematically identical.\n */\nfunction runLayoutIterations(state, from, to) {\n  const count = state.count\n  const xs = state.xs\n  const ys = state.ys\n  const usableEdges = state.usableEdges\n  const edgeStride = state.edgeStride\n  const ideal = state.ideal\n  const componentOf = state.componentOf\n  const centerX = state.centerX\n  const centerY = state.centerY\n  const dispX = state.dispX\n  const dispY = state.dispY\n  const exactRepulsion = state.exactRepulsion\n  const sampleCount = state.sampleCount\n  const repulsionScale = state.repulsionScale\n  const startTemperature = state.startTemperature\n  const seed = state.seed\n  const iterations = state.iterations\n\n  for (let iteration = from; iteration < to; iteration += 1) {\n    dispX.fill(0)\n    dispY.fill(0)\n\n    // Attractive forces along edges (Fruchterman-Reingold f = d^2 / k).\n    for (let index = 0; index < usableEdges.length; index += edgeStride) {\n      const edge = usableEdges[index]\n      const source = edge[0]\n      const target = edge[1]\n      let dx = xs[source] - xs[target]\n      let dy = ys[source] - ys[target]\n      let distance = Math.sqrt(dx * dx + dy * dy)\n      if (distance < 0.01) {\n        dx = (hashUnit(source, target, iteration) - 0.5) * 0.02\n        dy = (hashUnit(target, source, iteration) - 0.5) * 0.02\n        distance = Math.sqrt(dx * dx + dy * dy)\n      }\n      if (!(distance > 1e-9)) {\n        dx = 0.01\n        dy = 0\n        distance = 0.01\n      }\n      const force = Math.min((distance * distance) / ideal, ideal * 4) * edgeStride\n      const ux = dx / distance\n      const uy = dy / distance\n      dispX[source] -= ux * force\n      dispY[source] -= uy * force\n      dispX[target] += ux * force\n      dispY[target] += uy * force\n    }\n\n    // Repulsive forces between nodes.\n    if (exactRepulsion) {\n      for (let i = 0; i < count; i += 1) {\n        for (let j = i + 1; j < count; j += 1) {\n          let dx = xs[i] - xs[j]\n          let dy = ys[i] - ys[j]\n          let distance = Math.sqrt(dx * dx + dy * dy)\n          if (distance < 0.01) {\n            dx = (hashUnit(i, j, iteration) - 0.5) * 0.02\n            dy = (hashUnit(j, i, iteration) - 0.5) * 0.02\n            distance = Math.sqrt(dx * dx + dy * dy)\n          }\n          if (!(distance > 1e-9)) {\n            dx = 0.01\n            dy = 0\n            distance = 0.01\n          }\n          const force = Math.min((ideal * ideal) / distance, ideal * 8)\n          const ux = dx / distance\n          const uy = dy / distance\n          dispX[i] += ux * force\n          dispY[i] += uy * force\n          dispX[j] -= ux * force\n          dispY[j] -= uy * force\n        }\n      }\n    } else {\n      for (let i = 0; i < count; i += 1) {\n        for (let sample = 0; sample < sampleCount; sample += 1) {\n          let j = Math.floor(hashUnit(i, sample, iteration + seed) * count)\n          if (j >= count) j = count - 1\n          if (j === i) continue\n          let dx = xs[i] - xs[j]\n          let dy = ys[i] - ys[j]\n          let distance = Math.sqrt(dx * dx + dy * dy)\n          if (distance < 0.01) {\n            dx = (hashUnit(i, sample, iteration) - 0.5) * 0.02\n            dy = (hashUnit(sample, i, iteration) - 0.5) * 0.02\n            distance = Math.sqrt(dx * dx + dy * dy)\n          }\n          if (!(distance > 1e-9)) {\n            dx = 0.01\n            dy = 0\n            distance = 0.01\n          }\n          const force = Math.min((ideal * ideal) / distance, ideal * 8) * repulsionScale\n          const ux = dx / distance\n          const uy = dy / distance\n          dispX[i] += ux * force\n          dispY[i] += uy * force\n          dispX[j] -= ux * force * 0.25\n          dispY[j] -= uy * force * 0.25\n        }\n      }\n    }\n\n    // Weak gravity towards each component's grid cell centre keeps\n    // disconnected clusters in their own region of the canvas.\n    for (let i = 0; i < count; i += 1) {\n      const component = componentOf[i]\n      dispX[i] += (centerX[component] - xs[i]) * 0.02\n      dispY[i] += (centerY[component] - ys[i]) * 0.02\n    }\n\n    // Cool down and apply a capped displacement.\n    const temperature = startTemperature * (1 - (iteration + 1) / iterations) + ideal * 0.002\n    for (let i = 0; i < count; i += 1) {\n      const dx = dispX[i]\n      const dy = dispY[i]\n      const distance = Math.sqrt(dx * dx + dy * dy)\n      if (!Number.isFinite(distance) || distance < 1e-9) continue\n      const step = Math.min(distance, temperature) / distance\n      const nextX = xs[i] + dx * step\n      const nextY = ys[i] + dy * step\n      if (Number.isFinite(nextX)) xs[i] = nextX\n      if (Number.isFinite(nextY)) ys[i] = nextY\n    }\n  }\n}\n\n/** Scale and centre the solved coordinates into the padded box. */\nfunction finalizeLayout(state) {\n  const count = state.count\n  const xs = state.xs\n  const ys = state.ys\n  const ids = state.ids\n  const width = state.width\n  const height = state.height\n  const padding = state.padding\n\n  let minX = Infinity\n  let maxX = -Infinity\n  let minY = Infinity\n  let maxY = -Infinity\n  for (let i = 0; i < count; i += 1) {\n    if (xs[i] < minX) minX = xs[i]\n    if (xs[i] > maxX) maxX = xs[i]\n    if (ys[i] < minY) minY = ys[i]\n    if (ys[i] > maxY) maxY = ys[i]\n  }\n  if (!Number.isFinite(minX) || !Number.isFinite(maxX) || !Number.isFinite(minY) || !Number.isFinite(maxY)) {\n    minX = maxX = minY = maxY = 0\n  }\n\n  const spanX = maxX - minX\n  const spanY = maxY - minY\n  const availableWidth = Math.max(0, width - padding * 2)\n  const availableHeight = Math.max(0, height - padding * 2)\n  const scaleX = spanX > 1e-9 ? availableWidth / spanX : Infinity\n  const scaleY = spanY > 1e-9 ? availableHeight / spanY : Infinity\n  let scale = Math.min(scaleX, scaleY)\n  if (!Number.isFinite(scale) || scale <= 0) scale = 1\n  const offsetX = (width - spanX * scale) / 2 - minX * scale\n  const offsetY = (height - spanY * scale) / 2 - minY * scale\n  const lowerX = padding\n  const upperX = width - padding\n  const lowerY = padding\n  const upperY = height - padding\n\n  const result = new Array(count)\n  for (let i = 0; i < count; i += 1) {\n    let x = offsetX + xs[i] * scale\n    let y = offsetY + ys[i] * scale\n    if (!Number.isFinite(x)) x = width / 2\n    if (!Number.isFinite(y)) y = height / 2\n    x = Math.min(upperX, Math.max(lowerX, x))\n    y = Math.min(upperY, Math.max(lowerY, y))\n    result[i] = { id: ids[i], x, y, vx: 0, vy: 0 }\n  }\n  return result\n}\n\nfunction singlePoint(state) {\n  return [{ id: state.ids[0], x: state.width / 2, y: state.height / 2, vx: 0, vy: 0 }]\n}\n\n/**\n * Deterministic force-directed layout in a width x height box.\n *\n * The graph is split into connected components, components are seeded on a\n * grid of cells (so they cannot collapse onto each other), and each cell gets\n * a phyllotaxis seed. A Fruchterman-Reingold style pass then runs with:\n *   - attractive forces along edges,\n *   - repulsive forces between nodes (exact for small graphs, deterministic\n *     sampling for large ones so 1200 nodes stay interactive),\n *   - a weak pull towards the component's grid cell centre,\n *   - a linear cooling schedule and a per-iteration displacement cap.\n * The result is finally scaled and centred into the padded box.\n *\n * Same graph + same seed => byte-identical positions.\n *\n * @param {any} graph\n * @param {{width?: number, height?: number, iterations?: number, seed?: number, padding?: number}} [options]\n * @returns {{id: string, x: number, y: number, vx: number, vy: number}[]}\n */\nfunction layoutGraph(graph, options) {\n  const state = prepareLayout(graph, options)\n  if (state.empty) return []\n  if (state.single) return singlePoint(state)\n  runLayoutIterations(state, 0, state.iterations)\n  return finalizeLayout(state)\n}\n\n/**\n * Chunked, cancellable layout task used when layout must not block the main\n * thread (design §3.4). It shares `prepareLayout` / `runLayoutIterations` /\n * `finalizeLayout` with `layoutGraph`, so running it to completion yields\n * mathematically identical positions (same seed, iteration order and sampling\n * decisions; a Node test asserts deep equality).\n *\n * @param {any} graph\n * @param {{width?: number, height?: number, iterations?: number, seed?: number, padding?: number}} [options]\n * @returns {{step: (maxMillis?: number) => {done: boolean, progress: number, canceled?: boolean},\n *            result: () => any[]|null, cancel: () => void}}\n */\nfunction createLayoutTask(graph, options) {\n  const state = prepareLayout(graph, options)\n  let next = 0\n  let done = state.empty || state.single || state.iterations === 0\n  let positions = null\n  if (state.empty) positions = []\n  else if (state.single) positions = singlePoint(state)\n  else if (done) positions = finalizeLayout(state)\n  let progress = done ? 1 : 0\n  let canceled = false\n\n  function step(maxMillis) {\n    if (canceled) return { done: true, progress: 1, canceled: true }\n    if (done) return { done: true, progress: 1 }\n    const budget = typeof maxMillis === 'number' && Number.isFinite(maxMillis) ? maxMillis : 8\n    const started = layoutNow()\n    while (next < state.iterations) {\n      runLayoutIterations(state, next, next + 1)\n      next += 1\n      if (budget <= 0) break\n      if (layoutNow() - started >= budget) break\n    }\n    progress = Math.min(1, next / state.iterations)\n    if (next >= state.iterations) {\n      positions = finalizeLayout(state)\n      done = true\n      progress = 1\n      return { done: true, progress }\n    }\n    return { done: false, progress }\n  }\n\n  function result() {\n    return positions\n  }\n\n  function cancel() {\n    canceled = true\n    done = true\n    progress = 1\n    positions = null\n  }\n\n  return { step, result, cancel }\n}\n\n// ==== src/worker-entry.js ====\n/**\n * Background compute entry (classic Blob Worker script).\n *\n * This file is NEVER concatenated into the main Client closure. `build/build.mjs`\n * reads it together with `src/rdf-parse.js` and `src/graph-model.js`, strips the\n * ES-module export syntax, wraps the three sources in an IIFE and embeds the\n * result as the `ONTOLOGY_WORKER_SOURCE` string inside `client.js`. At runtime\n * the plugin creates a classic worker from a Blob URL, so this script must be\n * fully self-contained: `parseOntology`, `buildGraph` and `layoutGraph` are\n * resolved from the worker closure created by the build. No React, no DOM.\n *\n * Protocol (see `src/ontology-job.js` for the client side):\n *\n *   in:  { type: 'compute', id, text, resourceAddress, displayName,\n *          limits: { maxTriples, maxNodes, maxEdges, maxLiteralsPerNode,\n *                    maxLiteralLength, maxDepth },\n *          layout: { width, height, seed, iterations } }\n *        { type: 'relayout', id, width, height, seed, iterations }\n *\n *   out: { type: 'graph', id, graph, base, baseSource, prefixes, diagnostics,\n *          stats, truncation, timing: { parse, build, layout } }\n *        { type: 'layout', id, positions: Float64Array, timing: { layout } }\n *        { type: 'error', id, message }\n *\n * `positions` is a transferable Float64Array of x/y pairs in `graph.nodes`\n * order (layoutGraph deduplicates ids in input order, so the order matches the\n * node list the main thread already has). The worker caches the last graph by\n * message id so a size change can run `relayout` without re-parsing.\n *\n * Keeping this file free of `import`/`export` matches the build's no-import\n * contract. Only `node --check` and the bundle tests ever read it directly.\n */\n\n/** Monotonic-enough clock inside a worker; Date.now is the fallback. */\nfunction ontologyWorkerNow() {\n  try {\n    if (typeof self !== 'undefined' && self.performance && typeof self.performance.now === 'function') {\n      return self.performance.now()\n    }\n  } catch (error) {\n    // fall through to Date.now\n  }\n  return Date.now()\n}\n\n/** Coerce a finite number, else return the fallback (0 is a valid value). */\nfunction ontologyWorkerNumber(value, fallback) {\n  return typeof value === 'number' && Number.isFinite(value) ? value : fallback\n}\n\n/** Merge protocol limits with the design's initial budgets. */\nfunction ontologyWorkerNormalizeLimits(limits) {\n  const input = limits && typeof limits === 'object' ? limits : {}\n  return {\n    maxTriples: Math.max(1, Math.floor(ontologyWorkerNumber(input.maxTriples, 120000))),\n    maxNodes: Math.max(1, Math.floor(ontologyWorkerNumber(input.maxNodes, 1500))),\n    maxEdges: Math.max(0, Math.floor(ontologyWorkerNumber(input.maxEdges, 6000))),\n    maxLiteralsPerNode: Math.max(0, Math.floor(ontologyWorkerNumber(input.maxLiteralsPerNode, 60))),\n    maxLiteralLength: Math.max(1, Math.floor(ontologyWorkerNumber(input.maxLiteralLength, 16384))),\n    maxDepth: Math.max(1, Math.floor(ontologyWorkerNumber(input.maxDepth, 256))),\n  }\n}\n\n/** Merge protocol layout options with the deterministic layout defaults. */\nfunction ontologyWorkerNormalizeLayout(layout) {\n  const input = layout && typeof layout === 'object' ? layout : {}\n  const width = Math.max(1, ontologyWorkerNumber(input.width, 900))\n  const height = Math.max(1, ontologyWorkerNumber(input.height, 600))\n  const seed = Number.isFinite(input.seed) ? Math.floor(input.seed) >>> 0 : 1\n  const iterations = Math.max(0, Math.min(2000, Math.floor(ontologyWorkerNumber(input.iterations, 320))))\n  return { width, height, seed, iterations }\n}\n\n/** Pack layout points into the transferable x/y pair array. */\nfunction ontologyWorkerPackPositions(positions) {\n  const list = Array.isArray(positions) ? positions : []\n  const packed = new Float64Array(list.length * 2)\n  for (let index = 0; index < list.length; index += 1) {\n    const point = list[index] && typeof list[index] === 'object' ? list[index] : {}\n    packed[index * 2] = Number.isFinite(point.x) ? point.x : 0\n    packed[index * 2 + 1] = Number.isFinite(point.y) ? point.y : 0\n  }\n  return packed\n}\n\n/** Human-readable message for the error protocol message. */\nfunction ontologyWorkerErrorMessage(error) {\n  return error && error.message ? String(error.message) : String(error)\n}\n\n/** Last computed graph, kept so `relayout` does not re-parse the document. */\nlet ontologyWorkerCache = null\n\n/** Post the transferable layout message. */\nfunction ontologyWorkerPostLayout(id, positions, elapsed) {\n  const packed = ontologyWorkerPackPositions(positions)\n  self.postMessage({ type: 'layout', id, positions: packed, timing: { layout: elapsed } }, [packed.buffer])\n}\n\n/** Handle one `compute` request: parse -> build -> layout -> cache. */\nfunction ontologyWorkerCompute(id, message) {\n  const text = typeof message.text === 'string' ? message.text : ''\n  const resourceAddress = typeof message.resourceAddress === 'string' ? message.resourceAddress : ''\n  const displayName = typeof message.displayName === 'string' ? message.displayName : ''\n  const limits = ontologyWorkerNormalizeLimits(message.limits)\n  const layoutOptions = ontologyWorkerNormalizeLayout(message.layout)\n\n  const startedAt = ontologyWorkerNow()\n  const parsed = parseOntology(text, {\n    resourceAddress: resourceAddress || undefined,\n    fileName: displayName || undefined,\n    maxTriples: limits.maxTriples,\n    maxLiteralLength: limits.maxLiteralLength,\n    maxDepth: limits.maxDepth,\n  }) || {}\n  const parsedAt = ontologyWorkerNow()\n\n  const graph = buildGraph(parsed, {\n    maxNodes: limits.maxNodes,\n    maxEdges: limits.maxEdges,\n    maxLiteralsPerNode: limits.maxLiteralsPerNode,\n    maxLiteralLength: limits.maxLiteralLength,\n    source: {\n      address: resourceAddress,\n      displayName: displayName,\n      format: typeof parsed.format === 'string' ? parsed.format : '',\n    },\n  }) || { nodes: [], edges: [], stats: {}, warnings: [] }\n  const builtAt = ontologyWorkerNow()\n\n  const positions = layoutGraph(graph, layoutOptions)\n  const laidOutAt = ontologyWorkerNow()\n\n  ontologyWorkerCache = { id: id, graph: graph }\n\n  const stats = parsed.stats && typeof parsed.stats === 'object' ? parsed.stats : {}\n  self.postMessage({\n    type: 'graph',\n    id: id,\n    graph: graph,\n    base: typeof parsed.base === 'string' ? parsed.base : '',\n    baseSource: typeof parsed.baseSource === 'string' ? parsed.baseSource : 'none',\n    prefixes: parsed.prefixes && typeof parsed.prefixes === 'object' ? parsed.prefixes : {},\n    diagnostics: Array.isArray(parsed.diagnostics) ? parsed.diagnostics : [],\n    stats: stats,\n    truncation: stats.truncation && typeof stats.truncation === 'object' ? stats.truncation : null,\n    timing: {\n      parse: parsedAt - startedAt,\n      build: builtAt - parsedAt,\n      layout: laidOutAt - builtAt,\n    },\n  })\n  ontologyWorkerPostLayout(id, positions, laidOutAt - builtAt)\n}\n\n/** Handle one `relayout` request against the cached graph. */\nfunction ontologyWorkerRelayout(id, message) {\n  if (!ontologyWorkerCache || ontologyWorkerCache.id !== id) {\n    throw new Error('relayout requested before a graph is available')\n  }\n  const layoutOptions = ontologyWorkerNormalizeLayout(message)\n  const startedAt = ontologyWorkerNow()\n  const positions = layoutGraph(ontologyWorkerCache.graph, layoutOptions)\n  ontologyWorkerPostLayout(id, positions, ontologyWorkerNow() - startedAt)\n}\n\n/** Worker message entry point. */\nself.onmessage = function ontologyWorkerOnMessage(event) {\n  const message = event && event.data ? event.data : null\n  if (!message || typeof message !== 'object') return\n  const id = message.id\n  try {\n    if (message.type === 'compute') {\n      ontologyWorkerCompute(id, message)\n      return\n    }\n    if (message.type === 'relayout') {\n      ontologyWorkerRelayout(id, message)\n    }\n  } catch (error) {\n    self.postMessage({ type: 'error', id: id, message: ontologyWorkerErrorMessage(error) })\n  }\n}\n})();";
+		// ==== src/ontology-workspace.js ====
+		/**
+		 * Multi-file ontology workspace: source records, bounded L0 storage and the
+		 * merged statement index that the graph model renders.
+		 *
+		 * This module is plain ECMAScript and is concatenated into the Client bundle
+		 * and the embedded Worker (see build/build.mjs) as well as imported directly
+		 * by Node tests. Like `ontology-job.js` it resolves the few helpers that live
+		 * in sibling modules through explicit injection or the shared closure, so the
+		 * module stays import-free:
+		 *
+		 *   createWorkspace({ buildGraph, identity })
+		 *   addSource(workspace, input)       // input.parsed is a parseOntology result
+		 *   removeSource(workspace, sourceId)
+		 *   replaceSource(workspace, sourceId, input)
+		 *   workspaceAdmission(workspace, byteSize)
+		 *   composeWorkspaceGraph(workspace, options)
+		 *   workspaceSummary(workspace)
+		 *
+		 * Layers: this module owns L0 (bounded parsed statements and their sources).
+		 * The graph model derives L1 (bounded node-link model), the view filters it to
+		 * L2, exploration is L3 and the drawn edge budget is L4. Nothing here infers a
+		 * source position: statements only say which file they came from.
+		 */
+
+		/** Candidate admission limits. They are tuned by benchmarks, not contracts. */
+		const WORKSPACE_LIMITS = Object.freeze({
+		  maxFiles: 16,
+		  maxTotalSourceBytes: 24 * 1024 * 1024,
+		  maxOccurrences: 120000,
+		  maxTriplesPerSource: 120000,
+		  degradedMaxOccurrences: 60000,
+		})
+
+		const WORKSPACE_STATUS = Object.freeze({
+		  READY: 'ready',
+		  PARTIAL: 'partial',
+		  EMPTY: 'empty',
+		  ERROR: 'error',
+		})
+
+		/** UTF-8 byte length of a string, falling back to code units. */
+		function workspaceByteLength(text) {
+		  if (typeof text !== 'string') return 0
+		  try {
+		    if (typeof TextEncoder === 'function') return new TextEncoder().encode(text).length
+		  } catch (error) {
+		    // fall through to code units
+		  }
+		  return text.length
+		}
+
+		/** Resolve the graph builder from an explicit option or the bundle closure. */
+		function resolveWorkspaceBuildGraph(explicit) {
+		  if (typeof explicit === 'function') return explicit
+		  try {
+		    if (typeof buildGraph === 'function') return buildGraph
+		  } catch (error) {
+		    // no graph model in this scope
+		  }
+		  try {
+		    if (typeof globalThis === 'object' && globalThis &&
+		      typeof globalThis.buildGraph === 'function') return globalThis.buildGraph
+		  } catch (error) {
+		    // ignored
+		  }
+		  return null
+		}
+
+		/** Resolve identity helpers from an explicit option or the bundle closure. */
+		function resolveWorkspaceIdentity(explicit) {
+		  if (explicit && typeof explicit.entityKeyForTerm === 'function' &&
+		    typeof explicit.statementIdFor === 'function') {
+		    return explicit
+		  }
+		  try {
+		    if (typeof entityKeyForTerm === 'function' && typeof statementIdFor === 'function') {
+		      return {
+		        entityKeyForTerm: entityKeyForTerm,
+		        statementIdFor: statementIdFor,
+		        graphIdentityFor: graphIdentityFor,
+		      }
+		    }
+		  } catch (error) {
+		    // no identity module in this scope
+		  }
+		  return null
+		}
+
+		function workspaceLimits(limits) {
+		  const input = limits && typeof limits === 'object' ? limits : {}
+		  const read = (value, fallback) => (
+		    typeof value === 'number' && Number.isFinite(value) && value > 0
+		      ? Math.floor(value)
+		      : fallback
+		  )
+		  return {
+		    maxFiles: read(input.maxFiles, WORKSPACE_LIMITS.maxFiles),
+		    maxTotalSourceBytes: read(input.maxTotalSourceBytes, WORKSPACE_LIMITS.maxTotalSourceBytes),
+		    maxOccurrences: read(input.maxOccurrences, WORKSPACE_LIMITS.maxOccurrences),
+		    maxTriplesPerSource: read(input.maxTriplesPerSource, WORKSPACE_LIMITS.maxTriplesPerSource),
+		    degradedMaxOccurrences: read(input.degradedMaxOccurrences, WORKSPACE_LIMITS.degradedMaxOccurrences),
+		  }
+		}
+
+		/** Total accepted bytes of the sources that still count against the budget. */
+		function workspaceUsedBytes(workspace) {
+		  let total = 0
+		  for (const source of workspace.sources) total += Number(source.byteSize) || 0
+		  return total
+		}
+
+		/** Total accepted statement occurrences. */
+		function workspaceUsedOccurrences(workspace) {
+		  let total = 0
+		  for (const source of workspace.sources) total += Number(source.occurrenceCount) || 0
+		  return total
+		}
+
+		/**
+		 * Create an empty workspace.
+		 * @param {{limits?: object, buildGraph?: Function, identity?: object}} [options]
+		 */
+		function createWorkspace(options) {
+		  const opts = options && typeof options === 'object' ? options : {}
+		  return {
+		    limits: workspaceLimits(opts.limits),
+		    buildGraph: resolveWorkspaceBuildGraph(opts.buildGraph),
+		    identity: resolveWorkspaceIdentity(opts.identity),
+		    revision: 0,
+		    nextSourceNumber: 1,
+		    sources: [],
+		  }
+		}
+
+		/**
+		 * Ask whether one more source of `byteSize` bytes can be parsed and admitted.
+		 * The caller passes `maxTriples` to the parser; the workspace then re-checks
+		 * the real occurrence count when the parse result arrives.
+		 * @returns {{allowed: boolean, maxTriples: number, reason: string|null}}
+		 */
+		function workspaceAdmission(workspace, byteSize) {
+		  const state = workspace || createWorkspace()
+		  const limits = state.limits
+		  const bytes = Math.max(0, Number(byteSize) || 0)
+		  if (state.sources.length >= limits.maxFiles) {
+		    return { allowed: false, maxTriples: 0, reason: 'file-limit' }
+		  }
+		  if (workspaceUsedBytes(state) + bytes > limits.maxTotalSourceBytes) {
+		    return { allowed: false, maxTriples: 0, reason: 'byte-budget' }
+		  }
+		  const remaining = limits.maxOccurrences - workspaceUsedOccurrences(state)
+		  if (remaining <= 0) {
+		    return { allowed: false, maxTriples: 0, reason: 'occurrence-budget' }
+		  }
+		  return {
+		    allowed: true,
+		    maxTriples: Math.min(limits.maxTriplesPerSource, remaining),
+		    reason: null,
+		  }
+		}
+
+		/** Derive the presentation status of one parsed source. */
+		function workspaceSourceStatus(parsed, text) {
+		  if (!parsed || typeof parsed !== 'object') return WORKSPACE_STATUS.ERROR
+		  const triples = Array.isArray(parsed.triples) ? parsed.triples : []
+		  const errors = Array.isArray(parsed.errors) ? parsed.errors : []
+		  if (triples.length === 0) {
+		    if (typeof text === 'string' && text.trim() !== '' && errors.length > 0) {
+		      return WORKSPACE_STATUS.ERROR
+		    }
+		    return WORKSPACE_STATUS.EMPTY
+		  }
+		  const stats = parsed.stats && typeof parsed.stats === 'object' ? parsed.stats : {}
+		  if (stats.truncated || errors.length > 0) return WORKSPACE_STATUS.PARTIAL
+		  return WORKSPACE_STATUS.READY
+		}
+
+		/** Copy only what L0 and the UI need from one parse result. */
+		function workspaceParsedSnapshot(parsed) {
+		  const input = parsed && typeof parsed === 'object' ? parsed : {}
+		  const stats = input.stats && typeof input.stats === 'object' ? input.stats : {}
+		  return {
+		    format: typeof input.format === 'string' ? input.format : '',
+		    prefixes: input.prefixes && typeof input.prefixes === 'object' ? input.prefixes : {},
+		    base: typeof input.base === 'string' ? input.base : '',
+		    baseSource: typeof input.baseSource === 'string' ? input.baseSource : 'none',
+		    triples: Array.isArray(input.triples) ? input.triples : [],
+		    diagnostics: Array.isArray(input.diagnostics) ? input.diagnostics : [],
+		    warnings: Array.isArray(input.warnings) ? input.warnings : [],
+		    errors: Array.isArray(input.errors) ? input.errors : [],
+		    stats: {
+		      tripleCount: Number(stats.tripleCount) || (Array.isArray(input.triples) ? input.triples.length : 0),
+		      truncated: !!stats.truncated,
+		      truncation: stats.truncation || null,
+		    },
+		  }
+		}
+
+		/**
+		 * Add one parsed source. The caller parses first (with `workspaceAdmission`),
+		 * so this transaction only validates budgets and records the source.
+		 * @returns {{workspace: object, status: string, source: object|null, reason: string|null}}
+		 */
+		function addSource(workspace, input) {
+		  const state = workspace || createWorkspace()
+		  const request = input && typeof input === 'object' ? input : {}
+		  const parsed = request.parsed
+		  const text = typeof request.text === 'string' ? request.text : ''
+		  const byteSize = Number.isFinite(request.byteSize)
+		    ? Math.max(0, Number(request.byteSize))
+		    : (typeof request.text === 'string' ? workspaceByteLength(text) : 0)
+		  const admission = workspaceAdmission(state, byteSize)
+		  if (!admission.allowed) {
+		    return { workspace: state, status: 'rejected', source: null, reason: admission.reason }
+		  }
+		  const snapshot = workspaceParsedSnapshot(parsed)
+		  if (snapshot.triples.length > admission.maxTriples) {
+		    // The parser ignored the admission limit; never admit more than budgeted.
+		    return { workspace: state, status: 'rejected', source: null, reason: 'occurrence-budget' }
+		  }
+		  const status = typeof request.error === 'string' && request.error
+		    ? WORKSPACE_STATUS.ERROR
+		    : workspaceSourceStatus(parsed, text)
+		  const sourceId = typeof request.sourceId === 'string' && request.sourceId
+		    ? request.sourceId
+		    : 'src' + state.nextSourceNumber
+		  const revision = Number.isFinite(request.revision) && request.revision > 0
+		    ? Math.floor(request.revision)
+		    : 1
+		  const record = {
+		    sourceId: sourceId,
+		    origin: request.origin === 'browser' ? 'browser' : 'host',
+		    displayName: typeof request.displayName === 'string' ? request.displayName : '',
+		    navigationAddress: typeof request.navigationAddress === 'string' ? request.navigationAddress : null,
+		    absolutePath: typeof request.absolutePath === 'string' && request.absolutePath
+		      ? request.absolutePath
+		      : null,
+		    rdfBase: typeof request.rdfBase === 'string' ? request.rdfBase : '',
+		    format: typeof request.format === 'string' && request.format
+		      ? request.format
+		      : snapshot.format,
+		    revision: revision,
+		    status: status,
+		    byteSize: byteSize,
+		    occurrenceCount: snapshot.triples.length,
+		    error: typeof request.error === 'string' ? request.error : null,
+		    stale: false,
+		    parsed: snapshot,
+		    addedOrder: state.sources.length,
+		  }
+		  const next = Object.assign({}, state, {
+		    sources: state.sources.concat([record]),
+		    revision: state.revision + 1,
+		    nextSourceNumber: sourceId === 'src' + state.nextSourceNumber
+		      ? state.nextSourceNumber + 1
+		      : state.nextSourceNumber,
+		  })
+		  return { workspace: next, status: status, source: record, reason: null }
+		}
+
+		/** Remove one source; entities only it contributed disappear with it. */
+		function removeSource(workspace, sourceId) {
+		  const state = workspace || createWorkspace()
+		  const remaining = state.sources.filter((source) => source.sourceId !== sourceId)
+		  if (remaining.length === state.sources.length) return { workspace: state, removed: false }
+		  return {
+		    workspace: Object.assign({}, state, { sources: remaining, revision: state.revision + 1 }),
+		    removed: true,
+		  }
+		}
+
+		/**
+		 * Atomically replace one source with a newly parsed version. A rejected
+		 * candidate leaves the previous version untouched (no partial state).
+		 */
+		function replaceSource(workspace, sourceId, input) {
+		  const state = workspace || createWorkspace()
+		  const index = state.sources.findIndex((source) => source.sourceId === sourceId)
+		  if (index < 0) {
+		    return { workspace: state, status: 'missing', source: null, reason: 'unknown-source' }
+		  }
+		  const previous = state.sources[index]
+		  const request = Object.assign({}, input && typeof input === 'object' ? input : {})
+		  // A failed read or a missing parse result must not replace good data.
+		  if (typeof request.error === 'string' && request.error) {
+		    return { workspace: state, status: 'rejected', source: previous, reason: 'read-failed' }
+		  }
+		  if (!request.parsed || typeof request.parsed !== 'object' ||
+		    !Array.isArray(request.parsed.triples)) {
+		    return { workspace: state, status: 'rejected', source: previous, reason: 'missing-parse' }
+		  }
+		  const staged = Object.assign({}, state, {
+		    sources: state.sources.slice(0, index).concat(state.sources.slice(index + 1)),
+		    revision: state.revision,
+		  })
+		  request.sourceId = sourceId
+		  request.revision = (Number(previous.revision) || 1) + 1
+		  if (request.displayName === undefined) request.displayName = previous.displayName
+		  if (request.origin === undefined) request.origin = previous.origin
+		  if (request.navigationAddress === undefined) request.navigationAddress = previous.navigationAddress
+		  if (request.absolutePath === undefined) request.absolutePath = previous.absolutePath
+		  const added = addSource(staged, request)
+		  if (added.status === 'rejected') {
+		    return { workspace: state, status: 'rejected', source: previous, reason: added.reason }
+		  }
+		  const restored = staged.sources.slice()
+		  restored.splice(index, 0, added.source)
+		  return {
+		    workspace: Object.assign({}, added.workspace, {
+		      sources: restored,
+		      revision: state.revision + 1,
+		    }),
+		    status: added.status,
+		    source: added.source,
+		    reason: null,
+		  }
+		}
+
+		/** Mark one source as changed on disk without dropping its last good data. */
+		function markSourceStale(workspace, sourceId, version) {
+		  const state = workspace || createWorkspace()
+		  let changed = false
+		  const sources = state.sources.map((source) => {
+		    if (source.sourceId !== sourceId) return source
+		    if (version !== undefined && source.version === version) return source
+		    changed = true
+		    return Object.assign({}, source, { stale: true, version: version })
+		  })
+		  if (!changed) return { workspace: state, changed: false }
+		  return {
+		    workspace: Object.assign({}, state, { sources: sources, revision: state.revision + 1 }),
+		    changed: true,
+		  }
+		}
+
+		/** Valid source ids for a selection; an empty/absent selection means all. */
+		function selectSourceIds(workspace, sourceIds) {
+		  const state = workspace || createWorkspace()
+		  const wanted = Array.isArray(sourceIds) ? new Set(sourceIds.filter((id) => typeof id === 'string')) : null
+		  if (!wanted || wanted.size === 0) return state.sources.map((source) => source.sourceId)
+		  return state.sources
+		    .filter((source) => wanted.has(source.sourceId))
+		    .map((source) => source.sourceId)
+		}
+
+		/** Public source summaries for the source panel (never the parsed triples). */
+		function workspaceSummary(workspace) {
+		  const state = workspace || createWorkspace()
+		  return state.sources.map((source) => ({
+		    sourceId: source.sourceId,
+		    origin: source.origin,
+		    displayName: source.displayName,
+		    navigationAddress: source.navigationAddress,
+		    absolutePath: source.absolutePath,
+		    format: source.format,
+		    revision: source.revision,
+		    status: source.status,
+		    byteSize: source.byteSize,
+		    tripleCount: source.occurrenceCount,
+		    errorCount: source.parsed && Array.isArray(source.parsed.errors) ? source.parsed.errors.length : 0,
+		    warningCount: source.parsed && Array.isArray(source.parsed.warnings)
+		      ? source.parsed.warnings.length
+		      : 0,
+		    truncated: !!(source.parsed && source.parsed.stats && source.parsed.stats.truncated),
+		    stale: !!source.stale,
+		    base: source.parsed ? source.parsed.base : '',
+		  }))
+		}
+
+		/** Workspace-level counters derived from the accepted sources. */
+		function workspaceTotals(workspace) {
+		  const state = workspace || createWorkspace()
+		  return {
+		    files: state.sources.length,
+		    bytes: workspaceUsedBytes(state),
+		    occurrences: workspaceUsedOccurrences(state),
+		    maxFiles: state.limits.maxFiles,
+		    maxTotalSourceBytes: state.limits.maxTotalSourceBytes,
+		    maxOccurrences: state.limits.maxOccurrences,
+		    revision: state.revision,
+		  }
+		}
+
+		/** Statement key: every term identity plus the statement graph identity. */
+		function workspaceStatementKey(identity, terms, graphKey) {
+		  return [
+		    terms.s,
+		    terms.p,
+		    terms.oKind,
+		    terms.o,
+		    terms.dt || '',
+		    terms.lang || '',
+		    graphKey,
+		    terms.literalTruncated ? 'truncated' : '',
+		  ].join('\u0001')
+		}
+
+		/**
+		 * Merge the selected sources into statement records with occurrences.
+		 * Identical statements (same terms and graph identity) merge; every
+		 * occurrence keeps its source and revision.
+		 */
+		function workspaceMergeRecords(workspace, selectedIds) {
+		  const identity = workspace.identity
+		  if (!identity) throw new Error('workspace identity helpers are unavailable')
+		  const selected = selectedIds ? new Set(selectedIds) : null
+		  const records = new Map()
+		  const order = []
+		  let occurrences = 0
+		  for (const source of workspace.sources) {
+		    if (selected && !selected.has(source.sourceId)) continue
+		    const parsed = source.parsed
+		    if (!parsed || !Array.isArray(parsed.triples)) continue
+		    const triples = parsed.triples
+		    for (let ordinal = 0; ordinal < triples.length; ordinal++) {
+		      const triple = triples[ordinal]
+		      if (!triple || typeof triple.s !== 'string' || typeof triple.p !== 'string') continue
+		      if (triple.o === null || triple.o === undefined) continue
+		      const objectKind = triple.oKind === 'literal' || triple.oKind === 'blank'
+		        ? triple.oKind
+		        : 'iri'
+		      const graph = triple.graph && typeof triple.graph === 'object'
+		        ? triple.graph
+		        : { kind: 'unknown' }
+		      const terms = {
+		        s: identity.entityKeyForTerm(triple.s, source.sourceId),
+		        p: identity.entityKeyForTerm(triple.p, source.sourceId),
+		        o: objectKind === 'literal'
+		          ? String(triple.o)
+		          : identity.entityKeyForTerm(String(triple.o), source.sourceId),
+		        oKind: objectKind,
+		        dt: typeof triple.dt === 'string' ? triple.dt : undefined,
+		        lang: typeof triple.lang === 'string' ? triple.lang : undefined,
+		        literalTruncated: !!triple.literalTruncated,
+		      }
+		      const graphKey = identity.graphIdentityFor(source.sourceId, graph)
+		      const key = workspaceStatementKey(identity, terms, graphKey)
+		      let record = records.get(key)
+		      if (record === undefined) {
+		        record = Object.assign({ key: key, statementId: identity.statementIdFor(source.sourceId, ordinal), terms: terms }, {
+		          occurrences: [],
+		        })
+		        records.set(key, record)
+		        order.push(record)
+		      }
+		      record.occurrences.push({
+		        sourceId: source.sourceId,
+		        revision: source.revision,
+		        graph: graph,
+		      })
+		      occurrences += 1
+		    }
+		  }
+		  return { records: order, occurrences: occurrences }
+		}
+
+		/**
+		 * Build the L1 graph for the selected sources (all by default).
+		 * The graph model receives expanded statement occurrences plus the source
+		 * table, so node/edge provenance survives without re-parsing anything.
+		 * @param {{sourceIds?: string[], maxNodes?: number, maxEdges?: number,
+		 *          maxLiteralsPerNode?: number, maxLiteralLength?: number}} [options]
+		 */
+		function composeWorkspaceGraph(workspace, options) {
+		  const state = workspace || createWorkspace()
+		  const opts = options && typeof options === 'object' ? options : {}
+		  const builder = state.buildGraph
+		  if (typeof builder !== 'function') {
+		    return { error: 'graph-model-unavailable', graph: null, statements: 0, occurrences: 0 }
+		  }
+		  const selectedIds = opts.sourceIds === undefined
+		    ? state.sources.map((source) => source.sourceId)
+		    : selectSourceIds(state, opts.sourceIds)
+		  const merged = workspaceMergeRecords(state, selectedIds)
+		  const statements = []
+		  for (const record of merged.records) {
+		    for (const occurrence of record.occurrences) {
+		      statements.push({
+		        s: record.terms.s,
+		        p: record.terms.p,
+		        o: record.terms.o,
+		        oKind: record.terms.oKind,
+		        dt: record.terms.dt,
+		        lang: record.terms.lang,
+		        literalTruncated: record.terms.literalTruncated,
+		        graph: occurrence.graph,
+		        sourceId: occurrence.sourceId,
+		        statementId: record.statementId,
+		      })
+		    }
+		  }
+		  const sources = workspaceSummary(state).filter((source) => selectedIds.indexOf(source.sourceId) >= 0)
+		  const single = sources.length === 1 ? sources[0] : null
+		  const prefixes = {}
+		  for (const source of state.sources) {
+		    if (selectedIds.indexOf(source.sourceId) < 0) continue
+		    if (!source.parsed || !source.parsed.prefixes) continue
+		    const keys = Object.keys(source.parsed.prefixes)
+		    for (let index = 0; index < keys.length; index++) {
+		      const name = keys[index]
+		      if (typeof prefixes[name] !== 'string') prefixes[name] = source.parsed.prefixes[name]
+		    }
+		  }
+		  const graph = builder(
+		    { prefixes: prefixes, triples: [], sources: sources },
+		    {
+		      statements: statements,
+		      sources: sources,
+		      maxNodes: opts.maxNodes,
+		      maxEdges: opts.maxEdges,
+		      maxLiteralsPerNode: opts.maxLiteralsPerNode,
+		      maxLiteralLength: opts.maxLiteralLength,
+		      source: single
+		        ? {
+		            address: single.navigationAddress || single.absolutePath || '',
+		            displayName: single.displayName,
+		            format: single.format,
+		          }
+		        : { address: '', displayName: '', format: '' },
+		    },
+		  )
+		  return {
+		    graph: graph,
+		    statements: merged.records.length,
+		    occurrences: merged.occurrences,
+		    sourceIds: selectedIds,
+		  }
+		}
+
+		// ==== src/ontology-views.js ====
+		/**
+		 * Semantic projections over the L1 graph: the class/property hierarchy tree
+		 * and the layered relation view.
+		 *
+		 * Both projections are read-only. They never add synthetic RDF entities or
+		 * assertions to the graph: display references, cycle groups and layout
+		 * coordinates live only in the projection result. All coordinates are
+		 * deterministic (stable ordering, no Math.random) and bounded by explicit
+		 * budgets.
+		 *
+		 * Plain ECMAScript: concatenated into the Client bundle and the embedded
+		 * Worker (see build/build.mjs), and imported directly by Node tests.
+		 */
+
+		const VIEW_RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type'
+		const VIEW_RDF_PROPERTY = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#Property'
+		const VIEW_RDFS_SUBCLASSOF = 'http://www.w3.org/2000/01/rdf-schema#subClassOf'
+		const VIEW_RDFS_SUBPROPERTYOF = 'http://www.w3.org/2000/01/rdf-schema#subPropertyOf'
+		const VIEW_RDFS_LABEL = 'http://www.w3.org/2000/01/rdf-schema#label'
+		const VIEW_OWL_CLASS = 'http://www.w3.org/2002/07/owl#Class'
+		const VIEW_RDFS_CLASS = 'http://www.w3.org/2000/01/rdf-schema#Class'
+		const VIEW_OWL_OBJECT_PROPERTY = 'http://www.w3.org/2002/07/owl#ObjectProperty'
+		const VIEW_OWL_DATATYPE_PROPERTY = 'http://www.w3.org/2002/07/owl#DatatypeProperty'
+
+		const VIEW_HIERARCHY_DEFAULT_PREDICATE = VIEW_RDFS_SUBCLASSOF
+		const VIEW_GROUP_MARKER = '\u0000group\u0000'
+
+		/** Default element/expansion budgets (callers may override). */
+		const VIEW_BUDGETS = Object.freeze({
+		  maxEntities: 1200,
+		  maxRefs: 2000,
+		  maxDepth: 12,
+		  maxLayers: 200,
+		  maxLayerWidth: 80,
+		})
+
+		function viewIsObject(value) {
+		  return value !== null && typeof value === 'object'
+		}
+
+		function viewCompare(a, b) {
+		  if (a === b) return 0
+		  return a < b ? -1 : 1
+		}
+
+		function viewString(value) {
+		  return value === null || value === undefined ? '' : String(value)
+		}
+
+		function viewPositive(value, fallback) {
+		  if (typeof value === 'number' && Number.isFinite(value) && value > 0) return Math.floor(value)
+		  return fallback
+		}
+
+		/**
+		 * Iterative Tarjan strongly-connected components.
+		 *
+		 * @param {string[]} ids node ids in deterministic order
+		 * @param {Map<string, string[]>} outAdjacency outgoing edges per id
+		 * @returns {{componentOf: Map<string, number>, components: string[][]}}
+		 */
+		function computeStronglyConnectedComponents(ids, outAdjacency) {
+		  const index = new Map()
+		  const low = new Map()
+		  const onStack = new Set()
+		  const stack = []
+		  const componentOf = new Map()
+		  const components = []
+		  let counter = 0
+
+		  for (const rootId of ids) {
+		    if (index.has(rootId)) continue
+		    const frames = [{ id: rootId, next: 0 }]
+		    index.set(rootId, counter)
+		    low.set(rootId, counter)
+		    counter += 1
+		    stack.push(rootId)
+		    onStack.add(rootId)
+		    while (frames.length > 0) {
+		      const frame = frames[frames.length - 1]
+		      const neighbors = outAdjacency.get(frame.id) || []
+		      if (frame.next < neighbors.length) {
+		        const nextId = neighbors[frame.next]
+		        frame.next += 1
+		        if (!index.has(nextId)) {
+		          index.set(nextId, counter)
+		          low.set(nextId, counter)
+		          counter += 1
+		          stack.push(nextId)
+		          onStack.add(nextId)
+		          frames.push({ id: nextId, next: 0 })
+		        } else if (onStack.has(nextId)) {
+		          low.set(frame.id, Math.min(low.get(frame.id), index.get(nextId)))
+		        }
+		        continue
+		      }
+		      frames.pop()
+		      if (frames.length > 0) {
+		        const parent = frames[frames.length - 1]
+		        low.set(parent.id, Math.min(low.get(parent.id), low.get(frame.id)))
+		      }
+		      if (low.get(frame.id) === index.get(frame.id)) {
+		        const component = []
+		        let member
+		        do {
+		          member = stack.pop()
+		          onStack.delete(member)
+		          component.push(member)
+		          componentOf.set(member, components.length)
+		        } while (member !== frame.id)
+		        components.push(component)
+		      }
+		    }
+		  }
+		  return { componentOf, components }
+		}
+
+		/** Node ids in graph order, plus a lookup for one node by id. */
+		function viewNodeIndex(graph) {
+		  const nodes = viewIsObject(graph) && Array.isArray(graph.nodes) ? graph.nodes : []
+		  const byId = new Map()
+		  for (const node of nodes) {
+		    if (!viewIsObject(node) || typeof node.id !== 'string') continue
+		    if (!byId.has(node.id)) byId.set(node.id, node)
+		  }
+		  return { nodes: Array.from(byId.values()), byId }
+		}
+
+		/** Class-like candidate ids derived from explicit declarations and hierarchy. */
+		function viewClassCandidates(byId) {
+		  const candidates = new Set()
+		  for (const node of byId.values()) {
+		    if (node.kind === 'class') candidates.add(node.id)
+		  }
+		  return candidates
+		}
+
+		/**
+		 * Build the class or property hierarchy projection.
+		 *
+		 * Mode `class` follows explicit rdfs:subClassOf; mode `property` follows
+		 * explicit rdfs:subPropertyOf. `rdf:type` never becomes inheritance. The
+		 * result reports roots, orphan entities, cycles and budget truncation so the
+		 * view can explain missing structure instead of silently inventing it.
+		 *
+		 * @param {any} graph L1 graph
+		 * @param {{mode?: 'class'|'property', predicate?: string,
+		 *          maxEntities?: number}} [options]
+		 */
+		function buildHierarchy(graph, options) {
+		  const opts = viewIsObject(options) ? options : {}
+		  const mode = opts.mode === 'property' ? 'property' : 'class'
+		  const predicate = typeof opts.predicate === 'string' && opts.predicate
+		    ? opts.predicate
+		    : (mode === 'property' ? VIEW_RDFS_SUBPROPERTYOF : VIEW_HIERARCHY_DEFAULT_PREDICATE)
+		  const maxEntities = viewPositive(opts.maxEntities, VIEW_BUDGETS.maxEntities)
+		  const { nodes, byId } = viewNodeIndex(graph)
+		  const edges = viewIsObject(graph) && Array.isArray(graph.edges) ? graph.edges : []
+
+		  // Candidates are entities the document explicitly declares as classes (or
+		  // properties) plus both ends of a hierarchy relation. A node that is only
+		  // the object of rdf:type is a vocabulary reference, not a declared class, so
+		  // it does not flood the tree with owl:Class / rdfs:Class entries.
+		  const declaredTypes = mode === 'property'
+		    ? [VIEW_OWL_OBJECT_PROPERTY, VIEW_OWL_DATATYPE_PROPERTY, VIEW_RDF_PROPERTY]
+		    : [VIEW_OWL_CLASS, VIEW_RDFS_CLASS]
+		  const candidates = new Set()
+		  for (const node of nodes) {
+		    const types = Array.isArray(node.types) ? node.types : []
+		    for (const type of declaredTypes) {
+		      if (types.indexOf(type) >= 0) {
+		        candidates.add(node.id)
+		        break
+		      }
+		    }
+		  }
+		  for (const edge of edges) {
+		    if (!viewIsObject(edge) || edge.p !== predicate) continue
+		    if (typeof edge.source === 'string' && byId.has(edge.source)) candidates.add(edge.source)
+		    if (typeof edge.target === 'string' && byId.has(edge.target)) candidates.add(edge.target)
+		  }
+
+		  // Deterministic budget: keep the entities with the most hierarchy relations,
+		  // then the lexicographically smallest id.
+		  const relationCount = new Map()
+		  for (const id of candidates) relationCount.set(id, 0)
+		  for (const edge of edges) {
+		    if (!viewIsObject(edge) || edge.p !== predicate) continue
+		    if (relationCount.has(edge.source)) relationCount.set(edge.source, relationCount.get(edge.source) + 1)
+		    if (relationCount.has(edge.target)) relationCount.set(edge.target, relationCount.get(edge.target) + 1)
+		  }
+		  let keptIds = Array.from(candidates)
+		  keptIds.sort((a, b) => {
+		    const diff = (relationCount.get(b) || 0) - (relationCount.get(a) || 0)
+		    return diff !== 0 ? diff : viewCompare(a, b)
+		  })
+		  const entityTruncated = Math.max(0, keptIds.length - maxEntities)
+		  keptIds = keptIds.slice(0, maxEntities)
+		  const kept = new Set(keptIds)
+
+		  const entities = new Map()
+		  for (const id of keptIds) {
+		    const node = byId.get(id)
+		    entities.set(id, {
+		      id: id,
+		      label: node && typeof node.label === 'string' && node.label ? node.label : id,
+		      kind: node ? node.kind : 'external',
+		      iri: node && typeof node.iri === 'string' ? node.iri : id,
+		      parents: [],
+		      children: [],
+		      sourceIds: node && viewIsObject(node.provenance) && Array.isArray(node.provenance.sourceIds)
+		        ? node.provenance.sourceIds.slice()
+		        : [],
+		      inCycle: false,
+		      orphan: false,
+		    })
+		  }
+
+		  // Child -> parent edge direction. `relationId` points at the real graph edge.
+		  for (let index = 0; index < edges.length; index++) {
+		    const edge = edges[index]
+		    if (!viewIsObject(edge) || edge.p !== predicate) continue
+		    if (!kept.has(edge.source) || !kept.has(edge.target)) continue
+		    if (edge.source === edge.target) continue
+		    const relation = {
+		      relationId: typeof edge.id === 'string' ? edge.id : 'edge:' + index,
+		      predicate: edge.p,
+		      statementIds: Array.isArray(edge.statementIds) ? edge.statementIds.slice() : [],
+		      sourceIds: Array.isArray(edge.sourceIds) ? edge.sourceIds.slice() : [],
+		      graphs: Array.isArray(edge.graphs) ? edge.graphs.slice() : [],
+		    }
+		    const child = entities.get(edge.source)
+		    const parent = entities.get(edge.target)
+		    if (!child || !parent) continue
+		    child.parents.push(Object.assign({ parentId: edge.target }, relation))
+		    parent.children.push(Object.assign({ childId: edge.source }, relation))
+		  }
+
+		  // Self loops are cycles too; they stay visible as a cycle mark on the entity.
+		  for (const edge of edges) {
+		    if (!viewIsObject(edge) || edge.p !== predicate || edge.source !== edge.target) continue
+		    const entity = entities.get(edge.source)
+		    if (entity) entity.inCycle = true
+		  }
+
+		  const ids = keptIds.slice()
+		  const outAdjacency = new Map()
+		  for (const id of ids) outAdjacency.set(id, [])
+		  for (const entity of entities.values()) {
+		    const parents = entity.parents.map((relation) => relation.parentId).sort(viewCompare)
+		    outAdjacency.set(entity.id, parents)
+		  }
+		  const { componentOf, components } = computeStronglyConnectedComponents(ids, outAdjacency)
+		  for (const entity of entities.values()) {
+		    const component = components[componentOf.get(entity.id)]
+		    if (component.length > 1) entity.inCycle = true
+		  }
+
+		  const roots = []
+		  const cycles = []
+		  const orphans = []
+		  const componentMembers = new Map()
+		  for (const component of components) {
+		    if (component.length < 2) continue
+		    const members = component.slice().sort(viewCompare)
+		    componentMembers.set(component[0], members)
+		    for (const id of members) {
+		      const entity = entities.get(id)
+		      if (entity) entity.componentId = component[0]
+		    }
+		  }
+		  for (const id of ids) {
+		    const entity = entities.get(id)
+		    if (!entity) continue
+		    if (entity.inCycle) {
+		      const members = componentMembers.get(id)
+		      if (members) {
+		        // One group per multi-node SCC, emitted from its first member.
+		        if (!cycles.some((cycle) => cycle.id === id)) {
+		          const hasIncoming = members.some((memberId) => {
+		            const member = entities.get(memberId)
+		            return member && member.parents.some((relation) => members.indexOf(relation.parentId) < 0)
+		          })
+		          cycles.push({ id: id, members: members, hasExternalParent: hasIncoming })
+		        }
+		        continue
+		      }
+		      // A self loop marks the entity; with no other structure it stays a
+		      // visible root entry so the cycle is reachable.
+		      if (entity.parents.length === 0 && entity.children.length === 0) {
+		        entity.selfCycle = true
+		        roots.push(id)
+		      }
+		      continue
+		    }
+		    if (entity.parents.length === 0) {
+		      if (entity.children.length === 0) orphans.push(id)
+		      else roots.push(id)
+		    }
+		  }
+		  roots.sort(viewCompare)
+		  orphans.sort(viewCompare)
+		  cycles.sort((a, b) => viewCompare(a.id, b.id))
+
+		  let relationCountTotal = 0
+		  for (const entity of entities.values()) relationCountTotal += entity.parents.length
+
+		  return {
+		    mode: mode,
+		    predicate: predicate,
+		    entities: entities,
+		    entityIds: ids,
+		    roots: roots,
+		    orphans: orphans,
+		    cycles: cycles,
+		    stats: {
+		      entities: entities.size,
+		      relations: relationCountTotal,
+		      roots: roots.length,
+		      orphans: orphans.length,
+		      cycles: cycles.length,
+		      truncated: entityTruncated,
+		      maxEntities: maxEntities,
+		    },
+		  }
+		}
+
+		/**
+		 * Materialize only the expanded paths of a hierarchy into display references.
+		 *
+		 * Roots and orphan entries always get one reference. Every child of an
+		 * expanded entity becomes its own reference, so one entity reached by several
+		 * paths appears several times while every reference still points at the same
+		 * entity id. A path that revisits an entity gets a `cycle` reference instead
+		 * of recursing.
+		 *
+		 * @param {ReturnType<typeof buildHierarchy>} hierarchy
+		 * @param {{expandedIds?: string[], maxRefs?: number, maxDepth?: number}} [options]
+		 */
+		function expandHierarchy(hierarchy, options) {
+		  const input = viewIsObject(hierarchy) ? hierarchy : { entities: new Map() }
+		  const opts = viewIsObject(options) ? options : {}
+		  const maxRefs = viewPositive(opts.maxRefs, VIEW_BUDGETS.maxRefs)
+		  const maxDepth = viewPositive(opts.maxDepth, VIEW_BUDGETS.maxDepth)
+		  const expanded = new Set(Array.isArray(opts.expandedIds) ? opts.expandedIds : [])
+		  const entities = input.entities instanceof Map ? input.entities : new Map()
+		  const refs = []
+		  let truncatedRefs = 0
+
+		  function pushRef(entityId, parentRefId, depth, path, relation) {
+		    if (refs.length >= maxRefs) {
+		      truncatedRefs += 1
+		      return null
+		    }
+		    const entity = entities.get(entityId)
+		    if (!entity) return null
+		    const cycle = path.indexOf(entityId) >= 0
+		    const ref = {
+		      refId: 'r' + refs.length,
+		      entityId: entityId,
+		      parentRefId: parentRefId,
+		      depth: depth,
+		      cycle: cycle,
+		      expanded: !cycle && expanded.has(entityId),
+		      childCount: entity.children.length,
+		      orphan: !!entity.orphan,
+		      inCycle: !!entity.inCycle,
+		      label: entity.label,
+		      kind: entity.kind,
+		    }
+		    if (relation) {
+		      ref.relationId = relation.relationId
+		      ref.statementIds = relation.statementIds
+		      ref.sourceIds = relation.sourceIds
+		    }
+		    refs.push(ref)
+		    return ref
+		  }
+
+		  const queue = []
+		  for (const id of input.roots || []) queue.push({ entityId: id, parentRefId: null, depth: 0, path: [], relation: null })
+		  for (const cycle of input.cycles || []) {
+		    queue.push({
+		      entityId: cycle.members[0],
+		      parentRefId: null,
+		      depth: 0,
+		      path: [],
+		      relation: null,
+		      cycleGroup: cycle.members.slice(),
+		    })
+		  }
+		  for (const id of input.orphans || []) {
+		    queue.push({ entityId: id, parentRefId: null, depth: 0, path: [], relation: null, orphan: true })
+		  }
+		  let cursor = 0
+		  while (cursor < queue.length) {
+		    const item = queue[cursor]
+		    cursor += 1
+		    const entity = entities.get(item.entityId)
+		    if (!entity) continue
+		    const ref = pushRef(item.entityId, item.parentRefId, item.depth, item.path, item.relation)
+		    if (!ref) continue
+		    if (item.cycleGroup) ref.cycleGroup = item.cycleGroup
+		    if (item.orphan) ref.orphan = true
+		    if (!ref.expanded || ref.depth >= maxDepth) continue
+		    const path = item.path.concat([item.entityId])
+		    for (const relation of entity.children) {
+		      queue.push({
+		        entityId: relation.childId,
+		        parentRefId: ref.refId,
+		        depth: ref.depth + 1,
+		        path: path,
+		        relation: relation,
+		      })
+		    }
+		  }
+		  return {
+		    refs: refs,
+		    stats: {
+		      refs: refs.length,
+		      entities: entities.size,
+		      truncated: truncatedRefs,
+		      maxRefs: maxRefs,
+		    },
+		  }
+		}
+
+		/** Effective predicates of a layered projection (user-selected, else one). */
+		function viewPredicates(options, fallback) {
+		  if (Array.isArray(options.predicates)) {
+		    const unique = []
+		    for (const value of options.predicates) {
+		      if (typeof value === 'string' && value && unique.indexOf(value) < 0) unique.push(value)
+		    }
+		    if (unique.length > 0) return unique.sort(viewCompare)
+		  }
+		  return [fallback]
+		}
+
+		/**
+		 * Build and lay out the layered relation graph.
+		 *
+		 * The selected predicates are projected onto the L1 graph, strongly connected
+		 * components are contracted into visible groups, and the condensation is
+		 * layered with a longest-path assignment plus a bounded barycenter sweep.
+		 * Coordinates are deterministic and limited to the requested canvas.
+		 *
+		 * @param {any} graph L1 (or L2) graph
+		 * @param {{predicates?: string[], orientation?: 'down'|'right',
+		 *          width?: number, height?: number, maxNodes?: number,
+		 *          maxLayers?: number}} [options]
+		 */
+		function layoutLayeredGraph(graph, options) {
+		  const opts = viewIsObject(options) ? options : {}
+		  const predicates = viewPredicates(opts, VIEW_RDFS_SUBCLASSOF)
+		  const orientation = opts.orientation === 'right' ? 'right' : 'down'
+		  const width = viewPositive(opts.width, 900)
+		  const height = viewPositive(opts.height, 600)
+		  const maxNodes = viewPositive(opts.maxNodes, VIEW_BUDGETS.maxEntities)
+		  const maxLayers = viewPositive(opts.maxLayers, VIEW_BUDGETS.maxLayers)
+		  const { nodes, byId } = viewNodeIndex(graph)
+		  const edges = viewIsObject(graph) && Array.isArray(graph.edges) ? graph.edges : []
+
+		  const predicateSet = new Set(predicates)
+		  const projected = []
+		  const selfLoopEdges = []
+		  const used = new Set()
+		  for (const edge of edges) {
+		    if (!viewIsObject(edge) || !predicateSet.has(edge.p)) continue
+		    if (typeof edge.source !== 'string' || typeof edge.target !== 'string') continue
+		    if (!byId.has(edge.source) || !byId.has(edge.target)) continue
+		    if (edge.source === edge.target) {
+		      selfLoopEdges.push(edge)
+		      used.add(edge.source)
+		      continue
+		    }
+		    projected.push({ edge: edge, internal: false })
+		    used.add(edge.source)
+		    used.add(edge.target)
+		  }
+
+		  let candidates = Array.from(used)
+		  candidates.sort(viewCompare)
+		  const nodeTruncated = Math.max(0, candidates.length - maxNodes)
+		  candidates = candidates.slice(0, maxNodes)
+		  const kept = new Set(candidates)
+
+		  // Self loops stay visible on their entity; other edges respect the budget.
+		  const keptEdges = []
+		  for (const item of projected) {
+		    if (item.internal) continue
+		    if (kept.has(item.edge.source) && kept.has(item.edge.target)) keptEdges.push(item.edge)
+		  }
+
+		  const adjacency = new Map()
+		  for (const id of candidates) adjacency.set(id, [])
+		  for (const edge of keptEdges) adjacency.get(edge.source).push(edge.target)
+		  const { componentOf, components } = computeStronglyConnectedComponents(candidates, adjacency)
+
+		  const groups = []
+		  const groupKeyOf = new Map()
+		  const displayIdOf = new Map()
+		  for (const id of candidates) {
+		    const component = components[componentOf.get(id)]
+		    if (component.length > 1) {
+		      const anchor = component.slice().sort(viewCompare)[0]
+		      groupKeyOf.set(id, anchor)
+		      displayIdOf.set(id, VIEW_GROUP_MARKER + anchor)
+		    } else {
+		      displayIdOf.set(id, id)
+		    }
+		  }
+		  const groupAnchors = new Set()
+		  for (const id of candidates) {
+		    const anchor = groupKeyOf.get(id)
+		    if (anchor === undefined || groupAnchors.has(anchor)) continue
+		    groupAnchors.add(anchor)
+		    groups.push({
+		      id: VIEW_GROUP_MARKER + anchor,
+		      anchor: anchor,
+		      members: components[componentOf.get(anchor)].slice().sort(viewCompare),
+		    })
+		  }
+		  groups.sort((a, b) => viewCompare(a.anchor, b.anchor))
+
+		  const displayIds = []
+		  for (const group of groups) displayIds.push(group.id)
+		  for (const id of candidates) {
+		    if (groupKeyOf.has(id)) continue
+		    displayIds.push(id)
+		  }
+		  displayIds.sort(viewCompare)
+		  const displayIndex = new Map()
+		  for (let index = 0; index < displayIds.length; index++) displayIndex.set(displayIds[index], index)
+
+		  // Condensation edges between display nodes.
+		  const displayAdjacency = new Map()
+		  for (const id of displayIds) displayAdjacency.set(id, [])
+		  const crossEdges = []
+		  const internalEdges = []
+		  for (const edge of keptEdges) {
+		    const from = displayIdOf.get(edge.source)
+		    const to = displayIdOf.get(edge.target)
+		    if (from === to) {
+		      internalEdges.push(edge)
+		      continue
+		    }
+		    crossEdges.push(edge)
+		    displayAdjacency.get(from).push(to)
+		  }
+		  // Parallel condensation edges collapse for layering, not for rendering.
+		  for (const id of displayIds) {
+		    const unique = Array.from(new Set(displayAdjacency.get(id))).sort(viewCompare)
+		    displayAdjacency.set(id, unique)
+		  }
+
+		  // Longest-path layering over the condensation DAG (Kahn order).
+		  const indegree = new Map()
+		  for (const id of displayIds) indegree.set(id, 0)
+		  for (const id of displayIds) {
+		    for (const next of displayAdjacency.get(id)) indegree.set(next, indegree.get(next) + 1)
+		  }
+		  const queue = displayIds.filter((id) => indegree.get(id) === 0)
+		  queue.sort(viewCompare)
+		  const layer = new Map()
+		  for (const id of displayIds) layer.set(id, 0)
+		  const order = []
+		  while (queue.length > 0) {
+		    const id = queue.shift()
+		    order.push(id)
+		    for (const next of displayAdjacency.get(id)) {
+		      layer.set(next, Math.max(layer.get(next), layer.get(id) + 1))
+		      indegree.set(next, indegree.get(next) - 1)
+		      if (indegree.get(next) === 0) {
+		        queue.push(next)
+		        queue.sort(viewCompare)
+		      }
+		    }
+		  }
+		  // Every display node is in the condensation DAG, so `order` is complete.
+
+		  // Layer budget: drop deepest layers deterministically.
+		  let layerCount = 0
+		  for (const id of displayIds) layerCount = Math.max(layerCount, layer.get(id) + 1)
+		  const layerTruncated = Math.max(0, layerCount - maxLayers)
+		  const visible = new Set()
+		  for (const id of displayIds) {
+		    if (layer.get(id) < maxLayers) visible.add(id)
+		  }
+
+		  // Barycenter sweeps (bounded) to reduce crossings within layers.
+		  const layers = []
+		  for (let index = 0; index < layerCount && index < maxLayers; index++) layers.push([])
+		  for (const id of order) {
+		    if (!visible.has(id)) continue
+		    layers[layer.get(id)].push(id)
+		  }
+		  for (const list of layers) list.sort(viewCompare)
+		  const position = new Map()
+		  function reindex() {
+		    for (const list of layers) {
+		      for (let index = 0; index < list.length; index++) position.set(list[index], index)
+		    }
+		  }
+		  reindex()
+		  const incoming = new Map()
+		  for (const id of displayIds) incoming.set(id, [])
+		  for (const id of displayIds) {
+		    for (const next of displayAdjacency.get(id)) incoming.get(next).push(id)
+		  }
+		  for (let sweep = 0; sweep < 4; sweep++) {
+		    const topDown = sweep % 2 === 0
+		    const sequence = topDown ? layers.slice(1) : layers.slice(0, -1).reverse()
+		    for (const list of sequence) {
+		      const scores = new Map()
+		      for (const id of list) {
+		        const neighbors = topDown ? incoming.get(id) : displayAdjacency.get(id)
+		        let sum = 0
+		        let count = 0
+		        for (const neighbor of neighbors) {
+		          if (!visible.has(neighbor)) continue
+		          sum += position.get(neighbor)
+		          count += 1
+		        }
+		        scores.set(id, count === 0 ? position.get(id) : sum / count)
+		      }
+		      list.sort((a, b) => {
+		        const diff = scores.get(a) - scores.get(b)
+		        return diff !== 0 ? diff : viewCompare(a, b)
+		      })
+		    }
+		    reindex()
+		  }
+
+		  // Coordinates: layers along one axis, members spread along the other.
+		  const padding = 24
+		  const innerWidth = Math.max(1, width - padding * 2)
+		  const innerHeight = Math.max(1, height - padding * 2)
+		  const positions = new Map()
+		  const layerSpan = orientation === 'down' ? innerHeight : innerWidth
+		  const laneSpan = orientation === 'down' ? innerWidth : innerHeight
+		  const layerStep = Math.max(1, layerSpan / Math.max(1, layers.length))
+		  for (let index = 0; index < layers.length; index++) {
+		    const list = layers[index]
+		    const laneStep = Math.max(1, laneSpan / Math.max(1, list.length))
+		    for (let lane = 0; lane < list.length; lane++) {
+		      const along = padding + layerStep * (index + 0.5)
+		      const across = padding + laneStep * (lane + 0.5)
+		      positions.set(list[lane], orientation === 'down'
+		        ? { x: across, y: along }
+		        : { x: along, y: across })
+		    }
+		  }
+
+		  const layoutNodes = []
+		  for (const id of displayIds) {
+		    if (!visible.has(id) || !positions.has(id)) continue
+		    const point = positions.get(id)
+		    const group = groups.find((item) => item.id === id)
+		    const node = group ? null : byId.get(id)
+		    layoutNodes.push({
+		      id: id,
+		      x: Math.round(point.x * 100) / 100,
+		      y: Math.round(point.y * 100) / 100,
+		      layer: layer.get(id),
+		      label: group ? id : (node && node.label) || id,
+		      kind: group ? 'group' : (node ? node.kind : 'external'),
+		      groupId: group ? group.id : null,
+		      memberCount: group ? group.members.length : 0,
+		    })
+		  }
+		  const layoutEdges = []
+		  for (const edge of crossEdges) {
+		    const from = displayIdOf.get(edge.source)
+		    const to = displayIdOf.get(edge.target)
+		    if (!visible.has(from) || !visible.has(to)) continue
+		    layoutEdges.push({
+		      id: edge.id,
+		      source: from,
+		      target: to,
+		      p: edge.p,
+		      label: edge.label,
+		      count: edge.count,
+		      sourceIds: edge.sourceIds,
+		      statementIds: edge.statementIds,
+		    })
+		  }
+		  const internal = []
+		  for (const edge of internalEdges) {
+		    internal.push({
+		      id: edge.id,
+		      source: displayIdOf.get(edge.source),
+		      target: displayIdOf.get(edge.target),
+		      p: edge.p,
+		      label: edge.label,
+		      count: edge.count,
+		      sourceIds: edge.sourceIds,
+		      statementIds: edge.statementIds,
+		    })
+		  }
+		  for (const edge of selfLoopEdges) {
+		    if (!visible.has(displayIdOf.get(edge.source))) continue
+		    internal.push({
+		      id: edge.id,
+		      source: displayIdOf.get(edge.source),
+		      target: displayIdOf.get(edge.source),
+		      p: edge.p,
+		      label: edge.label,
+		      count: edge.count,
+		      sourceIds: edge.sourceIds,
+		      statementIds: edge.statementIds,
+		      selfLoop: true,
+		    })
+		  }
+
+		  return {
+		    orientation: orientation,
+		    predicates: predicates,
+		    nodes: layoutNodes,
+		    edges: layoutEdges,
+		    internalEdges: internal,
+		    groups: groups.map((group) => ({
+		      id: group.id,
+		      anchor: group.anchor,
+		      members: group.members,
+		    })),
+		    layers: layers.length,
+		    bounds: { minX: padding, minY: padding, width: width - padding * 2, height: height - padding * 2 },
+		    stats: {
+		      nodes: layoutNodes.length,
+		      edges: layoutEdges.length,
+		      internalEdges: internal.length,
+		      groups: groups.length,
+		      layers: layers.length,
+		      truncatedNodes: nodeTruncated,
+		      truncatedLayers: layerTruncated,
+		      maxNodes: maxNodes,
+		      maxLayers: maxLayers,
+		    },
+		  }
+		}
+
+		/** Class/property hierarchy check used by the view to explain empty modes. */
+		function hierarchyPredicateFor(mode) {
+		  return mode === 'property' ? VIEW_RDFS_SUBPROPERTYOF : VIEW_HIERARCHY_DEFAULT_PREDICATE
+		}
+
+		/** The rdf:type-based instance grouping predicate (never inheritance). */
+		function instanceTypePredicate() {
+		  return VIEW_RDF_TYPE
+		}
+
+		/** Explicit class declaration types, for labels and grouping. */
+		function classDeclarationTypes() {
+		  return [VIEW_OWL_CLASS, VIEW_RDFS_CLASS]
+		}
+
+		/** Label predicate used by the class tree when a node has no preferred label. */
+		function hierarchyLabelPredicate() {
+		  return VIEW_RDFS_LABEL
+		}
+
+		// ==== src/graph-export.js ====
+		/**
+		 * Static export of the currently displayed graph view (SVG / PNG).
+		 *
+		 * The exporter never serializes the live host DOM: the view hands over an
+		 * explicit scene snapshot (visible nodes, visible edges, positions, labels,
+		 * theme). RDF text is treated as untrusted text, so it is escaped and never
+		 * becomes markup, an attribute, a style rule or an external reference. PNG is
+		 * produced from the same safe SVG inside the browser; there is no server-side
+		 * renderer.
+		 *
+		 * Plain ECMAScript: concatenated into the Client bundle (see build/build.mjs)
+		 * and imported directly by Node tests. Browser APIs are only touched inside
+		 * `rasterizePng`, through an injectable environment.
+		 */
+
+		/** Hard candidate limits for one rasterized export (tuned later by benchmarks). */
+		const EXPORT_LIMITS = Object.freeze({
+		  maxPixels: 16 * 1024 * 1024,
+		  maxSide: 8192,
+		  defaultScale: 1,
+		  allowedScales: [1, 2],
+		})
+
+		const SVG_NS = 'http://www.w3.org/2000/svg'
+		const FALLBACK_THEME = Object.freeze({
+		  background: '#ffffff',
+		  node: '#4f6bed',
+		  nodeText: '#1f2430',
+		  edge: '#9aa3b2',
+		  edgeText: '#6b7280',
+		  group: '#7c5cd6',
+		})
+
+		function exportIsObject(value) {
+		  return value !== null && typeof value === 'object'
+		}
+
+		/** Coerce to a finite number, else return the fallback. */
+		function exportNumber(value, fallback) {
+		  return typeof value === 'number' && Number.isFinite(value) ? value : fallback
+		}
+
+		/** Escape text for XML character data; control characters are removed. */
+		function escapeSvgText(value) {
+		  const text = value === null || value === undefined ? '' : String(value)
+		  return text
+		    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\uFFFE\uFFFF]/g, '')
+		    .replace(/&/g, '&amp;')
+		    .replace(/</g, '&lt;')
+		    .replace(/>/g, '&gt;')
+		    .replace(/"/g, '&quot;')
+		    .replace(/'/g, '&apos;')
+		}
+
+		/**
+		 * Only literal colors or numeric rgb()/hsl() functions are emitted. Anything
+		 * else (including `url(...)`, `var(...)` or expressions) falls back, so RDF
+		 * text can never reach a style attribute as a payload.
+		 */
+		function safeSvgColor(value, fallback) {
+		  const color = typeof value === 'string' ? value.trim() : ''
+		  if (/^#[0-9a-fA-F]{3,8}$/.test(color)) return color
+		  if (/^rgba?\(\s*[\d.%\s,/]+\)$/.test(color)) return color
+		  if (/^hsla?\(\s*[\d.%\s,/a-z]+\)$/i.test(color) && color.indexOf('url') < 0) return color
+		  if (color === 'transparent') return color
+		  return typeof fallback === 'string' ? fallback : '#000000'
+		}
+
+		/** One-line label text with finite position; long labels are clipped. */
+		function exportLabelNode(value, maxLength) {
+		  const text = (value === null || value === undefined ? '' : String(value))
+		    // Control characters (including the NUL separators of tagged identities)
+		    // are never valid in exported text.
+		    .replace(/[\u0000-\u001f\u007f]+/g, ' ')
+		    .trim()
+		  if (text.length <= maxLength) return text
+		  return text.slice(0, Math.max(0, maxLength - 1)) + '\u2026'
+		}
+
+		function exportTheme(theme) {
+		  const input = exportIsObject(theme) ? theme : {}
+		  return {
+		    background: safeSvgColor(input.background, FALLBACK_THEME.background),
+		    node: safeSvgColor(input.node, FALLBACK_THEME.node),
+		    nodeText: safeSvgColor(input.nodeText, FALLBACK_THEME.nodeText),
+		    edge: safeSvgColor(input.edge, FALLBACK_THEME.edge),
+		    edgeText: safeSvgColor(input.edgeText, FALLBACK_THEME.edgeText),
+		    group: safeSvgColor(input.group, FALLBACK_THEME.group),
+		  }
+		}
+
+		/** Normalize one node entry from the view's display data. */
+		function exportNode(entry, index) {
+		  if (!exportIsObject(entry)) return null
+		  const id = typeof entry.id === 'string' ? entry.id : 'n' + index
+		  return {
+		    id: id,
+		    x: exportNumber(entry.x, 0),
+		    y: exportNumber(entry.y, 0),
+		    label: exportLabelNode(entry.label, 160),
+		    kind: typeof entry.kind === 'string' ? entry.kind : 'individual',
+		    groupId: typeof entry.groupId === 'string' ? entry.groupId : null,
+		    memberCount: exportNumber(entry.memberCount, 0),
+		  }
+		}
+
+		/** Normalize one edge entry; positions come from the node position table. */
+		function exportEdge(entry, positions, index) {
+		  if (!exportIsObject(entry)) return null
+		  const source = typeof entry.source === 'string' ? entry.source : ''
+		  const target = typeof entry.target === 'string' ? entry.target : ''
+		  const from = positions.get(source)
+		  const to = positions.get(target)
+		  if (!from || !to) return null
+		  return {
+		    id: typeof entry.id === 'string' ? entry.id : 'e' + index,
+		    source: source,
+		    target: target,
+		    x1: exportNumber(from.x, 0),
+		    y1: exportNumber(from.y, 0),
+		    x2: exportNumber(to.x, 0),
+		    y2: exportNumber(to.y, 0),
+		    label: exportLabelNode(entry.label, 80),
+		    count: exportNumber(entry.count, 1),
+		  }
+		}
+
+		function exportPositions(list) {
+		  const map = new Map()
+		  for (const entry of list) {
+		    if (!exportIsObject(entry)) continue
+		    if (typeof entry.id !== 'string') continue
+		    map.set(entry.id, { x: exportNumber(entry.x, 0), y: exportNumber(entry.y, 0) })
+		  }
+		  return map
+		}
+
+		/**
+		 * Estimate the horizontal space a node label needs in the exported SVG. The
+		 * renderer draws node labels with a 10px system font starting at the node x,
+		 * so a fixed padding is not enough: long labels used to be centred outside the
+		 * viewBox and silently cropped from SVG/PNG output.
+		 */
+		function exportLabelWidth(label) {
+		  const text = typeof label === 'string' ? label : ''
+		  if (!text) return 0
+		  return Math.min(600, Math.ceil(text.length * 6.2))
+		}
+
+		/**
+		 * Bounds for a static scene that include each node label (drawn above the node
+		 * and extending to the right) so text never overflows the exported viewBox.
+		 */
+		function exportSceneBounds(nodes, padding) {
+		  const list = Array.isArray(nodes) ? nodes : []
+		  let minX = Infinity
+		  let minY = Infinity
+		  let maxX = -Infinity
+		  let maxY = -Infinity
+		  for (const node of list) {
+		    if (!exportIsObject(node)) continue
+		    const x = exportNumber(node.x, NaN)
+		    const y = exportNumber(node.y, NaN)
+		    if (!Number.isFinite(x) || !Number.isFinite(y)) continue
+		    const right = x + exportLabelWidth(node.label)
+		    if (x < minX) minX = x
+		    if (right > maxX) maxX = right
+		    if (y - 14 < minY) minY = y - 14
+		    if (y > maxY) maxY = y
+		  }
+		  if (!Number.isFinite(minX)) return null
+		  const pad = exportNumber(padding, 24)
+		  return {
+		    x: minX - pad,
+		    y: minY - pad,
+		    width: Math.max(1, maxX - minX + pad * 2),
+		    height: Math.max(1, maxY - minY + pad * 2),
+		  }
+		}
+
+		function exportSceneBase(viewType, revision, range) {
+		  return {
+		    viewType: viewType,
+		    revision: exportNumber(revision, 0),
+		    range: range,
+		    viewBox: { x: 0, y: 0, width: 1, height: 1 },
+		    width: 1,
+		    height: 1,
+		    nodes: [],
+		    edges: [],
+		    labels: true,
+		    theme: exportTheme(null),
+		    truncated: { nodes: 0, edges: 0 },
+		    meta: {},
+		  }
+		}
+
+		/**
+		 * Build a scene from the network view.
+		 * @param {{nodes: any[], edges: any[], positions?: any[], width?: number,
+		 *          height?: number, camera?: {zoom?: number, panX?: number, panY?: number},
+		 *          viewport?: {width?: number, height?: number},
+		 *          range?: 'viewport'|'layout', labels?: boolean, theme?: object,
+		 *          revision?: number, truncated?: object, meta?: object}} options
+		 */
+		function buildNetworkScene(options) {
+		  const opts = exportIsObject(options) ? options : {}
+		  const range = opts.range === 'layout' ? 'layout' : 'viewport'
+		  const scene = exportSceneBase('network', opts.revision, range)
+		  const nodeList = Array.isArray(opts.nodes) ? opts.nodes : []
+		  const edgeList = Array.isArray(opts.edges) ? opts.edges : []
+		  const positions = exportPositions(Array.isArray(opts.positions) ? opts.positions : nodeList)
+		  const camera = exportIsObject(opts.camera) ? opts.camera : {}
+		  const zoom = Math.max(0.01, exportNumber(camera.zoom, 1))
+		  const panX = exportNumber(camera.panX, 0)
+		  const panY = exportNumber(camera.panY, 0)
+		  const viewportWidth = Math.max(1, exportNumber(opts.viewport && opts.viewport.width, 900))
+		  const viewportHeight = Math.max(1, exportNumber(opts.viewport && opts.viewport.height, 600))
+		  const theme = exportTheme(opts.theme)
+
+		  for (let index = 0; index < nodeList.length; index++) {
+		    const raw = nodeList[index]
+		    if (!exportIsObject(raw) || typeof raw.id !== 'string') continue
+		    const point = positions.get(raw.id)
+		    if (!point) {
+		      scene.truncated.nodes += 1
+		      continue
+		    }
+		    const node = exportNode({
+		      id: raw.id,
+		      x: point.x,
+		      y: point.y,
+		      label: raw.label !== undefined ? raw.label : raw.id,
+		      kind: raw.kind,
+		    }, index)
+		    scene.nodes.push(node)
+		  }
+		  const nodeIds = new Set(scene.nodes.map((node) => node.id))
+		  for (let index = 0; index < edgeList.length; index++) {
+		    const edge = exportEdge(edgeList[index], positions, index)
+		    if (!edge || !nodeIds.has(edge.source)) continue
+		    scene.edges.push(edge)
+		  }
+
+		  if (range === 'viewport') {
+		    scene.viewBox = {
+		      x: panX === 0 ? 0 : -panX / zoom,
+		      y: panY === 0 ? 0 : -panY / zoom,
+		      width: viewportWidth / zoom,
+		      height: viewportHeight / zoom,
+		    }
+		    scene.width = Math.round(viewportWidth)
+		    scene.height = Math.round(viewportHeight)
+		    // Keep only geometry that intersects the crop.
+		    const view = scene.viewBox
+		    const inside = (node) => (
+		      node.x >= view.x && node.x <= view.x + view.width &&
+		      node.y >= view.y && node.y <= view.y + view.height
+		    )
+		    const kept = scene.nodes.filter(inside)
+		    scene.truncated.nodes += scene.nodes.length - kept.length
+		    scene.nodes = kept
+		    const keptIds = new Set(kept.map((node) => node.id))
+		    const before = scene.edges.length
+		    scene.edges = scene.edges.filter((edge) => keptIds.has(edge.source) && keptIds.has(edge.target))
+		    scene.truncated.edges += before - scene.edges.length
+		  } else {
+		    const bounds = exportSceneBounds(scene.nodes, 32) || { x: 0, y: 0, width: 1, height: 1 }
+		    scene.viewBox = bounds
+		    scene.width = Math.round(bounds.width)
+		    scene.height = Math.round(bounds.height)
+		  }
+		  scene.labels = opts.labels !== false
+		  scene.theme = theme
+		  scene.meta = exportIsObject(opts.meta) ? opts.meta : {}
+		  return scene
+		}
+
+		/**
+		 * Build a scene from the class tree's expanded display references. Rows follow
+		 * the reference order (pre-order), columns follow the nesting depth, so the
+		 * export mirrors exactly the paths the user expanded.
+		 */
+		function buildTreeScene(refs, options) {
+		  const opts = exportIsObject(options) ? options : {}
+		  const list = Array.isArray(refs) ? refs : []
+		  const scene = exportSceneBase('tree', opts.revision, opts.range === 'viewport' ? 'viewport' : 'layout')
+		  const rowHeight = 22
+		  const indent = 18
+		  const positions = new Map()
+		  const refById = new Map()
+		  for (let index = 0; index < list.length; index++) {
+		    const ref = list[index]
+		    if (!exportIsObject(ref)) continue
+		    const refId = typeof ref.refId === 'string' ? ref.refId : 'r' + index
+		    const depth = Math.max(0, exportNumber(ref.depth, 0))
+		    positions.set(refId, { x: 16 + indent * depth, y: 16 + rowHeight * index })
+		    refById.set(refId, {
+		      id: refId,
+		      x: 16 + indent * depth,
+		      y: 16 + rowHeight * index,
+		      label: (ref.cycle ? '\u21ba ' : '') + (ref.label || ref.entityId || ''),
+		      kind: ref.cycle ? 'cycle' : (ref.kind || 'class'),
+		    })
+		  }
+		  scene.nodes = Array.from(refById.values())
+		  for (const ref of list) {
+		    if (!exportIsObject(ref) || typeof ref.parentRefId !== 'string') continue
+		    const child = refById.get(ref.refId)
+		    const parent = refById.get(ref.parentRefId)
+		    if (!child || !parent) continue
+		    scene.edges.push({
+		      id: 't' + scene.edges.length,
+		      x1: parent.x,
+		      y1: parent.y,
+		      x2: child.x,
+		      y2: child.y,
+		      label: '',
+		      count: 1,
+		    })
+		  }
+		  const bounds = exportSceneBounds(scene.nodes, 20) || { x: 0, y: 0, width: 1, height: 1 }
+		  scene.viewBox = bounds
+		  scene.width = Math.round(bounds.width)
+		  scene.height = Math.round(bounds.height)
+		  scene.labels = opts.labels !== false
+		  scene.theme = exportTheme(opts.theme)
+		  scene.meta = exportIsObject(opts.meta) ? opts.meta : {}
+		  return scene
+		}
+
+		/**
+		 * Build a scene from the layered relation layout.
+		 */
+		function buildLayeredScene(layout, options) {
+		  const opts = exportIsObject(options) ? options : {}
+		  const input = exportIsObject(layout) ? layout : {}
+		  const scene = exportSceneBase('layered', opts.revision, opts.range === 'viewport' ? 'viewport' : 'layout')
+		  const positions = exportPositions(input.nodes || [])
+		  const nodes = Array.isArray(input.nodes) ? input.nodes : []
+		  for (let index = 0; index < nodes.length; index++) {
+		    const entry = nodes[index]
+		    if (!exportIsObject(entry) || typeof entry.id !== 'string') continue
+		    const point = positions.get(entry.id)
+		    if (!point) continue
+		    scene.nodes.push(exportNode({
+		      id: entry.id,
+		      x: point.x,
+		      y: point.y,
+		      label: entry.label || entry.id,
+		      kind: entry.kind,
+		      groupId: entry.groupId,
+		      memberCount: entry.memberCount,
+		    }, index))
+		  }
+		  const byNode = new Map(scene.nodes.map((node) => [node.id, node]))
+		  const edges = Array.isArray(input.edges) ? input.edges : []
+		  for (let index = 0; index < edges.length; index++) {
+		    const edge = edges[index]
+		    if (!exportIsObject(edge)) continue
+		    const from = byNode.get(edge.source)
+		    const to = byNode.get(edge.target)
+		    if (!from || !to) continue
+		    scene.edges.push({
+		      id: typeof edge.id === 'string' ? edge.id : 'le' + index,
+		      x1: from.x,
+		      y1: from.y,
+		      x2: to.x,
+		      y2: to.y,
+		      label: exportLabelNode(edge.label, 80),
+		      count: exportNumber(edge.count, 1),
+		    })
+		  }
+		  const bounds = exportSceneBounds(scene.nodes, 32) || { x: 0, y: 0, width: 1, height: 1 }
+		  scene.viewBox = bounds
+		  scene.width = Math.round(bounds.width)
+		  scene.height = Math.round(bounds.height)
+		  scene.labels = opts.labels !== false
+		  scene.theme = exportTheme(opts.theme)
+		  scene.meta = exportIsObject(opts.meta) ? opts.meta : {}
+		  return scene
+		}
+
+		/**
+		 * Read one host theme token. Tokens live on <body> in the live Client (the
+		 * documentElement carries none), so both roots are probed before the literal
+		 * fallback is used. `getStyle` is injectable for tests.
+		 */
+		function readHostThemeToken(name, fallback, documentLike, getStyle) {
+		  try {
+		    const doc = documentLike || (typeof document === 'undefined' ? null : document)
+		    const style = typeof getStyle === 'function'
+		      ? getStyle
+		      : (typeof getComputedStyle === 'function' ? getComputedStyle : null)
+		    if (doc && style) {
+		      for (const root of [doc.body, doc.documentElement]) {
+		        if (!root) continue
+		        const value = style(root).getPropertyValue(name)
+		        if (typeof value === 'string' && value.trim()) return value.trim()
+		      }
+		    }
+		  } catch (error) {
+		    // fall through to the literal fallback
+		  }
+		  return fallback
+		}
+
+		/**
+		 * True when the graph view's displayed-scene report belongs to `graph` and the
+		 * layout has finished. Object identity matters: a re-rendered but stale report
+		 * must never be exported as the current view.
+		 */
+		function displayedSceneReady(displayed, graph) {
+		  return Boolean(displayed && displayed.ready === true && displayed.graph === graph)
+		}
+
+		/** True when the scene is ready to export (finished layout, known revision). */
+		function exportSceneReady(scene, currentRevision) {
+		  if (!exportIsObject(scene)) return { ok: false, reason: 'no-scene' }
+		  if (!Array.isArray(scene.nodes) || scene.nodes.length === 0) {
+		    return { ok: false, reason: 'empty-scene' }
+		  }
+		  if (typeof currentRevision === 'number' && Number.isFinite(currentRevision) &&
+		    exportNumber(scene.revision, -1) !== currentRevision) {
+		    return { ok: false, reason: 'stale-scene' }
+		  }
+		  return { ok: true, reason: null }
+		}
+
+		/**
+		 * Render the scene to a standalone SVG document string.
+		 *
+		 * Only static SVG elements are emitted. All text is escaped character data,
+		 * sizes and coordinates are finite, colors are literal, and no external
+		 * reference (image, href, CSS import, font) is ever produced.
+		 */
+		function renderSceneSvg(scene) {
+		  const input = exportIsObject(scene) ? scene : {}
+		  const viewBox = exportIsObject(input.viewBox) ? input.viewBox : { x: 0, y: 0, width: 1, height: 1 }
+		  const width = Math.max(1, Math.round(exportNumber(input.width, 1)))
+		  const height = Math.max(1, Math.round(exportNumber(input.height, 1)))
+		  const theme = exportTheme(input.theme)
+		  const labels = input.labels !== false
+		  const nodes = Array.isArray(input.nodes) ? input.nodes : []
+		  const edges = Array.isArray(input.edges) ? input.edges : []
+		  const parts = []
+		  parts.push('<?xml version="1.0" encoding="UTF-8"?>')
+		  parts.push(
+		    '<svg xmlns="' + SVG_NS + '" width="' + width + '" height="' + height +
+		    '" viewBox="' + exportNumber(viewBox.x, 0) + ' ' + exportNumber(viewBox.y, 0) + ' ' +
+		    Math.max(1, exportNumber(viewBox.width, 1)) + ' ' + Math.max(1, exportNumber(viewBox.height, 1)) +
+		    '" role="img">',
+		  )
+		  const view = {
+		    x: exportNumber(viewBox.x, 0),
+		    y: exportNumber(viewBox.y, 0),
+		    width: Math.max(1, exportNumber(viewBox.width, 1)),
+		    height: Math.max(1, exportNumber(viewBox.height, 1)),
+		  }
+		  parts.push(
+		    '<rect x="' + view.x + '" y="' + view.y + '" width="' + view.width + '" height="' + view.height +
+		    '" fill="' + theme.background + '"/>',
+		  )
+		  const strokeWidth = Math.max(0.5, Math.min(2, view.width / 900))
+		  for (const edge of edges) {
+		    if (!exportIsObject(edge)) continue
+		    parts.push(
+		      '<line x1="' + exportNumber(edge.x1, 0) + '" y1="' + exportNumber(edge.y1, 0) +
+		      '" x2="' + exportNumber(edge.x2, 0) + '" y2="' + exportNumber(edge.y2, 0) +
+		      '" stroke="' + theme.edge + '" stroke-width="' + strokeWidth + '" stroke-opacity="0.7"/>',
+		    )
+		  }
+		  const radius = Math.max(2, Math.min(8, view.width / 220))
+		  for (const node of nodes) {
+		    if (!exportIsObject(node)) continue
+		    const color = node.kind === 'group' ? theme.group : theme.node
+		    parts.push(
+		      '<circle cx="' + exportNumber(node.x, 0) + '" cy="' + exportNumber(node.y, 0) +
+		      '" r="' + radius + '" fill="' + color + '"/>',
+		    )
+		    if (labels && typeof node.label === 'string' && node.label) {
+		      parts.push(
+		        '<text x="' + exportNumber(node.x, 0) + '" y="' +
+		        (exportNumber(node.y, 0) - radius - 3) + '" fill="' + theme.nodeText +
+		        '" font-size="10" font-family="system-ui, sans-serif">' + escapeSvgText(node.label) + '</text>',
+		      )
+		    }
+		  }
+		  if (labels) {
+		    for (const edge of edges) {
+		      if (!exportIsObject(edge) || !edge.label) continue
+		      const midX = (exportNumber(edge.x1, 0) + exportNumber(edge.x2, 0)) / 2
+		      const midY = (exportNumber(edge.y1, 0) + exportNumber(edge.y2, 0)) / 2
+		      parts.push(
+		        '<text x="' + midX + '" y="' + midY + '" fill="' + theme.edgeText +
+		        '" font-size="9" font-family="system-ui, sans-serif" text-anchor="middle">' +
+		        escapeSvgText(edge.label) + '</text>',
+		      )
+		    }
+		  }
+		  parts.push('</svg>')
+		  return parts.join('')
+		}
+
+		/**
+		 * Check the pixel budget before allocating any raster buffer.
+		 * @returns {{ok: boolean, width: number, height: number, scale: number,
+		 *            pixels: number, reason: string|null}}
+		 */
+		function planPngExport(scene, options) {
+		  const input = exportIsObject(scene) ? scene : {}
+		  const opts = exportIsObject(options) ? options : {}
+		  const width = Math.max(1, Math.round(exportNumber(input.width, 1)))
+		  const height = Math.max(1, Math.round(exportNumber(input.height, 1)))
+		  const allowed = EXPORT_LIMITS.allowedScales
+		  let scale = exportNumber(opts.scale, EXPORT_LIMITS.defaultScale)
+		  if (allowed.indexOf(scale) < 0) scale = EXPORT_LIMITS.defaultScale
+		  const maxPixels = exportNumber(opts.maxPixels, EXPORT_LIMITS.maxPixels)
+		  const maxSide = exportNumber(opts.maxSide, EXPORT_LIMITS.maxSide)
+		  const pixelWidth = Math.round(width * scale)
+		  const pixelHeight = Math.round(height * scale)
+		  const pixels = pixelWidth * pixelHeight
+		  if (pixelWidth > maxSide || pixelHeight > maxSide) {
+		    return {
+		      ok: false, width: width, height: height, scale: scale,
+		      pixels: pixels, reason: 'max-side',
+		    }
+		  }
+		  if (pixels > maxPixels) {
+		    return {
+		      ok: false, width: width, height: height, scale: scale,
+		      pixels: pixels, reason: 'max-pixels',
+		    }
+		  }
+		  return { ok: true, width: width, height: height, scale: scale, pixels: pixels, reason: null }
+		}
+
+		/** Resolve the browser primitives needed for rasterization. */
+		function exportBrowserEnvironment(explicit) {
+		  if (exportIsObject(explicit)) return explicit
+		  const env = {}
+		  try {
+		    // Client modules can run with a per-module `globalThis` that lacks DOM
+		    // constructors even though the page owns them; `window` is the browser
+		    // root the caller actually renders into.
+		    const root = typeof window !== 'undefined' && window
+		      ? window
+		      : (typeof globalThis !== 'undefined' ? globalThis : null)
+		    if (root) {
+		      env.Image = root.Image
+		      env.document = root.document
+		      env.Blob = root.Blob
+		      env.URL = root.URL
+		    }
+		  } catch (error) {
+		    // ignore: not a browser
+		  }
+		  return env
+		}
+
+		/**
+		 * Rasterize one safe SVG string to a PNG Blob.
+		 *
+		 * The rasterization runs only in the browser through an Image element and a
+		 * canvas. Every failure (missing APIs, image decode failure, a null Blob, an
+		 * oversized canvas) returns `{ok:false, reason}` so the caller can offer the
+		 * SVG export instead; it never falls back to a server.
+		 */
+		async function rasterizePng(svg, plan, environment) {
+		  const env = exportBrowserEnvironment(environment)
+		  const deps = exportIsObject(env) ? env : {}
+		  if (!plan || plan.ok !== true) {
+		    return { ok: false, reason: plan && plan.reason ? plan.reason : 'budget' }
+		  }
+		  if (typeof svg !== 'string' || svg === '') return { ok: false, reason: 'no-svg' }
+		  const hasImage = typeof deps.Image === 'function'
+		  const hasBlob = typeof deps.Blob === 'function'
+		  const URLImpl = deps.URL
+		  const hasUrl = (typeof URLImpl === 'object' || typeof URLImpl === 'function') && URLImpl !== null &&
+		    typeof URLImpl.createObjectURL === 'function' && typeof URLImpl.revokeObjectURL === 'function'
+		  if (!hasImage || !hasBlob || !hasUrl || !deps.document) {
+		    return { ok: false, reason: 'unavailable' }
+		  }
+		  let canvas = null
+		  let image = null
+		  try {
+		    const blob = new deps.Blob([svg], { type: 'image/svg+xml;charset=utf-8' })
+		    const url = URLImpl.createObjectURL(blob)
+		    try {
+		      image = await new Promise((resolve, reject) => {
+		        image = new deps.Image()
+		        image.onload = () => resolve(image)
+		        image.onerror = () => reject(new Error('image decode failed'))
+		        image.src = url
+		      })
+		      canvas = deps.document.createElement('canvas')
+		      canvas.width = plan.width * plan.scale
+		      canvas.height = plan.height * plan.scale
+		      const context = canvas.getContext && canvas.getContext('2d')
+		      if (!context) return { ok: false, reason: 'no-canvas-context' }
+		      context.drawImage(image, 0, 0, canvas.width, canvas.height)
+		      const png = await new Promise((resolve) => {
+		        if (typeof canvas.toBlob !== 'function') {
+		          resolve(null)
+		          return
+		        }
+		        canvas.toBlob((value) => resolve(value || null), 'image/png')
+		      })
+		      if (!png) return { ok: false, reason: 'to-blob-failed' }
+		      return { ok: true, blob: png, width: canvas.width, height: canvas.height }
+		    } finally {
+		      URLImpl.revokeObjectURL(url)
+		    }
+		  } catch (error) {
+		    return {
+		      ok: false,
+		      reason: error && error.message ? String(error.message) : 'rasterize-failed',
+		    }
+		  } finally {
+		    if (image) {
+		      image.onload = null
+		      image.onerror = null
+		      image.src = ''
+		    }
+		    if (canvas) {
+		      canvas.width = 0
+		      canvas.height = 0
+		    }
+		    image = null
+		    canvas = null
+		  }
+		}
+
+		/** Theme tokens for an export, resolved from computed style values. */
+		function exportThemeFromTokens(readToken) {
+		  const read = (name, fallback) => {
+		    try {
+		      if (typeof readToken === 'function') {
+		        const value = readToken(name)
+		        if (typeof value === 'string' && value.trim()) return value.trim()
+		      }
+		    } catch (error) {
+		      // fall through to the fallback
+		    }
+		    return fallback
+		  }
+		  return {
+		    background: safeSvgColor(read('--dsw-alias-bg-layer-1', FALLBACK_THEME.background), FALLBACK_THEME.background),
+		    node: safeSvgColor(read('--dsw-alias-brand-primary', FALLBACK_THEME.node), FALLBACK_THEME.node),
+		    nodeText: safeSvgColor(read('--dsw-alias-label-primary', FALLBACK_THEME.nodeText), FALLBACK_THEME.nodeText),
+		    edge: safeSvgColor(read('--dsw-alias-border-l1', FALLBACK_THEME.edge), FALLBACK_THEME.edge),
+		    edgeText: safeSvgColor(read('--dsw-alias-label-secondary', FALLBACK_THEME.edgeText), FALLBACK_THEME.edgeText),
+		    group: safeSvgColor(read('--dsw-alias-brand-primary', FALLBACK_THEME.group), FALLBACK_THEME.group),
+		  }
+		}
+
+		// ==== embedded worker source (generated from src/rdf-parse.js, src/ontology-identity.js, src/graph-model.js, src/ontology-workspace.js, src/ontology-views.js, src/worker-entry.js) ====
+		const ONTOLOGY_WORKER_SOURCE = "(function () {\n'use strict';\n// ==== src/rdf-parse.js ====\n/**\n * Dependency-free RDF reader used by the ontology viewer.\n *\n * Supported serializations: Turtle/N3/TriG (graphs ignored), N-Triples/N-Quads\n * (graph term ignored), RDF/XML and a practical JSON-LD 1.1 subset.\n *\n * The module is deliberately plain ECMAScript: no imports, no DOM APIs, no\n * Node globals and no decoding helpers.  The build script concatenates this\n * file with the other Client modules inside one closure, so every internal\n * helper is prefixed with `ontoRdf`/`OntoRdf` to avoid collisions.\n *\n * Every parser returns the same plain-object shape and never throws:\n *   { format, prefixes, base, triples, stats, warnings, errors }\n */\n\nconst ONTO_RDF_NS = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#'\nconst ONTO_RDF_TYPE = ONTO_RDF_NS + 'type'\nconst ONTO_RDF_FIRST = ONTO_RDF_NS + 'first'\nconst ONTO_RDF_REST = ONTO_RDF_NS + 'rest'\nconst ONTO_RDF_NIL = ONTO_RDF_NS + 'nil'\nconst ONTO_RDF_LANG_STRING = ONTO_RDF_NS + 'langString'\nconst ONTO_RDF_XML_LITERAL = ONTO_RDF_NS + 'XMLLiteral'\nconst ONTO_RDF_JSON = ONTO_RDF_NS + 'JSON'\nconst ONTO_XSD_NS = 'http://www.w3.org/2001/XMLSchema#'\nconst ONTO_XSD_STRING = ONTO_XSD_NS + 'string'\nconst ONTO_XSD_INTEGER = ONTO_XSD_NS + 'integer'\nconst ONTO_XSD_DECIMAL = ONTO_XSD_NS + 'decimal'\nconst ONTO_XSD_DOUBLE = ONTO_XSD_NS + 'double'\nconst ONTO_XSD_BOOLEAN = ONTO_XSD_NS + 'boolean'\nconst ONTO_XML_NS = 'http://www.w3.org/XML/1998/namespace'\nconst ONTO_DEFAULT_MAX_TRIPLES = 100000\nconst ONTO_DEFAULT_MAX_LITERAL_LENGTH = 16384\nconst ONTO_DEFAULT_MAX_DEPTH = 256\nconst ONTO_DEFAULT_MAX_DIAGNOSTICS = 200\nconst ONTO_DIAGNOSTIC_SAMPLE_LIMIT = 3\n\n/* ------------------------------------------------------------------ */\n/* Small generic helpers                                              */\n/* ------------------------------------------------------------------ */\n\nfunction ontoRdfHas(object, key) {\n  return Object.prototype.hasOwnProperty.call(object, key)\n}\n\nfunction ontoRdfNormalizeText(text) {\n  if (typeof text !== 'string') return ''\n  return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text\n}\n\nfunction ontoRdfIsWhitespace(character) {\n  return character === ' ' || character === '\\t' || character === '\\r' || character === '\\n'\n}\n\nfunction ontoRdfBuildLineIndex(text) {\n  const starts = [0]\n  for (let i = 0; i < text.length; i++) {\n    if (text.charCodeAt(i) === 10) starts.push(i + 1)\n  }\n  return starts\n}\n\nfunction ontoRdfLineAt(starts, index) {\n  let low = 0\n  let high = starts.length - 1\n  while (low < high) {\n    const middle = (low + high + 1) >> 1\n    if (starts[middle] <= index) low = middle\n    else high = middle - 1\n  }\n  return low + 1\n}\n\nfunction ontoRdfFormatDiagnostic(message, line) {\n  if (typeof line === 'number' && isFinite(line) && line >= 1) {\n    return message + ' (line ' + Math.floor(line) + ')'\n  }\n  return message\n}\n\nfunction ontoRdfMaxTriples(value) {\n  if (value === undefined || value === null) return ONTO_DEFAULT_MAX_TRIPLES\n  const number = typeof value === 'number' ? value : Number(value)\n  if (!isFinite(number) || number < 0) return ONTO_DEFAULT_MAX_TRIPLES\n  return Math.floor(number)\n}\n\nfunction ontoRdfLimit(value, fallback) {\n  if (value === undefined || value === null) return fallback\n  const number = typeof value === 'number' ? value : Number(value)\n  if (!isFinite(number) || number < 0) return fallback\n  return Math.floor(number)\n}\n\nfunction ontoRdfIsAbsoluteIri(value) {\n  return typeof value === 'string' && /^[A-Za-z][A-Za-z0-9+.-]*:/.test(value)\n}\n\nfunction ontoRdfNormalizeIri(value, base, builder, line) {\n  if (typeof value !== 'string' || value === '') return value\n  if (value.slice(0, 2) === '_:') return value\n  if (ontoRdfIsAbsoluteIri(value)) return value\n  if (base) return resolveIri(base, value)\n  if (builder) {\n    builder.diagnose(\n      'base-unavailable',\n      'warning',\n      'relative IRI \"' + value + '\" could not be resolved (no base)',\n      line,\n    )\n  }\n  return value\n}\n\nfunction ontoRdfFileExtension(fileName) {\n  if (typeof fileName !== 'string') return ''\n  let name = fileName.trim()\n  if (!name) return ''\n  const hash = name.indexOf('#')\n  if (hash >= 0) name = name.slice(0, hash)\n  const query = name.indexOf('?')\n  if (query >= 0) name = name.slice(0, query)\n  const slash = Math.max(name.lastIndexOf('/'), name.lastIndexOf('\\\\'))\n  const leaf = slash < 0 ? name : name.slice(slash + 1)\n  const dot = leaf.lastIndexOf('.')\n  if (dot < 0 || dot === leaf.length - 1) return ''\n  return leaf.slice(dot + 1).toLowerCase()\n}\n\n/* ------------------------------------------------------------------ */\n/* Resource address mapping (display name is never an identity)        */\n/* ------------------------------------------------------------------ */\n\nconst ONTO_WINDOWS_DRIVE_PATH = /^[A-Za-z]:[\\\\/]/\nconst ONTO_URI_PATH_CHAR = /[A-Za-z0-9\\-._~!$&'()*+,;=:@]/\nconst ONTO_SHARED_DEFAULT_GRAPH = Object.freeze({ kind: 'default' })\nconst ONTO_SHARED_UNKNOWN_GRAPH = Object.freeze({ kind: 'unknown' })\n\nfunction ontoRdfStripFragment(value) {\n  const hash = value.indexOf('#')\n  return hash < 0 ? value : value.slice(0, hash)\n}\n\n/**\n * DSH session file routes carry authorization and navigation only. They are\n * never used as an RDF base IRI, so the two host entries can agree on the\n * real file identity behind the route.\n */\nfunction ontoRdfIsDshResourceAddress(value) {\n  return typeof value === 'string' && /^dsh-resource:/i.test(value.trim())\n}\n\n/**\n * Split a DSH session file route into its authorizing session and requested\n * path. The path is a request hint only: the Host still resolves it.\n */\nfunction ontoRdfParseDshResourceAddress(value) {\n  if (!ontoRdfIsDshResourceAddress(value)) return null\n  const match = /^dsh-resource:\\/\\/([^/]*)\\/session\\/([^/]+)\\/([\\s\\S]*)$/i.exec(value.trim())\n  if (!match) return null\n  return { authority: match[1], sessionId: match[2], path: match[3] }\n}\n\n/** Percent-encode one Unicode code point as UTF-8. */\nfunction ontoRdfEncodeCodePoint(code) {\n  let bytes\n  if (code < 0x80) bytes = [code]\n  else if (code < 0x800) bytes = [0xc0 | (code >> 6), 0x80 | (code & 0x3f)]\n  else if (code < 0x10000) {\n    bytes = [0xe0 | (code >> 12), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f)]\n  } else {\n    bytes = [0xf0 | (code >> 18), 0x80 | ((code >> 12) & 0x3f),\n      0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f)]\n  }\n  let output = ''\n  for (let index = 0; index < bytes.length; index++) {\n    const hex = bytes[index].toString(16).toUpperCase()\n    output += '%' + (hex.length < 2 ? '0' + hex : hex)\n  }\n  return output\n}\n\n/**\n * Encode one filesystem path segment for a file URI. URI path characters are\n * kept; everything else (including `%`, spaces, `#`, `?` and non-ASCII) is\n * percent-encoded, so a literal `%20` in a raw path becomes `%2520` while an\n * already-encoded URI is never decoded and re-encoded.\n */\nfunction ontoRdfEncodePathSegment(segment) {\n  let output = ''\n  for (let index = 0; index < segment.length; index++) {\n    const code = segment.codePointAt(index)\n    if (code > 0xffff) index++\n    const character = String.fromCodePoint(code)\n    if (ONTO_URI_PATH_CHAR.test(character)) output += character\n    else output += ontoRdfEncodeCodePoint(code)\n  }\n  return output\n}\n\nfunction ontoRdfEncodePathSegments(path) {\n  const segments = path.split('/')\n  for (let index = 0; index < segments.length; index++) {\n    segments[index] = ontoRdfEncodePathSegment(segments[index])\n  }\n  return segments.join('/')\n}\n\n/**\n * Map a host-confirmed absolute filesystem path to a file URI. Relative\n * paths, display names and non-path values return null: a real identity is\n * never guessed. Windows drive letters keep their case folded to upper case,\n * both separators are accepted, UNC keeps its share as the URI authority,\n * POSIX paths keep their case.\n */\nfunction ontoRdfFileUriFromPath(value) {\n  if (typeof value !== 'string') return null\n  const raw = value.trim()\n  if (raw === '') return null\n  if (ONTO_WINDOWS_DRIVE_PATH.test(raw)) {\n    const normalized = raw.replace(/\\\\/g, '/')\n    const drive = normalized.slice(0, 1).toUpperCase() + ':'\n    const rest = normalized.slice(2)\n    return 'file:///' + drive + ontoRdfEncodePathSegments(rest)\n  }\n  if (raw.slice(0, 2) === '\\\\\\\\') {\n    const normalized = raw.replace(/\\\\/g, '/').slice(2)\n    const slash = normalized.indexOf('/')\n    const host = slash < 0 ? normalized : normalized.slice(0, slash)\n    const rest = slash < 0 ? '' : normalized.slice(slash)\n    if (!host) return null\n    return 'file://' + ontoRdfEncodePathSegment(host) + ontoRdfEncodePathSegments(rest)\n  }\n  if (raw.charAt(0) === '/') {\n    return 'file://' + ontoRdfEncodePathSegments(raw)\n  }\n  return null\n}\n\n/**\n * Map a real resource address to an RDF base IRI, or null when it cannot be\n * mapped reliably. A DSH session route is explicitly excluded; every other\n * absolute hierarchical URI keeps its RDF meaning. A display file name is a\n * relative path and is therefore never mapped.\n */\nfunction ontoRdfMapResourceAddress(address) {\n  if (typeof address !== 'string') return null\n  const value = address.trim()\n  if (value === '') return null\n  if (ontoRdfIsDshResourceAddress(value)) return null\n  const mappedPath = ontoRdfFileUriFromPath(value)\n  if (mappedPath) return mappedPath\n  if (!ontoRdfIsAbsoluteIri(value)) return null\n  const parts = ontoRdfParseIri(value)\n  const scheme = typeof parts.scheme === 'string' ? parts.scheme.toLowerCase() : ''\n  if (scheme === 'http' || scheme === 'https' || scheme === 'file') {\n    return ontoRdfStripFragment(value)\n  }\n  // Custom schemes are used verbatim only when they form an absolute\n  // hierarchical URI; otherwise we refuse to guess and report no base.\n  if (parts.authority !== undefined || parts.path.charAt(0) === '/') {\n    return ontoRdfStripFragment(value)\n  }\n  return null\n}\n\n/**\n * Initial base for one parse: document declarations may override it later.\n * Precedence: explicit trusted `rdfBase`, then the host-confirmed\n * `absolutePath`, then legacy `resourceAddress` for library callers. A\n * `navigationAddress` (the DSH route) never contributes a base.\n * @returns {{ base: string, source: 'document'|'resource'|'none' }}\n */\nfunction ontoRdfInitialBase(options) {\n  const opts = options || {}\n  if (opts.rdfBase !== undefined && opts.rdfBase !== null) {\n    if (ontoRdfIsDshResourceAddress(opts.rdfBase)) return { base: '', source: 'none' }\n    const mapped = ontoRdfMapResourceAddress(opts.rdfBase)\n    if (mapped) return { base: mapped, source: 'resource' }\n    return { base: '', source: 'none' }\n  }\n  if (opts.absolutePath !== undefined && opts.absolutePath !== null) {\n    const mapped = ontoRdfFileUriFromPath(opts.absolutePath)\n    if (mapped) return { base: mapped, source: 'resource' }\n    return { base: '', source: 'none' }\n  }\n  if (opts.navigationAddress !== undefined && opts.navigationAddress !== null) {\n    // The route is the only address here; it is not an RDF identity.\n    return { base: '', source: 'none' }\n  }\n  if (opts.resourceAddress !== undefined && opts.resourceAddress !== null) {\n    const mapped = ontoRdfMapResourceAddress(opts.resourceAddress)\n    if (mapped) return { base: mapped, source: 'resource' }\n    return { base: '', source: 'none' }\n  }\n  // Legacy compatibility for library callers that passed a real path as\n  // `fileName`: only address-like values still contribute a base. A bare\n  // display name MUST NOT fabricate a `file:///` identity.\n  const legacy = ontoRdfMapResourceAddress(opts.fileName)\n  if (legacy) return { base: legacy, source: 'resource' }\n  return { base: '', source: 'none' }\n}\n\n/* ------------------------------------------------------------------ */\n/* RDF document builder                                               */\n/* ------------------------------------------------------------------ */\n\nclass OntoRdfBuilder {\n  constructor(format, text, options) {\n    const opts = options || {}\n    this.format = format\n    this.text = typeof text === 'string' ? text : ''\n    this.maxTriples = ontoRdfMaxTriples(opts.maxTriples)\n    this.maxLiteralLength = ontoRdfLimit(opts.maxLiteralLength, ONTO_DEFAULT_MAX_LITERAL_LENGTH)\n    this.maxDepth = ontoRdfLimit(opts.maxDepth, ONTO_DEFAULT_MAX_DEPTH)\n    this.maxDiagnostics = ontoRdfLimit(opts.maxDiagnostics, ONTO_DEFAULT_MAX_DIAGNOSTICS)\n    this.triples = []\n    this.prefixes = {}\n    this.base = ''\n    this.baseSource = 'none'\n    this.warnings = []\n    this.errors = []\n    this.diagnostics = []\n    this.diagnosticIndex = Object.create(null)\n    this.rawMessageCount = 0\n    this.suppressedMessages = 0\n    this.suppressedSamples = []\n    this.truncated = false\n    this.blankCounter = 0\n    this.usedBlankLabels = Object.create(null)\n    this.lineIndex = null\n    /**\n     * Graph context for statements appended next. TriG/TriG-style blocks and\n     * JSON-LD named graphs set this; every other serialization keeps the\n     * shared default-graph marker. The object is shared so 100k statements do\n     * not allocate 100k identical graph objects.\n     */\n    this.currentGraph = ONTO_SHARED_DEFAULT_GRAPH\n    if (typeof text !== 'string') this.error('input is not a string')\n  }\n\n  lineAt(index) {\n    if (this.lineIndex === null) this.lineIndex = ontoRdfBuildLineIndex(this.text)\n    return ontoRdfLineAt(this.lineIndex, index)\n  }\n\n  /** Append one raw message, honouring the retained-message cap. */\n  pushRaw(severity, message, line) {\n    const text = ontoRdfFormatDiagnostic(message, line)\n    if (this.rawMessageCount >= this.maxDiagnostics) {\n      this.suppressedMessages++\n      if (this.suppressedSamples.length < ONTO_DIAGNOSTIC_SAMPLE_LIMIT) {\n        this.suppressedSamples.push(text)\n      }\n      return\n    }\n    this.rawMessageCount++\n    if (severity === 'error') this.errors.push(text)\n    else this.warnings.push(text)\n  }\n\n  warn(message, line) {\n    this.pushRaw('warning', message, line)\n  }\n\n  error(message, line) {\n    this.pushRaw('error', message, line)\n  }\n\n  /**\n   * Record one classified diagnostic and its raw message. Aggregates by code:\n   * `count` accumulates every occurrence while `sample` keeps at most three.\n   */\n  diagnose(code, severity, message, line) {\n    const level = severity === 'error' ? 'error' : 'warning'\n    const text = ontoRdfFormatDiagnostic(message, line)\n    let entry = this.diagnosticIndex[code]\n    if (!entry) {\n      entry = { code: code, severity: level, message: message, count: 0, sample: [] }\n      this.diagnosticIndex[code] = entry\n      this.diagnostics.push(entry)\n    }\n    entry.count++\n    if (entry.sample.length < ONTO_DIAGNOSTIC_SAMPLE_LIMIT) entry.sample.push(text)\n    this.pushRaw(level, message, line)\n    return entry\n  }\n\n  add(subject, predicate, object, objectKind, datatype, language, graph) {\n    if (this.triples.length >= this.maxTriples) {\n      if (!this.truncated) {\n        this.truncated = true\n        this.diagnose(\n          'triple-limit',\n          'warning',\n          'triple limit of ' + this.maxTriples + ' reached; remaining triples were skipped',\n        )\n      }\n      return false\n    }\n    let term = object\n    let literalTruncated = false\n    if ((objectKind || 'iri') === 'literal' && typeof term === 'string' &&\n      term.length > this.maxLiteralLength) {\n      literalTruncated = true\n      this.diagnose(\n        'literal-limit',\n        'warning',\n        'literal value of ' + term.length + ' characters was truncated to ' +\n          this.maxLiteralLength + ' characters',\n      )\n      term = term.slice(0, this.maxLiteralLength)\n    }\n    const triple = {\n      s: subject,\n      p: predicate,\n      o: term,\n      oKind: objectKind || 'iri',\n      graph: graph || this.currentGraph || ONTO_SHARED_DEFAULT_GRAPH,\n      location: null,\n    }\n    if (literalTruncated) triple.literalTruncated = true\n    if (datatype !== undefined) triple.dt = datatype\n    if (language !== undefined) triple.lang = language\n    this.triples.push(triple)\n    return true\n  }\n\n  freshBlank() {\n    let candidate = '_:b' + this.blankCounter\n    while (this.usedBlankLabels[candidate] === true) {\n      this.blankCounter++\n      candidate = '_:b' + this.blankCounter\n    }\n    this.blankCounter++\n    this.usedBlankLabels[candidate] = true\n    return candidate\n  }\n\n  useBlank(label) {\n    const id = label.slice(0, 2) === '_:' ? label : '_:' + label\n    this.usedBlankLabels[id] = true\n    return id\n  }\n\n  finish() {\n    const subjects = new Set()\n    const predicates = new Set()\n    const objects = new Set()\n    for (let i = 0; i < this.triples.length; i++) {\n      const triple = this.triples[i]\n      subjects.add(triple.s)\n      predicates.add(triple.p)\n      objects.add(triple.o)\n    }\n    if (this.suppressedMessages > 0) {\n      const message = this.suppressedMessages + ' diagnostic message' +\n        (this.suppressedMessages === 1 ? '' : 's') +\n        ' were suppressed after the limit of ' + this.maxDiagnostics\n      this.diagnostics.push({\n        code: 'diagnostics-truncated',\n        severity: 'warning',\n        message: message,\n        count: this.suppressedMessages,\n        sample: this.suppressedSamples.slice(),\n      })\n    }\n    return {\n      format: this.format,\n      prefixes: this.prefixes,\n      base: this.base || '',\n      baseSource: this.baseSource || 'none',\n      triples: this.triples,\n      stats: {\n        tripleCount: this.triples.length,\n        subjectCount: subjects.size,\n        predicateCount: predicates.size,\n        objectCount: objects.size,\n        truncated: this.truncated,\n        truncation: this.truncated\n          ? { reason: 'triple-limit', limit: this.maxTriples, kept: this.triples.length }\n          : null,\n      },\n      diagnostics: this.diagnostics,\n      warnings: this.warnings,\n      errors: this.errors,\n    }\n  }\n}\n\n/* ------------------------------------------------------------------ */\n/* IRI reference resolution (RFC 3986 section 5.2, string math only)   */\n/* ------------------------------------------------------------------ */\n\nconst ONTO_IRI_PATTERN = /^(?:([A-Za-z][A-Za-z0-9+.-]*):)?(?:\\/\\/([^/?#]*))?([^?#]*)(?:\\?([^#]*))?(?:#([\\s\\S]*))?$/\n\nfunction ontoRdfParseIri(value) {\n  const match = ONTO_IRI_PATTERN.exec(value)\n  if (!match) {\n    return { scheme: undefined, authority: undefined, path: value, query: undefined, fragment: undefined }\n  }\n  return {\n    scheme: match[1],\n    authority: match[2],\n    path: match[3] === undefined ? '' : match[3],\n    query: match[4],\n    fragment: match[5],\n  }\n}\n\nfunction ontoRdfDropLastSegment(output) {\n  const slash = output.lastIndexOf('/')\n  return slash < 0 ? '' : output.slice(0, slash)\n}\n\nfunction ontoRdfRemoveDotSegments(path) {\n  let input = path\n  let output = ''\n  while (input.length > 0) {\n    if (input.slice(0, 3) === '../') {\n      input = input.slice(3)\n    } else if (input.slice(0, 2) === './') {\n      input = input.slice(2)\n    } else if (input.slice(0, 3) === '/./') {\n      input = '/' + input.slice(3)\n    } else if (input === '/.') {\n      input = '/'\n    } else if (input.slice(0, 4) === '/../') {\n      input = '/' + input.slice(4)\n      output = ontoRdfDropLastSegment(output)\n    } else if (input === '/..') {\n      input = '/'\n      output = ontoRdfDropLastSegment(output)\n    } else if (input === '.' || input === '..') {\n      input = ''\n    } else {\n      const end = input.charAt(0) === '/' ? input.indexOf('/', 1) : input.indexOf('/')\n      if (end < 0) {\n        output += input\n        input = ''\n      } else {\n        output += input.slice(0, end)\n        input = input.slice(end)\n      }\n    }\n  }\n  return output\n}\n\nfunction ontoRdfMergePath(baseParts, referencePath) {\n  if (baseParts.authority !== undefined && baseParts.path === '') return '/' + referencePath\n  const slash = baseParts.path.lastIndexOf('/')\n  return slash < 0 ? referencePath : baseParts.path.slice(0, slash + 1) + referencePath\n}\n\nfunction ontoRdfBuildIri(parts) {\n  let result = ''\n  if (parts.scheme !== undefined) result += parts.scheme + ':'\n  if (parts.authority !== undefined) result += '//' + parts.authority\n  result += parts.path\n  if (parts.query !== undefined) result += '?' + parts.query\n  if (parts.fragment !== undefined) result += '#' + parts.fragment\n  return result\n}\n\n/** Resolve a relative IRI reference against an absolute base IRI. */\nfunction resolveIri(base, reference) {\n  const baseText = typeof base === 'string' ? base : ''\n  const referenceText = typeof reference === 'string' ? reference : ''\n  if (baseText === '') return referenceText\n  const ref = ontoRdfParseIri(referenceText)\n  const baseParts = ontoRdfParseIri(baseText)\n  if (ref.scheme !== undefined) {\n    return ontoRdfBuildIri({\n      scheme: ref.scheme,\n      authority: ref.authority,\n      path: ontoRdfRemoveDotSegments(ref.path),\n      query: ref.query,\n      fragment: ref.fragment,\n    })\n  }\n  if (ref.authority !== undefined) {\n    return ontoRdfBuildIri({\n      scheme: baseParts.scheme,\n      authority: ref.authority,\n      path: ontoRdfRemoveDotSegments(ref.path),\n      query: ref.query,\n      fragment: ref.fragment,\n    })\n  }\n  if (ref.path === '') {\n    return ontoRdfBuildIri({\n      scheme: baseParts.scheme,\n      authority: baseParts.authority,\n      path: baseParts.path,\n      query: ref.query !== undefined ? ref.query : baseParts.query,\n      fragment: ref.fragment,\n    })\n  }\n  const path = ref.path.charAt(0) === '/'\n    ? ontoRdfRemoveDotSegments(ref.path)\n    : ontoRdfRemoveDotSegments(ontoRdfMergePath(baseParts, ref.path))\n  return ontoRdfBuildIri({\n    scheme: baseParts.scheme,\n    authority: baseParts.authority,\n    path: path,\n    query: ref.query,\n    fragment: ref.fragment,\n  })\n}\n\n/** Expand 'foaf:Person' with a prefix map, or return null. */\nfunction expandPrefixedName(name, prefixes) {\n  if (typeof name !== 'string' || !prefixes || typeof prefixes !== 'object') return null\n  const colon = name.indexOf(':')\n  if (colon < 0) return null\n  const prefix = name.slice(0, colon)\n  if (!ontoRdfHas(prefixes, prefix)) return null\n  const namespace = prefixes[prefix]\n  if (typeof namespace !== 'string' || namespace === '') return null\n  return namespace + name.slice(colon + 1)\n}\n\n/* ------------------------------------------------------------------ */\n/* Escape decoding                                                    */\n/* ------------------------------------------------------------------ */\n\nfunction ontoRdfDecodeUnicode(raw, marker, line, builder) {\n  const size = marker === 'u' ? 4 : 8\n  const hex = raw.slice(0, size)\n  if (hex.length !== size || !/^[0-9A-Fa-f]+$/.test(hex)) {\n    builder.warn('invalid unicode escape \"\\\\' + marker + hex + '\"', line)\n    return null\n  }\n  const code = parseInt(hex, 16)\n  if (code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) {\n    builder.warn('invalid code point in unicode escape', line)\n    return { value: '\\uFFFD', used: size }\n  }\n  return { value: String.fromCodePoint(code), used: size }\n}\n\nfunction ontoRdfDecodeEscapes(raw, line, builder) {\n  let output = ''\n  let i = 0\n  while (i < raw.length) {\n    const character = raw.charAt(i)\n    if (character !== '\\\\') {\n      output += character\n      i++\n      continue\n    }\n    const marker = raw.charAt(i + 1)\n    if (marker === '') {\n      builder.warn('trailing backslash in literal', line)\n      break\n    }\n    if (marker === 't') {\n      output += '\\t'\n      i += 2\n    } else if (marker === 'b') {\n      output += '\\b'\n      i += 2\n    } else if (marker === 'n') {\n      output += '\\n'\n      i += 2\n    } else if (marker === 'r') {\n      output += '\\r'\n      i += 2\n    } else if (marker === 'f') {\n      output += '\\f'\n      i += 2\n    } else if (marker === '\"') {\n      output += '\"'\n      i += 2\n    } else if (marker === \"'\") {\n      output += \"'\"\n      i += 2\n    } else if (marker === '\\\\') {\n      output += '\\\\'\n      i += 2\n    } else if (marker === 'u' || marker === 'U') {\n      const decoded = ontoRdfDecodeUnicode(raw.slice(i + 2), marker, line, builder)\n      if (decoded === null) {\n        output += marker\n        i += 2\n      } else {\n        output += decoded.value\n        i += 2 + decoded.used\n      }\n    } else {\n      builder.warn('unknown escape sequence \"\\\\' + marker + '\"', line)\n      output += marker\n      i += 2\n    }\n  }\n  return output\n}\n\nfunction ontoRdfDecodeIriEscapes(raw, line, builder) {\n  let output = ''\n  let i = 0\n  while (i < raw.length) {\n    const character = raw.charAt(i)\n    if (character !== '\\\\') {\n      output += character\n      i++\n      continue\n    }\n    const marker = raw.charAt(i + 1)\n    if (marker === 'u' || marker === 'U') {\n      const decoded = ontoRdfDecodeUnicode(raw.slice(i + 2), marker, line, builder)\n      if (decoded === null) {\n        output += marker\n        i += 2\n      } else {\n        output += decoded.value\n        i += 2 + decoded.used\n      }\n      continue\n    }\n    if (marker === '') {\n      builder.warn('trailing backslash in IRI', line)\n      break\n    }\n    builder.warn('invalid escape sequence \"\\\\' + marker + '\" in IRI', line)\n    output += marker\n    i += 2\n  }\n  return output\n}\n\n/* ------------------------------------------------------------------ */\n/* Turtle / N3 / TriG                                                 */\n/* ------------------------------------------------------------------ */\n\nconst ONTO_TURTLE_NUMBER = /[+-]?(?:(?:(?:\\d+\\.\\d*)|(?:\\.\\d+)|(?:\\d+))[eE][+-]?\\d+|(?:\\d*\\.\\d+)|(?:\\d+))/y\n\nfunction ontoRdfTurtleBoundary(character) {\n  return character === undefined ||\n    character === ' ' || character === '\\t' || character === '\\r' || character === '\\n' ||\n    character === ';' || character === ',' || character === '.' || character === '(' ||\n    character === ')' || character === '[' || character === ']' || character === '{' ||\n    character === '}' || character === '<' || character === '>' || character === '\"' ||\n    character === \"'\" || character === '#' || character === '^'\n}\n\nclass OntoTurtleParser {\n  constructor(text, options) {\n    const opts = options || {}\n    this.builder = new OntoRdfBuilder('turtle', ontoRdfNormalizeText(text), opts)\n    this.source = this.builder.text\n    this.length = this.source.length\n    this.pos = 0\n    const initial = ontoRdfInitialBase(opts)\n    this.base = initial.base\n    this.builder.base = initial.base\n    this.builder.baseSource = initial.source\n    this.depth = 0\n    this.prefixes = this.builder.prefixes\n    /** Open TriG graph blocks; each entry is `{ term, index }`. */\n    this.graphStack = []\n    this.builder.currentGraph = ONTO_SHARED_DEFAULT_GRAPH\n    if (opts.prefixes && typeof opts.prefixes === 'object') {\n      const keys = Object.keys(opts.prefixes)\n      for (let i = 0; i < keys.length; i++) {\n        const value = opts.prefixes[keys[i]]\n        if (typeof value === 'string') this.prefixes[keys[i]] = value\n      }\n    }\n  }\n\n  parse() {\n    try {\n      this.parseDocument()\n    } catch (error) {\n      if (!error || !error.ontoRdfFatal) {\n        this.builder.error(\n          'parser failed: ' + (error && error.message ? error.message : String(error)),\n          this.builder.lineAt(this.pos),\n        )\n      }\n    }\n    return this.builder.finish()\n  }\n\n  /* ---------------------------- scanner ---------------------------- */\n\n  peek(offset) {\n    return this.source[this.pos + (offset || 0)]\n  }\n\n  atEnd() {\n    return this.pos >= this.length\n  }\n\n  lineAt(index) {\n    return this.builder.lineAt(index)\n  }\n\n  fatal(message, index) {\n    this.builder.error(message, this.lineAt(index === undefined ? this.pos : index))\n    const error = new Error(message)\n    error.ontoRdfFatal = true\n    throw error\n  }\n\n  skipWhitespace() {\n    while (this.pos < this.length) {\n      const character = this.source[this.pos]\n      if (character === ' ' || character === '\\t' || character === '\\r' || character === '\\n') {\n        this.pos++\n        continue\n      }\n      if (character === '#') {\n        const newline = this.source.indexOf('\\n', this.pos)\n        this.pos = newline < 0 ? this.length : newline + 1\n        continue\n      }\n      break\n    }\n  }\n\n  isNameDelimiter(character) {\n    return character === undefined ||\n      character === ' ' || character === '\\t' || character === '\\r' || character === '\\n' ||\n      character === ';' || character === ',' || character === '(' || character === ')' ||\n      character === '[' || character === ']' || character === '<' || character === '>' ||\n      character === '\"' || character === \"'\" || character === '#' || character === '{' ||\n      character === '}' || character === '^'\n  }\n\n  matchWord(word) {\n    const end = this.pos + word.length\n    if (this.source.slice(this.pos, end) !== word) return false\n    return ontoRdfTurtleBoundary(this.source[end])\n  }\n\n  readWord() {\n    let end = this.pos\n    while (end < this.length && /[A-Za-z]/.test(this.source[end])) end++\n    return this.source.slice(this.pos, end)\n  }\n\n  isDirectiveBoundary(index) {\n    const character = this.source[index]\n    return character === undefined || character === ' ' || character === '\\t' ||\n      character === '\\r' || character === '\\n' || character === '<'\n  }\n\n  /* --------------------------- directives -------------------------- */\n\n  tryDirective() {\n    const start = this.pos\n    if (this.peek() === '@') {\n      if (this.source.slice(start, start + 7).toLowerCase() === '@prefix' && this.isDirectiveBoundary(start + 7)) {\n        this.parsePrefixDirective(7, true)\n        return true\n      }\n      if (this.source.slice(start, start + 5).toLowerCase() === '@base' && this.isDirectiveBoundary(start + 5)) {\n        this.parseBaseDirective(5, true)\n        return true\n      }\n      return false\n    }\n    const word = this.readWord()\n    const lower = word.toLowerCase()\n    if (lower === 'prefix' && this.isDirectiveBoundary(start + word.length)) {\n      this.parsePrefixDirective(word.length, false)\n      return true\n    }\n    if (lower === 'base' && this.isDirectiveBoundary(start + word.length)) {\n      this.parseBaseDirective(word.length, false)\n      return true\n    }\n    return false\n  }\n\n  parsePrefixDirective(keywordLength, requireDot) {\n    const start = this.pos\n    this.pos += keywordLength\n    this.skipWhitespace()\n    const prefix = this.readPrefixLabel()\n    this.skipWhitespace()\n    if (this.peek() !== '<') this.fatal('expected an IRI after the prefix name', this.pos)\n    const iri = this.readIriReference()\n    this.declarePrefix(prefix, iri, start)\n    this.skipWhitespace()\n    if (requireDot) {\n      if (this.peek() !== '.') this.fatal(\"expected '.' after @prefix\", this.pos)\n      this.pos++\n    } else if (this.peek() === '.') {\n      this.pos++\n    }\n  }\n\n  parseBaseDirective(keywordLength, requireDot) {\n    const start = this.pos\n    this.pos += keywordLength\n    this.skipWhitespace()\n    if (this.peek() !== '<') this.fatal('expected an IRI after @base', this.pos)\n    const iri = this.readIriReference()\n    this.setBase(iri, start)\n    this.skipWhitespace()\n    if (requireDot) {\n      if (this.peek() !== '.') this.fatal(\"expected '.' after @base\", this.pos)\n      this.pos++\n    } else if (this.peek() === '.') {\n      this.pos++\n    }\n  }\n\n  readPrefixLabel() {\n    const start = this.pos\n    let prefix = ''\n    while (!this.atEnd()) {\n      const character = this.peek()\n      if (character === ':') {\n        this.pos++\n        return prefix\n      }\n      if (this.isNameDelimiter(character) || character === '\\\\') break\n      prefix += character\n      this.pos++\n    }\n    this.fatal('expected \":\" after the prefix name', start)\n    return ''\n  }\n\n  declarePrefix(prefix, iri, index) {\n    let value = iri\n    if (!ontoRdfIsAbsoluteIri(value)) {\n      if (this.base) value = resolveIri(this.base, value)\n      else {\n        this.builder.diagnose(\n          'base-unavailable',\n          'warning',\n          'prefix IRI \"' + iri + '\" is relative and no base is available',\n          this.lineAt(index),\n        )\n      }\n    }\n    this.prefixes[prefix] = value\n  }\n\n  setBase(iri, index) {\n    let value = iri\n    if (!ontoRdfIsAbsoluteIri(value)) {\n      if (this.base) {\n        value = resolveIri(this.base, value)\n      } else {\n        this.builder.diagnose(\n          'base-unavailable',\n          'warning',\n          '@base \"' + iri + '\" is relative and no base is available',\n          this.lineAt(index),\n        )\n        return\n      }\n    }\n    this.base = value\n    this.builder.base = value\n    if (value !== '') this.builder.baseSource = 'document'\n  }\n\n  /* ------------------------- graph context ------------------------- */\n\n  /** Open one TriG graph block and make its graph the current context. */\n  pushGraph(term, index) {\n    const graph = term && typeof term === 'object' ? term : ONTO_SHARED_DEFAULT_GRAPH\n    this.graphStack.push({ term: graph, index: index })\n    this.builder.currentGraph = graph\n  }\n\n  /** Close the innermost graph block; an unbalanced brace is diagnosed. */\n  popGraph(index) {\n    if (this.graphStack.length > 0) {\n      this.graphStack.pop()\n      this.builder.currentGraph = this.graphStack.length > 0\n        ? this.graphStack[this.graphStack.length - 1].term\n        : ONTO_SHARED_DEFAULT_GRAPH\n      return\n    }\n    this.builder.diagnose(\n      'named-graph-context',\n      'warning',\n      'closing \"}\" without an open graph block was ignored',\n      this.lineAt(index === undefined ? this.pos : index),\n    )\n    this.builder.currentGraph = ONTO_SHARED_DEFAULT_GRAPH\n  }\n\n  /** Resolve one graph IRI through the current base and prefixes. */\n  graphTermFromIri(iri, index) {\n    if (!ontoRdfIsAbsoluteIri(iri)) {\n      if (!this.base) {\n        this.builder.diagnose(\n          'base-unavailable',\n          'warning',\n          'graph IRI \"' + iri + '\" is relative and no base is available',\n          this.lineAt(index),\n        )\n        return ONTO_SHARED_UNKNOWN_GRAPH\n      }\n      return { kind: 'iri', value: resolveIri(this.base, iri) }\n    }\n    return { kind: 'iri', value: iri }\n  }\n\n  /**\n   * Resolve a prefixed-name graph label without aborting the document when\n   * the prefix is unknown: the label is reported and kept as unknown.\n   */\n  graphTermFromNameToken(token) {\n    const value = token && typeof token.value === 'string' ? token.value : ''\n    const colon = value.indexOf(':')\n    if (colon < 0) return null\n    const prefix = value.slice(0, colon)\n    const local = value.slice(colon + 1)\n    const namespace = ontoRdfHas(this.prefixes, prefix) ? this.prefixes[prefix] : undefined\n    if (typeof namespace !== 'string') return null\n    return this.graphTermFromIri(namespace + local, token.start)\n  }\n\n  /** Diagnose one graph label that could not be resolved, then keep unknown. */\n  noteUnresolvedGraph(label, index) {\n    this.builder.diagnose(\n      'named-graph-context',\n      'warning',\n      'graph label \"' + label + '\" could not be resolved; its statements keep an unknown graph context',\n      this.lineAt(index),\n    )\n    return ONTO_SHARED_UNKNOWN_GRAPH\n  }\n\n  /** Skip one balanced bracket construct without recursing (depth-limit escape). */\n  skipBalanced(openCharacter, closeCharacter) {\n    if (this.peek() !== openCharacter) return\n    this.pos++\n    let depth = 1\n    while (this.pos < this.length) {\n      const character = this.peek()\n      if (character === '\\\\') {\n        this.pos += 2\n        continue\n      }\n      if (character === '#') {\n        const newline = this.source.indexOf('\\n', this.pos)\n        this.pos = newline < 0 ? this.length : newline + 1\n        continue\n      }\n      if (character === '\"' || character === \"'\") {\n        const quote = character\n        const long = this.peek(1) === quote && this.peek(2) === quote\n        this.pos += long ? 3 : 1\n        while (this.pos < this.length) {\n          if (this.source[this.pos] === '\\\\') {\n            this.pos += 2\n            continue\n          }\n          if (long) {\n            if (this.source[this.pos] === quote && this.source[this.pos + 1] === quote &&\n              this.source[this.pos + 2] === quote) {\n              this.pos += 3\n              break\n            }\n          } else if (this.source[this.pos] === quote) {\n            this.pos++\n            break\n          }\n          this.pos++\n        }\n        continue\n      }\n      if (character === openCharacter) {\n        depth++\n      } else if (character === closeCharacter) {\n        depth--\n        this.pos++\n        if (depth === 0) return\n        continue\n      }\n      this.pos++\n    }\n  }\n\n  noteNestingLimit(index) {\n    this.builder.diagnose(\n      'nesting-limit',\n      'error',\n      'nesting depth limit of ' + this.builder.maxDepth +\n        ' reached; the nested branch was skipped',\n      this.lineAt(index),\n    )\n  }\n\n  /* ---------------------------- tokens ----------------------------- */\n\n  readIriReference() {\n    const start = this.pos\n    if (this.peek() !== '<') this.fatal('expected an IRI reference', start)\n    this.pos++\n    let raw = ''\n    while (this.pos < this.length) {\n      const character = this.source[this.pos]\n      if (character === '>') {\n        this.pos++\n        return ontoRdfDecodeIriEscapes(raw, this.lineAt(start), this.builder)\n      }\n      if (character === '\\n' || character === '\\r') this.fatal('newline inside an IRI reference', start)\n      raw += character\n      this.pos++\n    }\n    this.fatal('unterminated IRI reference', start)\n    return ''\n  }\n\n  readNameToken() {\n    const start = this.pos\n    let value = ''\n    while (!this.atEnd()) {\n      const character = this.peek()\n      if (character === '\\\\') {\n        const marker = this.peek(1)\n        if (marker === 'u' || marker === 'U') {\n          const size = marker === 'u' ? 4 : 8\n          const hex = this.source.slice(this.pos + 2, this.pos + 2 + size)\n          if (hex.length === size && /^[0-9A-Fa-f]+$/.test(hex)) {\n            const code = parseInt(hex, 16)\n            if (code <= 0x10ffff && !(code >= 0xd800 && code <= 0xdfff)) value += String.fromCodePoint(code)\n            this.pos += 2 + size\n            continue\n          }\n        }\n        if (marker === undefined) {\n          this.pos++\n          break\n        }\n        value += marker\n        this.pos += 2\n        continue\n      }\n      if (this.isNameDelimiter(character)) break\n      value += character\n      this.pos++\n    }\n    while (value.charAt(value.length - 1) === '.' && this.pos > start &&\n      this.source[this.pos - 1] === '.' && this.source[this.pos - 2] !== '\\\\') {\n      value = value.slice(0, -1)\n      this.pos--\n    }\n    return { value: value, start: start }\n  }\n\n  readBlankNode(token, start) {\n    const label = token.slice(2)\n    if (!label) this.fatal('empty blank node label', start)\n    if (!/^[A-Za-z0-9_][A-Za-z0-9_.-]*$/.test(label)) {\n      this.builder.warn('blank node label \"' + label + '\" may not be valid', this.lineAt(start))\n    }\n    return this.builder.useBlank(label)\n  }\n\n  expandNameToken(token) {\n    const value = token.value\n    const colon = value.indexOf(':')\n    if (colon < 0) return null\n    const prefix = value.slice(0, colon)\n    const local = value.slice(colon + 1)\n    const namespace = ontoRdfHas(this.prefixes, prefix) ? this.prefixes[prefix] : undefined\n    if (typeof namespace !== 'string') this.fatal('undefined prefix \"' + prefix + ':\": \"' + value + '\"', token.start)\n    return ontoRdfNormalizeIri(namespace + local, this.base, this.builder, this.lineAt(token.start))\n  }\n\n  readStringRaw() {\n    const quote = this.peek()\n    const start = this.pos\n    const long = this.peek(1) === quote && this.peek(2) === quote\n    this.pos += long ? 3 : 1\n    let raw = ''\n    while (this.pos < this.length) {\n      const character = this.source[this.pos]\n      if (long) {\n        if (character === quote && this.source[this.pos + 1] === quote && this.source[this.pos + 2] === quote) {\n          this.pos += 3\n          return raw\n        }\n      } else if (character === quote) {\n        this.pos++\n        return raw\n      }\n      if (character === '\\\\') {\n        raw += character\n        this.pos++\n        if (this.pos < this.length) {\n          raw += this.source[this.pos]\n          this.pos++\n        }\n        continue\n      }\n      if (!long && (character === '\\n' || character === '\\r')) {\n        this.fatal('newline inside a short string literal', start)\n      }\n      raw += character\n      this.pos++\n    }\n    this.fatal('unterminated string literal', start)\n    return ''\n  }\n\n  parseStringLiteral() {\n    const start = this.pos\n    const raw = this.readStringRaw()\n    const value = ontoRdfDecodeEscapes(raw, this.lineAt(start), this.builder)\n    let language\n    let datatype\n    if (this.peek() === '@') {\n      this.pos++\n      const tagStart = this.pos\n      while (!this.atEnd() && /[A-Za-z0-9-]/.test(this.peek())) this.pos++\n      const tag = this.source.slice(tagStart, this.pos)\n      if (!tag) {\n        this.builder.warn('empty language tag', this.lineAt(tagStart))\n      } else {\n        language = tag.toLowerCase()\n        if (!/^[A-Za-z]+(?:-[A-Za-z0-9]+)*$/.test(tag)) {\n          this.builder.warn('invalid language tag \"' + tag + '\"', this.lineAt(tagStart))\n        }\n      }\n    } else if (this.peek() === '^' && this.peek(1) === '^') {\n      this.pos += 2\n      this.skipWhitespace()\n      const datatypeStart = this.pos\n      if (this.peek() === '<') {\n        datatype = ontoRdfNormalizeIri(this.readIriReference(), this.base, this.builder, this.lineAt(datatypeStart))\n      } else {\n        const token = this.readNameToken()\n        datatype = this.expandNameToken(token)\n        if (!datatype) this.fatal('expected a datatype IRI', datatypeStart)\n      }\n    }\n    return { term: value, kind: 'literal', dt: datatype, lang: language }\n  }\n\n  readNumber() {\n    const start = this.pos\n    ONTO_TURTLE_NUMBER.lastIndex = this.pos\n    const match = ONTO_TURTLE_NUMBER.exec(this.source)\n    if (!match) this.fatal('invalid numeric literal', start)\n    const raw = match[0]\n    const end = start + raw.length\n    if (!ontoRdfTurtleBoundary(this.source[end])) {\n      this.fatal('invalid numeric literal \"' + raw + '\"', start)\n    }\n    this.pos = end\n    let datatype = ONTO_XSD_INTEGER\n    if (raw.indexOf('e') >= 0 || raw.indexOf('E') >= 0) datatype = ONTO_XSD_DOUBLE\n    else if (raw.indexOf('.') >= 0) datatype = ONTO_XSD_DECIMAL\n    return { term: raw, kind: 'literal', dt: datatype }\n  }\n\n  /* --------------------------- grammar ----------------------------- */\n\n  parseDocument() {\n    this.skipWhitespace()\n    while (!this.atEnd()) {\n      if (this.builder.truncated) break\n      const character = this.peek()\n      if (character === '{') {\n        // An anonymous block is TriG's default graph.\n        this.pushGraph(ONTO_SHARED_DEFAULT_GRAPH, this.pos)\n        this.pos++\n        this.skipWhitespace()\n        continue\n      }\n      if (character === '}') {\n        this.popGraph(this.pos)\n        this.pos++\n        this.skipWhitespace()\n        continue\n      }\n      if (this.tryDirective()) {\n        this.skipWhitespace()\n        continue\n      }\n      if (this.tryGraphHeader()) {\n        this.skipWhitespace()\n        continue\n      }\n      this.parseTriples()\n      if (this.builder.truncated) break\n      this.skipWhitespace()\n      if (this.atEnd()) break\n      if (this.peek() === '.') {\n        this.pos++\n        this.skipWhitespace()\n        continue\n      }\n      if (this.peek() === '}') {\n        this.popGraph(this.pos)\n        this.pos++\n        this.skipWhitespace()\n        continue\n      }\n      this.fatal(\"expected '.' after the triples\", this.pos)\n    }\n    if (!this.builder.truncated && this.graphStack.length > 0) {\n      this.builder.diagnose(\n        'named-graph-context',\n        'warning',\n        'a graph block was not closed before the end of the document',\n      )\n      this.graphStack.length = 0\n      this.builder.currentGraph = ONTO_SHARED_DEFAULT_GRAPH\n    }\n  }\n\n  tryGraphHeader() {\n    const save = this.pos\n    if (this.peek() === '<') {\n      const end = this.findIriEnd(save)\n      if (end < 0) return false\n      this.pos = save\n      const iri = this.readIriReference()\n      this.skipWhitespace()\n      if (this.peek() === '{') {\n        this.pushGraph(this.graphTermFromIri(iri, save), save)\n        this.pos++\n        return true\n      }\n      this.pos = save\n      return false\n    }\n    if (this.peek() === '_' && this.peek(1) === ':') {\n      this.pos += 2\n      const labelStart = save\n      while (!this.atEnd() && !this.isNameDelimiter(this.peek())) this.pos++\n      const labelText = this.source.slice(labelStart, this.pos)\n      this.skipWhitespace()\n      if (this.peek() === '{') {\n        this.pushGraph({ kind: 'blank', value: this.builder.useBlank(labelText.slice(2)) }, save)\n        this.pos++\n        return true\n      }\n      this.pos = save\n      return false\n    }\n    const word = this.readWord()\n    if (word.toLowerCase() === 'graph' && ontoRdfIsWhitespace(this.source[this.pos + word.length])) {\n      this.pos += word.length\n      this.skipWhitespace()\n      let graph\n      let labelText\n      if (this.peek() === '<') {\n        const labelStart = this.pos\n        if (this.findIriEnd(labelStart) < 0) {\n          this.pos = save\n          return false\n        }\n        const iri = this.readIriReference()\n        labelText = iri\n        graph = this.graphTermFromIri(iri, save)\n      } else if (this.peek() === '_' && this.peek(1) === ':') {\n        const labelStart = this.pos\n        this.pos += 2\n        while (!this.atEnd() && !this.isNameDelimiter(this.peek())) this.pos++\n        labelText = this.source.slice(labelStart, this.pos)\n        graph = { kind: 'blank', value: this.builder.useBlank(labelText.slice(2)) }\n      } else {\n        const labelToken = this.readNameToken()\n        if (!labelToken.value) {\n          this.pos = save\n          return false\n        }\n        labelText = labelToken.value\n        graph = this.graphTermFromNameToken(labelToken) ||\n          this.noteUnresolvedGraph(labelText, save)\n      }\n      this.skipWhitespace()\n      if (this.peek() === '{') {\n        this.pushGraph(graph, save)\n        this.pos++\n        return true\n      }\n      this.pos = save\n      return false\n    }\n    const token = this.readNameToken()\n    this.skipWhitespace()\n    if (token.value && this.peek() === '{') {\n      this.pushGraph(this.graphTermFromNameToken(token) ||\n        this.noteUnresolvedGraph(token.value, save), save)\n      this.pos++\n      return true\n    }\n    this.pos = save\n    return false\n  }\n\n  findIriEnd(start) {\n    let index = start + 1\n    while (index < this.length) {\n      const character = this.source[index]\n      if (character === '\\\\') {\n        index += 2\n        continue\n      }\n      if (character === '>') return index\n      if (character === '\\n' || character === '\\r') return -1\n      index++\n    }\n    return -1\n  }\n\n  parseTriples() {\n    const subject = this.parseSubject()\n    this.skipWhitespace()\n    if (this.peek() === '{') {\n      // A block opened after a subject is tolerated as a default-graph block.\n      this.pushGraph(ONTO_SHARED_DEFAULT_GRAPH, this.pos)\n      this.pos++\n      return\n    }\n    if (this.peek() === '.') {\n      if (!subject.propertyList) this.fatal('expected a predicate and object', this.pos)\n      return\n    }\n    const found = this.parsePredicateObjectList(subject.term)\n    if (!found && !subject.propertyList) this.fatal('expected a predicate and object', this.pos)\n  }\n\n  parseSubject() {\n    this.skipWhitespace()\n    const start = this.pos\n    const character = this.peek()\n    if (character === undefined) this.fatal('unexpected end of input, expected a subject', start)\n    if (character === '<') {\n      return {\n        term: ontoRdfNormalizeIri(this.readIriReference(), this.base, this.builder, this.lineAt(start)),\n        propertyList: false,\n      }\n    }\n    if (character === '[') {\n      return { term: this.parseBlankNodePropertyList(), propertyList: true }\n    }\n    if (character === '(') {\n      const head = this.parseCollection()\n      return { term: head, propertyList: false }\n    }\n    if (character === '_' && this.peek(1) === ':') {\n      const token = this.readNameToken()\n      return { term: this.readBlankNode(token.value, start), propertyList: false }\n    }\n    const token = this.readNameToken()\n    const iri = this.expandNameToken(token)\n    if (!iri) this.fatal('invalid subject \"' + token.value + '\"', start)\n    return { term: iri, propertyList: false }\n  }\n\n  parsePredicate() {\n    this.skipWhitespace()\n    const start = this.pos\n    if (this.matchWord('a')) {\n      this.pos++\n      return ONTO_RDF_TYPE\n    }\n    if (this.peek() === '<') {\n      return ontoRdfNormalizeIri(this.readIriReference(), this.base, this.builder, this.lineAt(start))\n    }\n    const token = this.readNameToken()\n    const iri = this.expandNameToken(token)\n    if (!iri) this.fatal('expected a predicate', start)\n    return iri\n  }\n\n  parseObject() {\n    this.skipWhitespace()\n    const start = this.pos\n    const character = this.peek()\n    if (character === undefined) this.fatal('unexpected end of input, expected an object', start)\n    if (character === '<') {\n      return {\n        term: ontoRdfNormalizeIri(this.readIriReference(), this.base, this.builder, this.lineAt(start)),\n        kind: 'iri',\n      }\n    }\n    if (character === '[') {\n      return { term: this.parseBlankNodePropertyList(), kind: 'blank' }\n    }\n    if (character === '(') {\n      const head = this.parseCollection()\n      return { term: head, kind: head === ONTO_RDF_NIL ? 'iri' : 'blank' }\n    }\n    if (character === '_' && this.peek(1) === ':') {\n      const token = this.readNameToken()\n      return { term: this.readBlankNode(token.value, start), kind: 'blank' }\n    }\n    if (character === '\"' || character === \"'\") return this.parseStringLiteral()\n    if (character === '+' || character === '-' || character === '.' ||\n      (character >= '0' && character <= '9')) {\n      if (character === '.' && !(this.peek(1) >= '0' && this.peek(1) <= '9')) {\n        this.fatal('unexpected \".\" where an object was expected', start)\n      }\n      return this.readNumber()\n    }\n    if (this.matchWord('true')) {\n      this.pos += 4\n      return { term: 'true', kind: 'literal', dt: ONTO_XSD_BOOLEAN }\n    }\n    if (this.matchWord('false')) {\n      this.pos += 5\n      return { term: 'false', kind: 'literal', dt: ONTO_XSD_BOOLEAN }\n    }\n    const token = this.readNameToken()\n    const iri = this.expandNameToken(token)\n    if (!iri) this.fatal('expected an object at \"' + token.value + '\"', start)\n    return { term: iri, kind: 'iri' }\n  }\n\n  parsePredicateObjectList(subject) {\n    let found = false\n    while (true) {\n      if (this.builder.truncated) break\n      this.skipWhitespace()\n      if (this.atEnd()) break\n      const character = this.peek()\n      if (character === '.' || character === ']' || character === ')' ||\n        character === '}' || character === '{') break\n      if (character === ';') {\n        this.pos++\n        continue\n      }\n      const predicate = this.parsePredicate()\n      this.parseObjectList(subject, predicate)\n      found = true\n      this.skipWhitespace()\n      if (this.peek() !== ';') break\n      this.pos++\n    }\n    return found\n  }\n\n  parseObjectList(subject, predicate) {\n    while (true) {\n      const object = this.parseObject()\n      const added = this.builder.add(subject, predicate, object.term, object.kind, object.dt, object.lang)\n      this.skipWhitespace()\n      if (!added || this.peek() !== ',') break\n      this.pos++\n      this.skipWhitespace()\n    }\n  }\n\n  parseBlankNodePropertyList() {\n    const start = this.pos\n    if (this.depth >= this.builder.maxDepth) {\n      this.noteNestingLimit(start)\n      this.skipBalanced('[', ']')\n      return this.builder.freshBlank()\n    }\n    this.depth++\n    try {\n      this.pos++\n      const node = this.builder.freshBlank()\n      this.skipWhitespace()\n      if (this.peek() === ']') {\n        this.pos++\n        return node\n      }\n      this.parsePredicateObjectList(node)\n      if (this.builder.truncated) return node\n      this.skipWhitespace()\n      if (this.peek() !== ']') this.fatal(\"expected ']' to close the blank node property list\", this.pos)\n      this.pos++\n      return node\n    } finally {\n      this.depth--\n    }\n  }\n\n  parseCollection() {\n    const start = this.pos\n    if (this.depth >= this.builder.maxDepth) {\n      this.noteNestingLimit(start)\n      this.skipBalanced('(', ')')\n      return ONTO_RDF_NIL\n    }\n    this.depth++\n    try {\n      this.pos++\n      this.skipWhitespace()\n      if (this.peek() === ')') {\n        this.pos++\n        return ONTO_RDF_NIL\n      }\n      const head = this.builder.freshBlank()\n      let current = head\n      while (true) {\n        const item = this.parseObject()\n        const added = this.builder.add(current, ONTO_RDF_FIRST, item.term, item.kind, item.dt, item.lang)\n        if (!added) return head\n        this.skipWhitespace()\n        if (this.peek() === ')') {\n          this.pos++\n          this.builder.add(current, ONTO_RDF_REST, ONTO_RDF_NIL, 'iri')\n          break\n        }\n        if (this.peek() === undefined) this.fatal('unterminated RDF collection', start)\n        const next = this.builder.freshBlank()\n        this.builder.add(current, ONTO_RDF_REST, next, 'blank')\n        current = next\n      }\n      return head\n    } finally {\n      this.depth--\n    }\n  }\n}\n\n/* ------------------------------------------------------------------ */\n/* N-Triples / N-Quads                                                */\n/* ------------------------------------------------------------------ */\n\nclass OntoNTriplesParser {\n  constructor(text, options) {\n    const opts = options || {}\n    this.builder = new OntoRdfBuilder('ntriples', ontoRdfNormalizeText(text), opts)\n    this.source = this.builder.text\n    const initial = ontoRdfInitialBase(opts)\n    this.base = initial.base\n    this.builder.base = initial.base\n    this.builder.baseSource = initial.source\n  }\n\n  parse() {\n    const lines = this.source.split('\\n')\n    for (let i = 0; i < lines.length; i++) {\n      if (this.builder.truncated) break\n      let line = lines[i]\n      if (line.charCodeAt(line.length - 1) === 13) line = line.slice(0, -1)\n      const trimmed = line.trim()\n      if (!trimmed || trimmed.charAt(0) === '#') continue\n      this.parseLine(trimmed, i + 1)\n    }\n    return this.builder.finish()\n  }\n\n  parseLine(line, lineNumber) {\n    const length = line.length\n    let pos = 0\n    const builder = this.builder\n    const base = this.base\n    const self = this\n\n    const fail = (message) => {\n      builder.error(message, lineNumber)\n      const error = new Error(message)\n      error.ontoRdfFatal = true\n      throw error\n    }\n\n    const skip = () => {\n      while (pos < length && (line[pos] === ' ' || line[pos] === '\\t')) pos++\n    }\n\n    const readIri = () => {\n      if (line[pos] !== '<') fail('expected an IRI reference')\n      pos++\n      let raw = ''\n      while (pos < length) {\n        const character = line[pos]\n        if (character === '\\\\') {\n          raw += character\n          pos++\n          if (pos < length) {\n            raw += line[pos]\n            pos++\n          }\n          continue\n        }\n        if (character === '>') {\n          pos++\n          return ontoRdfNormalizeIri(ontoRdfDecodeIriEscapes(raw, lineNumber, builder), base, builder, lineNumber)\n        }\n        raw += character\n        pos++\n      }\n      fail('unterminated IRI reference')\n      return ''\n    }\n\n    const readBlank = () => {\n      const pattern = /_:([A-Za-z0-9_][A-Za-z0-9_.-]*)/y\n      pattern.lastIndex = pos\n      const match = pattern.exec(line)\n      if (!match) fail('expected a blank node label')\n      pos = pattern.lastIndex\n      return builder.useBlank(match[1])\n    }\n\n    const readLiteral = () => {\n      if (line[pos] !== '\"') fail('expected a literal')\n      pos++\n      let raw = ''\n      let closed = false\n      while (pos < length) {\n        const character = line[pos]\n        if (character === '\\\\') {\n          raw += character\n          pos++\n          if (pos < length) {\n            raw += line[pos]\n            pos++\n          }\n          continue\n        }\n        if (character === '\"') {\n          pos++\n          closed = true\n          break\n        }\n        raw += character\n        pos++\n      }\n      if (!closed) fail('unterminated string literal')\n      let language\n      let datatype\n      if (line[pos] === '@') {\n        pos++\n        const tagStart = pos\n        while (pos < length && /[A-Za-z0-9-]/.test(line[pos])) pos++\n        const tag = line.slice(tagStart, pos)\n        if (!tag) builder.warn('empty language tag', lineNumber)\n        else language = tag.toLowerCase()\n      } else if (line[pos] === '^' && line[pos + 1] === '^') {\n        pos += 2\n        datatype = readIri()\n      }\n      return {\n        term: ontoRdfDecodeEscapes(raw, lineNumber, builder),\n        kind: 'literal',\n        dt: datatype,\n        lang: language,\n      }\n    }\n\n    try {\n      skip()\n      let subject\n      if (line[pos] === '<') subject = readIri()\n      else if (line[pos] === '_' && line[pos + 1] === ':') subject = readBlank()\n      else fail('expected a subject IRI or blank node')\n\n      skip()\n      if (line[pos] !== '<') fail('expected a predicate IRI')\n      const predicate = readIri()\n\n      skip()\n      let object\n      if (line[pos] === '<') object = { term: readIri(), kind: 'iri' }\n      else if (line[pos] === '_' && line[pos + 1] === ':') object = { term: readBlank(), kind: 'blank' }\n      else if (line[pos] === '\"') object = readLiteral()\n      else fail('expected an object')\n\n      skip()\n      let graphTerm = ONTO_SHARED_DEFAULT_GRAPH\n      if (line[pos] === '<' || (line[pos] === '_' && line[pos + 1] === ':')) {\n        if (line[pos] === '<') graphTerm = { kind: 'iri', value: readIri() }\n        else graphTerm = { kind: 'blank', value: readBlank() }\n        skip()\n      }\n\n      if (line[pos] !== '.') fail(\"expected '.' at the end of the statement\")\n      pos++\n      skip()\n      if (pos < length && line[pos] !== '#') {\n        builder.warn('extra content after the statement was ignored', lineNumber)\n      }\n\n      builder.add(subject, predicate, object.term, object.kind, object.dt, object.lang, graphTerm)\n    } catch (error) {\n      if (error && error.ontoRdfFatal) return\n      builder.error(\n        'failed to parse line: ' + (error && error.message ? error.message : String(error)),\n        lineNumber,\n      )\n    }\n  }\n}\n\n/* ------------------------------------------------------------------ */\n/* RDF/XML                                                            */\n/* ------------------------------------------------------------------ */\n\nfunction ontoRdfDecodeXmlEntity(body, builder, line) {\n  if (body === 'amp') return '&'\n  if (body === 'lt') return '<'\n  if (body === 'gt') return '>'\n  if (body === 'quot') return '\"'\n  if (body === 'apos') return \"'\"\n  if (body.charAt(0) === '#') {\n    let code\n    if (body.charAt(1) === 'x' || body.charAt(1) === 'X') code = parseInt(body.slice(2), 16)\n    else code = parseInt(body.slice(1), 10)\n    if (!isFinite(code) || code < 0 || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) {\n      builder.warn('invalid XML character reference &' + body + ';', line)\n      return '\\uFFFD'\n    }\n    return String.fromCodePoint(code)\n  }\n  if (/^[A-Za-z][A-Za-z0-9._-]*$/.test(body)) {\n    builder.warn('unknown XML entity &' + body + ';', line)\n  }\n  return null\n}\n\nfunction ontoRdfDecodeXmlEntities(raw, builder, line) {\n  let output = ''\n  let index = 0\n  while (index < raw.length) {\n    const amp = raw.indexOf('&', index)\n    if (amp < 0) {\n      output += raw.slice(index)\n      break\n    }\n    output += raw.slice(index, amp)\n    const semi = raw.indexOf(';', amp + 1)\n    if (semi < 0) {\n      output += raw.slice(amp)\n      break\n    }\n    const body = raw.slice(amp + 1, semi)\n    const decoded = ontoRdfDecodeXmlEntity(body, builder, line)\n    output += decoded === null ? raw.slice(amp, semi + 1) : decoded\n    index = semi + 1\n  }\n  return output\n}\n\nfunction ontoRdfXmlSplitName(qname) {\n  const colon = qname.indexOf(':')\n  if (colon < 0) return { prefix: '', local: qname }\n  return { prefix: qname.slice(0, colon), local: qname.slice(colon + 1) }\n}\n\nclass OntoRdfXmlParser {\n  constructor(text, options) {\n    const opts = options || {}\n    this.builder = new OntoRdfBuilder('rdfxml', ontoRdfNormalizeText(text), opts)\n    this.source = this.builder.text\n    const initial = ontoRdfInitialBase(opts)\n    this.initialBase = initial.base\n    this.initialBaseSource = initial.source\n    this.builder.base = initial.base\n    this.builder.baseSource = initial.source\n    this.depth = 0\n    this.warnedReification = false\n    this.warnedMultipleObjectsSubjects = Object.create(null)\n  }\n\n  /** Resolve xmlns declarations iteratively so deep XML cannot overflow the stack. */\n  resolveNamespaces(root) {\n    const stack = [{ element: root, inherited: {}, depth: 0 }]\n    while (stack.length > 0) {\n      const frame = stack.pop()\n      const element = frame.element\n      const namespaces = Object.assign({}, frame.inherited)\n      const keys = Object.keys(element.attrs)\n      for (let i = 0; i < keys.length; i++) {\n        const key = keys[i]\n        if (key === 'xmlns') {\n          if (element.attrs[key]) namespaces[''] = element.attrs[key]\n          else delete namespaces['']\n        } else if (key.slice(0, 6) === 'xmlns:') {\n          const prefix = key.slice(6)\n          if (element.attrs[key]) namespaces[prefix] = element.attrs[key]\n          else delete namespaces[prefix]\n        }\n      }\n      element.namespaces = namespaces\n      if (frame.depth >= this.builder.maxDepth) continue\n      for (let i = element.children.length - 1; i >= 0; i--) {\n        stack.push({ element: element.children[i], inherited: namespaces, depth: frame.depth + 1 })\n      }\n    }\n  }\n\n  parse() {\n    try {\n      const root = this.tokenize()\n      if (!root) {\n        if (this.builder.errors.length === 0) this.builder.error('no root element found')\n      } else {\n        this.mapDocument(root)\n      }\n    } catch (error) {\n      this.builder.error(\n        'XML parser failed: ' + (error && error.message ? error.message : String(error)),\n      )\n    }\n    return this.builder.finish()\n  }\n\n  /* ------------------------- XML tokenizer ------------------------- */\n\n  tokenize() {\n    const source = this.source\n    const length = source.length\n    const builder = this.builder\n    const root = {\n      qname: '#document',\n      attrs: {},\n      children: [],\n      text: '',\n      namespaces: {},\n      line: 1,\n      openEnd: 0,\n      closeStart: -1,\n    }\n    const stack = [root]\n    let pos = 0\n\n    const current = () => stack[stack.length - 1]\n\n    const skipSpace = () => {\n      while (pos < length && ontoRdfIsWhitespace(source[pos])) pos++\n    }\n\n    const appendText = (value) => {\n      if (!value) return\n      const element = current()\n      if (element === root) {\n        if (value.trim() !== '') builder.warn('text outside the document element was ignored', builder.lineAt(pos))\n        return\n      }\n      element.text += value\n    }\n\n    const skipDeclaration = () => {\n      let index = pos + 2\n      let brackets = 0\n      let quote = ''\n      while (index < length) {\n        const character = source[index]\n        if (quote) {\n          if (character === quote) quote = ''\n          index++\n          continue\n        }\n        if (character === '\"' || character === \"'\") {\n          quote = character\n          index++\n          continue\n        }\n        if (character === '[') brackets++\n        else if (character === ']' && brackets > 0) brackets--\n        else if (character === '>' && brackets === 0) {\n          pos = index + 1\n          return\n        }\n        index++\n      }\n      builder.error('unterminated markup declaration', builder.lineAt(pos))\n      pos = length\n    }\n\n    const closeTag = () => {\n      const start = pos\n      pos += 2\n      skipSpace()\n      const nameStart = pos\n      while (pos < length && !ontoRdfIsWhitespace(source[pos]) && source[pos] !== '>') pos++\n      const qname = source.slice(nameStart, pos)\n      skipSpace()\n      if (source[pos] !== '>') {\n        builder.error('expected \">\" in closing tag </' + qname + '>', builder.lineAt(start))\n        const next = source.indexOf('>', pos)\n        pos = next < 0 ? length : next + 1\n      } else {\n        pos++\n      }\n      if (stack.length <= 1) {\n        builder.error('unexpected closing tag </' + qname + '>', builder.lineAt(start))\n        return\n      }\n      const element = stack.pop()\n      if (element.qname !== qname) {\n        builder.error(\n          'mismatched closing tag </' + qname + '> for <' + element.qname + '>',\n          builder.lineAt(start),\n        )\n      }\n      element.closeStart = start\n    }\n\n    const openTag = () => {\n      const start = pos\n      pos++\n      const nameStart = pos\n      while (pos < length && !ontoRdfIsWhitespace(source[pos]) && source[pos] !== '>' && source[pos] !== '/') pos++\n      const qname = source.slice(nameStart, pos)\n      if (!qname) {\n        builder.error('invalid element name', builder.lineAt(start))\n        const next = source.indexOf('>', pos)\n        pos = next < 0 ? length : next + 1\n        return\n      }\n      const attrs = {}\n      let selfClosing = false\n      while (true) {\n        skipSpace()\n        if (pos >= length) {\n          builder.error('unterminated start tag <' + qname + '>', builder.lineAt(start))\n          return\n        }\n        if (source[pos] === '>') {\n          pos++\n          break\n        }\n        if (source[pos] === '/' && source[pos + 1] === '>') {\n          pos += 2\n          selfClosing = true\n          break\n        }\n        const attrStart = pos\n        while (pos < length && !ontoRdfIsWhitespace(source[pos]) && source[pos] !== '=' &&\n          source[pos] !== '>' && source[pos] !== '/') pos++\n        const attrName = source.slice(attrStart, pos)\n        if (!attrName) {\n          builder.error('invalid attribute in <' + qname + '>', builder.lineAt(pos))\n          pos++\n          continue\n        }\n        skipSpace()\n        if (source[pos] !== '=') {\n          builder.error('expected \"=\" after attribute \"' + attrName + '\"', builder.lineAt(attrStart))\n          const next = source.indexOf('>', pos)\n          pos = next < 0 ? length : next + 1\n          return\n        }\n        pos++\n        skipSpace()\n        const quote = source[pos]\n        if (quote !== '\"' && quote !== \"'\") {\n          builder.error('expected a quoted attribute value for \"' + attrName + '\"', builder.lineAt(pos))\n          const next = source.indexOf('>', pos)\n          pos = next < 0 ? length : next + 1\n          return\n        }\n        pos++\n        const valueStart = pos\n        while (pos < length && source[pos] !== quote) pos++\n        const rawValue = source.slice(valueStart, pos)\n        if (pos >= length) {\n          builder.error('unterminated attribute value for \"' + attrName + '\"', builder.lineAt(valueStart))\n        } else {\n          pos++\n        }\n        if (ontoRdfHas(attrs, attrName)) {\n          builder.warn('duplicate attribute \"' + attrName + '\"', builder.lineAt(attrStart))\n        }\n        attrs[attrName] = ontoRdfDecodeXmlEntities(rawValue, builder, builder.lineAt(valueStart))\n      }\n      const element = {\n        qname: qname,\n        attrs: attrs,\n        children: [],\n        text: '',\n        namespaces: {},\n        line: builder.lineAt(start),\n        openEnd: pos,\n        closeStart: selfClosing ? pos : -1,\n      }\n      if (current() === root) {\n        if (root.children.length > 0) builder.error('multiple root elements are not allowed', element.line)\n      }\n      current().children.push(element)\n      if (!selfClosing) stack.push(element)\n    }\n\n    while (pos < length) {\n      const lessThan = source.indexOf('<', pos)\n      if (lessThan < 0) {\n        appendText(ontoRdfDecodeXmlEntities(source.slice(pos), builder, builder.lineAt(pos)))\n        pos = length\n        break\n      }\n      if (lessThan > pos) {\n        appendText(ontoRdfDecodeXmlEntities(source.slice(pos, lessThan), builder, builder.lineAt(pos)))\n      }\n      pos = lessThan\n      if (source.slice(pos, pos + 4) === '<!--') {\n        const end = source.indexOf('-->', pos + 4)\n        if (end < 0) {\n          builder.error('unterminated XML comment', builder.lineAt(pos))\n          pos = length\n        } else {\n          pos = end + 3\n        }\n      } else if (source.slice(pos, pos + 9) === '<![CDATA[') {\n        const end = source.indexOf(']]>', pos + 9)\n        if (end < 0) {\n          builder.error('unterminated CDATA section', builder.lineAt(pos))\n          appendText(source.slice(pos + 9))\n          pos = length\n        } else {\n          appendText(source.slice(pos + 9, end))\n          pos = end + 3\n        }\n      } else if (source.slice(pos, pos + 2) === '<?') {\n        const end = source.indexOf('?>', pos + 2)\n        if (end < 0) {\n          builder.error('unterminated processing instruction', builder.lineAt(pos))\n          pos = length\n        } else {\n          pos = end + 2\n        }\n      } else if (source.slice(pos, pos + 2) === '<!') {\n        skipDeclaration()\n      } else if (source.slice(pos, pos + 2) === '</') {\n        closeTag()\n      } else {\n        openTag()\n      }\n    }\n\n    while (stack.length > 1) {\n      const element = stack.pop()\n      element.closeStart = length\n      builder.error('unclosed element <' + element.qname + '>', element.line)\n    }\n\n    return root.children[0] || null\n  }\n\n  /* --------------------------- mapping ---------------------------- */\n\n  elementIri(element) {\n    const parts = ontoRdfXmlSplitName(element.qname)\n    if (parts.prefix === '') {\n      const namespace = element.namespaces['']\n      return namespace ? namespace + parts.local : null\n    }\n    if (parts.prefix === 'xml') return ONTO_XML_NS + parts.local\n    const namespace = element.namespaces[parts.prefix]\n    return namespace ? namespace + parts.local : null\n  }\n\n  attributeIri(element, qname) {\n    const parts = ontoRdfXmlSplitName(qname)\n    if (parts.prefix === '') return null\n    if (parts.prefix === 'xml') return ONTO_XML_NS + parts.local\n    const namespace = element.namespaces[parts.prefix]\n    return namespace ? namespace + parts.local : null\n  }\n\n  getAttribute(element, iri) {\n    const keys = Object.keys(element.attrs)\n    for (let i = 0; i < keys.length; i++) {\n      if (this.attributeIri(element, keys[i]) === iri) return element.attrs[keys[i]]\n    }\n    return undefined\n  }\n\n  isSyntaxAttribute(iri) {\n    return iri === ONTO_RDF_NS + 'about' ||\n      iri === ONTO_RDF_NS + 'ID' ||\n      iri === ONTO_RDF_NS + 'nodeID' ||\n      iri === ONTO_RDF_NS + 'resource' ||\n      iri === ONTO_RDF_NS + 'datatype' ||\n      iri === ONTO_RDF_NS + 'parseType' ||\n      iri === ONTO_RDF_NS + 'li'\n  }\n\n  propertyAttributes(element) {\n    const result = []\n    const keys = Object.keys(element.attrs)\n    for (let i = 0; i < keys.length; i++) {\n      const key = keys[i]\n      if (key === 'xmlns' || key.slice(0, 6) === 'xmlns:') continue\n      const iri = this.attributeIri(element, key)\n      if (!iri) continue\n      if (iri.indexOf(ONTO_XML_NS) === 0) continue\n      if (this.isSyntaxAttribute(iri)) continue\n      result.push({ iri: iri, value: element.attrs[key] })\n    }\n    return result\n  }\n\n  contextFor(element, parent) {\n    let base = parent.base || ''\n    let baseSource = parent.baseSource || 'none'\n    const xmlBase = this.getAttribute(element, ONTO_XML_NS + 'base')\n    if (xmlBase !== undefined) {\n      if (xmlBase === '') {\n        // XML Base: an empty value keeps the base URI of the enclosing scope.\n        base = parent.base || ''\n      } else if (ontoRdfIsAbsoluteIri(xmlBase)) {\n        base = xmlBase\n        baseSource = 'document'\n      } else if (base) {\n        base = resolveIri(base, xmlBase)\n        baseSource = 'document'\n      } else {\n        this.builder.diagnose(\n          'base-unavailable',\n          'warning',\n          'relative xml:base \"' + xmlBase + '\" has no base to resolve against',\n          element.line,\n        )\n        base = ''\n      }\n    }\n    let language = parent.language\n    const xmlLang = this.getAttribute(element, ONTO_XML_NS + 'lang')\n    if (xmlLang !== undefined) language = xmlLang === '' ? undefined : xmlLang.toLowerCase()\n    return { base: base, language: language, baseSource: baseSource }\n  }\n\n  resolveTerm(value, base, line) {\n    return ontoRdfNormalizeIri(value, base, this.builder, line)\n  }\n\n  resolveId(value, base, line) {\n    if (!/^[A-Za-z_][A-Za-z0-9_.-]*$/.test(value)) {\n      this.builder.warn('rdf:ID \"' + value + '\" is not a valid XML name', line)\n    }\n    if (!base) {\n      this.builder.diagnose(\n        'base-unavailable',\n        'warning',\n        'rdf:ID \"' + value + '\" cannot be resolved without a base IRI',\n        line,\n      )\n      return '#' + value\n    }\n    return resolveIri(base, '#' + value)\n  }\n\n  collectXmlPrefixes(root) {\n    const stack = [root]\n    while (stack.length > 0) {\n      const element = stack.pop()\n      const keys = Object.keys(element.attrs)\n      for (let i = 0; i < keys.length; i++) {\n        const key = keys[i]\n        if (key.slice(0, 6) !== 'xmlns:') continue\n        const prefix = key.slice(6)\n        const iri = element.attrs[key]\n        if (prefix && iri) this.builder.prefixes[prefix] = iri\n      }\n      for (let i = element.children.length - 1; i >= 0; i--) {\n        stack.push(element.children[i])\n      }\n    }\n  }\n\n  mapDocument(root) {\n    this.resolveNamespaces(root)\n    this.collectXmlPrefixes(root)\n    const iri = this.elementIri(root)\n    if (!iri) {\n      this.builder.error('cannot resolve the root element name <' + root.qname + '>', root.line)\n      return\n    }\n    const context = this.contextFor(root, {\n      base: this.initialBase,\n      language: undefined,\n      baseSource: this.initialBaseSource,\n    })\n    if (iri === ONTO_RDF_NS + 'RDF') {\n      this.builder.base = context.base || ''\n      this.builder.baseSource = context.baseSource || 'none'\n      for (let i = 0; i < root.children.length; i++) {\n        if (this.builder.truncated) break\n        this.mapNodeElement(root.children[i], context)\n      }\n    } else {\n      this.builder.base = context.base || ''\n      this.builder.baseSource = context.baseSource || 'none'\n      this.mapNodeElement(root, context)\n    }\n  }\n\n  mapNodeElement(element, parentContext) {\n    if (this.builder.truncated) return null\n    const context = this.contextFor(element, parentContext)\n    if (this.depth >= this.builder.maxDepth) {\n      this.noteXmlNestingLimit(element)\n      return null\n    }\n    this.depth++\n    try {\n      return this.mapNodeElementBody(element, context)\n    } finally {\n      this.depth--\n    }\n  }\n\n  noteXmlNestingLimit(element) {\n    this.builder.diagnose(\n      'nesting-limit',\n      'error',\n      'XML nesting depth limit of ' + this.builder.maxDepth +\n        ' reached; the nested branch was skipped',\n      element.line,\n    )\n  }\n\n  mapNodeElementBody(element, context) {\n    const nameIri = this.elementIri(element)\n    if (!nameIri) {\n      this.builder.error('cannot resolve the element name <' + element.qname + '>', element.line)\n      return null\n    }\n    if (nameIri === ONTO_RDF_NS + 'RDF') {\n      this.builder.base = context.base || ''\n      this.builder.baseSource = context.baseSource || 'none'\n      for (let i = 0; i < element.children.length; i++) {\n        if (this.builder.truncated) break\n        this.mapNodeElement(element.children[i], context)\n      }\n      return null\n    }\n\n    const about = this.getAttribute(element, ONTO_RDF_NS + 'about')\n    const id = this.getAttribute(element, ONTO_RDF_NS + 'ID')\n    const nodeId = this.getAttribute(element, ONTO_RDF_NS + 'nodeID')\n    let subject\n    if (about !== undefined) {\n      subject = this.resolveTerm(about, context.base, element.line)\n    } else if (id !== undefined) {\n      subject = this.resolveId(id, context.base, element.line)\n    } else if (nodeId !== undefined) {\n      subject = this.builder.useBlank(nodeId)\n    } else {\n      subject = this.builder.freshBlank()\n    }\n\n    if (nameIri !== ONTO_RDF_NS + 'Description') {\n      this.builder.add(subject, ONTO_RDF_TYPE, nameIri, 'iri')\n    }\n\n    this.addAttributeTriples(element, subject, context)\n    this.mapChildProperties(element, subject, context)\n    return subject\n  }\n\n  addAttributeTriples(element, subject, context) {\n    const attributes = this.propertyAttributes(element)\n    for (let i = 0; i < attributes.length; i++) {\n      const attribute = attributes[i]\n      if (attribute.iri === ONTO_RDF_TYPE) {\n        this.builder.add(\n          subject,\n          ONTO_RDF_TYPE,\n          this.resolveTerm(attribute.value, context.base, element.line),\n          'iri',\n        )\n      } else {\n        this.builder.add(subject, attribute.iri, attribute.value, 'literal', undefined, context.language)\n      }\n    }\n  }\n\n  mapChildProperties(element, subject, context) {\n    let liIndex = 0\n    for (let i = 0; i < element.children.length; i++) {\n      if (this.builder.truncated) break\n      const child = element.children[i]\n      let predicate = this.elementIri(child)\n      if (!predicate) {\n        this.builder.error('cannot resolve the property element <' + child.qname + '>', child.line)\n        continue\n      }\n      if (predicate === ONTO_RDF_NS + 'li') {\n        liIndex++\n        predicate = ONTO_RDF_NS + '_' + liIndex\n      }\n      this.mapPropertyElement(child, subject, predicate, context)\n    }\n  }\n\n  mapPropertyElement(element, subject, predicate, parentContext) {\n    if (this.builder.truncated) return\n    const context = this.contextFor(element, parentContext)\n    if (this.depth >= this.builder.maxDepth) {\n      this.noteXmlNestingLimit(element)\n      return\n    }\n    this.depth++\n    try {\n      this.mapPropertyElementBody(element, subject, predicate, context)\n    } finally {\n      this.depth--\n    }\n  }\n\n  mapPropertyElementBody(element, subject, predicate, context) {\n    const parseType = this.getAttribute(element, ONTO_RDF_NS + 'parseType')\n    const resource = this.getAttribute(element, ONTO_RDF_NS + 'resource')\n    const nodeId = this.getAttribute(element, ONTO_RDF_NS + 'nodeID')\n    const datatype = this.getAttribute(element, ONTO_RDF_NS + 'datatype')\n    const id = this.getAttribute(element, ONTO_RDF_NS + 'ID')\n\n    if (id !== undefined && !this.warnedReification) {\n      this.warnedReification = true\n      this.builder.diagnose(\n        'rdfxml-reification-ignored',\n        'warning',\n        'rdf:ID reification is not implemented; the statement itself was kept',\n        element.line,\n      )\n    }\n\n    if (parseType === 'Resource') {\n      const blank = this.builder.freshBlank()\n      this.builder.add(subject, predicate, blank, 'blank')\n      this.addAttributeTriples(element, blank, context)\n      this.mapChildProperties(element, blank, context)\n      return\n    }\n\n    if (parseType === 'Collection') {\n      const head = this.mapCollection(element.children, context)\n      this.builder.add(subject, predicate, head, head === ONTO_RDF_NIL ? 'iri' : 'blank')\n      return\n    }\n\n    if (parseType === 'Literal') {\n      const raw = element.closeStart >= 0 ? this.source.slice(element.openEnd, element.closeStart) : ''\n      this.builder.add(subject, predicate, raw, 'literal', ONTO_RDF_XML_LITERAL)\n      return\n    }\n\n    if (parseType !== undefined && parseType !== '') {\n      this.builder.diagnose(\n        'rdfxml-parsetype-unsupported',\n        'warning',\n        'unsupported rdf:parseType=\"' + parseType + '\"; treated as a plain property',\n        element.line,\n      )\n    }\n\n    if (resource !== undefined) {\n      if (element.children.length > 0) {\n        this.builder.warn('rdf:resource with nested elements is not valid; nested elements were ignored', element.line)\n      }\n      this.builder.add(subject, predicate, this.resolveTerm(resource, context.base, element.line), 'iri')\n      return\n    }\n\n    if (nodeId !== undefined) {\n      this.builder.add(subject, predicate, this.builder.useBlank(nodeId), 'blank')\n      return\n    }\n\n    if (element.children.length > 0) {\n      const childSubject = this.mapNodeElement(element.children[0], context)\n      if (childSubject) {\n        this.builder.add(\n          subject,\n          predicate,\n          childSubject,\n          childSubject.slice(0, 2) === '_:' ? 'blank' : 'iri',\n        )\n      }\n      if (element.children.length > 1 && this.warnedMultipleObjectsSubjects[subject] !== true) {\n        this.warnedMultipleObjectsSubjects[subject] = true\n        this.builder.diagnose(\n          'rdfxml-multiple-objects',\n          'warning',\n          'property element <' + element.qname + '> has multiple objects; only the first was used',\n          element.line,\n        )\n      }\n      return\n    }\n\n    let value = element.text\n    const attributes = this.propertyAttributes(element)\n    if (value === '' && attributes.length > 0) {\n      const blank = this.builder.freshBlank()\n      this.builder.add(subject, predicate, blank, 'blank')\n      for (let i = 0; i < attributes.length; i++) {\n        this.builder.add(\n          blank,\n          attributes[i].iri,\n          attributes[i].value,\n          'literal',\n          undefined,\n          context.language,\n        )\n      }\n      return\n    }\n\n    if (datatype !== undefined) {\n      this.builder.add(\n        subject,\n        predicate,\n        value,\n        'literal',\n        this.resolveTerm(datatype, context.base, element.line),\n      )\n    } else {\n      this.builder.add(subject, predicate, value, 'literal', undefined, context.language)\n    }\n  }\n\n  mapCollection(children, context) {\n    if (children.length === 0) return ONTO_RDF_NIL\n    const head = this.builder.freshBlank()\n    const items = []\n    for (let i = 0; i < children.length; i++) {\n      if (this.builder.truncated) break\n      const item = this.mapNodeElement(children[i], context)\n      if (item) items.push(item)\n    }\n    if (items.length === 0) return ONTO_RDF_NIL\n    let current = head\n    for (let i = 0; i < items.length; i++) {\n      this.builder.add(\n        current,\n        ONTO_RDF_FIRST,\n        items[i],\n        items[i].slice(0, 2) === '_:' ? 'blank' : 'iri',\n      )\n      if (i < items.length - 1) {\n        const next = this.builder.freshBlank()\n        this.builder.add(current, ONTO_RDF_REST, next, 'blank')\n        current = next\n      } else {\n        this.builder.add(current, ONTO_RDF_REST, ONTO_RDF_NIL, 'iri')\n      }\n    }\n    return head\n  }\n}\n\n/* ------------------------------------------------------------------ */\n/* JSON-LD (practical subset)                                         */\n/* ------------------------------------------------------------------ */\n\nclass OntoJsonLdParser {\n  constructor(text, options) {\n    const opts = options || {}\n    this.builder = new OntoRdfBuilder('jsonld', ontoRdfNormalizeText(text), opts)\n    this.source = this.builder.text\n    const initial = ontoRdfInitialBase(opts)\n    this.initialBase = initial.base\n    this.initialBaseSource = initial.source\n    this.builder.base = initial.base\n    this.builder.baseSource = initial.source\n    this.depth = 0\n    this.warnedContainers = Object.create(null)\n    this.appliedContextNodes = new WeakSet()\n  }\n\n  parse() {\n    let data\n    try {\n      data = JSON.parse(this.source)\n    } catch (error) {\n      this.builder.error('invalid JSON: ' + (error && error.message ? error.message : String(error)))\n      return this.builder.finish()\n    }\n    try {\n      const context = this.newContext(this.initialBase, this.initialBaseSource)\n      this.processTop(data, context)\n    } catch (error) {\n      this.builder.error(\n        'JSON-LD parser failed: ' + (error && error.message ? error.message : String(error)),\n      )\n    }\n    return this.builder.finish()\n  }\n\n  newContext(base, baseSource) {\n    return {\n      terms: Object.create(null),\n      vocab: '',\n      base: base || '',\n      baseSource: baseSource || 'none',\n      language: '',\n    }\n  }\n\n  withContext(context, raw) {\n    const next = {\n      terms: Object.assign(Object.create(null), context.terms),\n      vocab: context.vocab,\n      base: context.base,\n      baseSource: context.baseSource,\n      language: context.language,\n    }\n    this.applyContext(next, raw)\n    return next\n  }\n\n  applyContext(context, raw) {\n    if (raw === null) {\n      context.terms = Object.create(null)\n      context.vocab = ''\n      context.language = ''\n      context.base = this.initialBase\n      context.baseSource = this.initialBaseSource\n      this.syncPrefixes(context)\n      return\n    }\n    const items = Array.isArray(raw) ? raw : [raw]\n    for (let i = 0; i < items.length; i++) {\n      const item = items[i]\n      if (typeof item === 'string') {\n        this.builder.diagnose(\n          'jsonld-remote-context-skipped',\n          'warning',\n          'remote @context \"' + item + '\" was not fetched and was skipped',\n        )\n        continue\n      }\n      if (!item || typeof item !== 'object' || Array.isArray(item)) {\n        this.builder.warn('unsupported @context entry was skipped')\n        continue\n      }\n      if (ontoRdfHas(item, '@base')) {\n        const base = item['@base']\n        if (base === null) {\n          context.base = ''\n          context.baseSource = 'none'\n        } else if (typeof base === 'string') {\n          if (ontoRdfIsAbsoluteIri(base)) {\n            context.base = base\n            context.baseSource = 'document'\n          } else if (context.base) {\n            context.base = resolveIri(context.base, base)\n            context.baseSource = 'document'\n          } else {\n            this.builder.diagnose(\n              'base-unavailable',\n              'warning',\n              'relative @base \"' + base + '\" has no base to resolve against',\n            )\n            context.base = ''\n            context.baseSource = 'none'\n          }\n        }\n      }\n      if (ontoRdfHas(item, '@vocab')) {\n        const vocab = item['@vocab']\n        if (vocab === null) context.vocab = ''\n        else if (typeof vocab === 'string') {\n          context.vocab = this.expandIri(vocab, context, { vocab: false, document: true }) || ''\n        }\n      }\n      if (ontoRdfHas(item, '@language')) {\n        const language = item['@language']\n        context.language = typeof language === 'string' ? language.toLowerCase() : ''\n      }\n      const keys = Object.keys(item)\n      for (let k = 0; k < keys.length; k++) {\n        const key = keys[k]\n        if (key === '@base' || key === '@vocab' || key === '@language' || key === '@version') continue\n        if (key.charAt(0) === '@') {\n          if (key !== '@context') this.builder.warn('unsupported context keyword \"' + key + '\" was skipped')\n          continue\n        }\n        this.defineTerm(context, key, item[key])\n      }\n    }\n    this.syncPrefixes(context)\n  }\n\n  syncPrefixes(context) {\n    const terms = Object.keys(context.terms)\n    for (let i = 0; i < terms.length; i++) {\n      const term = terms[i]\n      const definition = context.terms[term]\n      if (!definition) continue\n      const id = definition.id\n      if (typeof id !== 'string' || id === '' || id.charAt(0) === '@') continue\n      if (definition.prefix || /[/#]$/.test(id)) this.builder.prefixes[term] = id\n    }\n  }\n\n  defineTerm(context, term, value) {\n    if (term.indexOf(':') >= 0) {\n      this.builder.warn('term \"' + term + '\" contains a colon and was ignored')\n      return\n    }\n    if (value === null) {\n      context.terms[term] = { id: null, type: null, language: undefined, container: null, prefix: false }\n      return\n    }\n    if (typeof value === 'string') {\n      const id = this.expandIri(value, context, { vocab: true, document: true })\n      context.terms[term] = {\n        id: id,\n        type: null,\n        language: undefined,\n        container: null,\n        prefix: typeof id === 'string' && /[/#]$/.test(id),\n      }\n      return\n    }\n    if (typeof value !== 'object' || Array.isArray(value)) {\n      this.builder.warn('unsupported definition for term \"' + term + '\" was skipped')\n      return\n    }\n    const definition = {\n      id: null,\n      type: null,\n      language: undefined,\n      container: null,\n      prefix: false,\n    }\n    if (ontoRdfHas(value, '@reverse')) {\n      definition.id = this.expandIri(value['@reverse'], context, { vocab: true, document: true })\n      this.builder.diagnose(\n        'jsonld-reverse-term-forward',\n        'warning',\n        '@reverse term definitions are treated as forward properties',\n      )\n    } else if (ontoRdfHas(value, '@id')) {\n      const id = value['@id']\n      if (id === null) definition.id = null\n      else if (typeof id === 'string') {\n        definition.id = this.expandIri(id, context, { vocab: true, document: true })\n      }\n    } else {\n      definition.id = this.expandIri(term, context, { vocab: true, document: false })\n    }\n    if (ontoRdfHas(value, '@type')) {\n      const type = value['@type']\n      if (typeof type === 'string') {\n        if (type === '@id' || type === '@vocab' || type === '@json') definition.type = type\n        else definition.type = this.expandIri(type, context, { vocab: true, document: true })\n      }\n    }\n    if (ontoRdfHas(value, '@language')) {\n      const language = value['@language']\n      definition.language = typeof language === 'string' ? language.toLowerCase() : null\n    }\n    if (ontoRdfHas(value, '@container')) {\n      const container = value['@container']\n      definition.container = Array.isArray(container) ? container.slice() : container\n      this.noteContainer(container, term)\n    }\n    if (ontoRdfHas(value, '@prefix')) definition.prefix = value['@prefix'] === true\n    if (ontoRdfHas(value, '@context')) this.builder.warn('nested @context in term \"' + term + '\" was skipped')\n    if (typeof definition.id === 'string' && /[/#]$/.test(definition.id)) definition.prefix = true\n    context.terms[term] = definition\n  }\n\n  noteContainer(container, term) {\n    const list = Array.isArray(container) ? container : [container]\n    for (let i = 0; i < list.length; i++) {\n      const name = list[i]\n      if (name === '@set' || name === '@list' || name === '@language' || name === '@index') continue\n      const key = term + '|' + name\n      if (this.warnedContainers[key]) continue\n      this.warnedContainers[key] = true\n      this.builder.diagnose(\n        'jsonld-container-unsupported',\n        'warning',\n        '@container \"' + name + '\" on term \"' + term + '\" is not supported',\n      )\n    }\n  }\n\n  expandIri(value, context, options) {\n    if (typeof value !== 'string') return null\n    if (value === '') return options.document ? context.base : null\n    if (value.charAt(0) === '@') return value\n    if (value.slice(0, 2) === '_:') return value\n    if (ontoRdfHas(context.terms, value)) {\n      const definition = context.terms[value]\n      return definition && typeof definition.id === 'string' ? definition.id : null\n    }\n    const colon = value.indexOf(':')\n    if (colon > 0) {\n      const prefix = value.slice(0, colon)\n      const suffix = value.slice(colon + 1)\n      if (ontoRdfHas(context.terms, prefix)) {\n        const definition = context.terms[prefix]\n        if (definition && typeof definition.id === 'string') return definition.id + suffix\n      }\n      return value\n    }\n    if (options.vocab && context.vocab) return context.vocab + value\n    if (options.document && context.base) return resolveIri(context.base, value)\n    return null\n  }\n\n  normalizeIri(value, context) {\n    if (typeof value !== 'string' || value === '') return value\n    if (value.slice(0, 2) === '_:') {\n      this.builder.useBlank(value)\n      return value\n    }\n    if (ontoRdfIsAbsoluteIri(value)) return value\n    if (context.base) return resolveIri(context.base, value)\n    this.builder.diagnose(\n      'base-unavailable',\n      'warning',\n      'relative IRI \"' + value + '\" could not be resolved (no base)',\n    )\n    return value\n  }\n\n  literalLanguage(definition, context) {\n    if (definition && definition.language !== undefined) {\n      return definition.language === null ? undefined : definition.language\n    }\n    return context.language || undefined\n  }\n\n  processTop(data, context) {\n    if (Array.isArray(data)) {\n      for (let i = 0; i < data.length; i++) {\n        if (this.builder.truncated) break\n        this.processNode(data[i], context)\n      }\n      return\n    }\n    if (data === null || typeof data !== 'object') {\n      this.builder.error('JSON-LD document must be an object or an array')\n      return\n    }\n    let local = context\n    if (ontoRdfHas(data, '@context')) {\n      local = this.withContext(context, data['@context'])\n      this.appliedContextNodes.add(data)\n    }\n    this.builder.base = local.base || ''\n    this.builder.baseSource = local.baseSource || 'none'\n    // processNode handles a top-level @graph object, including its sibling keys.\n    this.processNode(data, local)\n  }\n\n  processNode(node, inheritedContext) {\n    if (Array.isArray(node)) {\n      if (this.depth >= this.builder.maxDepth) {\n        this.noteJsonLdNestingLimit()\n        return null\n      }\n      this.depth++\n      try {\n        for (let i = 0; i < node.length; i++) {\n          if (this.builder.truncated) break\n          this.processNode(node[i], inheritedContext)\n        }\n      } finally {\n        this.depth--\n      }\n      return null\n    }\n    if (node === null || typeof node !== 'object') return null\n    let context = inheritedContext\n    if (ontoRdfHas(node, '@context') && !this.appliedContextNodes.has(node)) {\n      context = this.withContext(inheritedContext, node['@context'])\n      this.appliedContextNodes.add(node)\n    }\n    if (ontoRdfHas(node, '@value') || ontoRdfHas(node, '@list') || ontoRdfHas(node, '@set')) {\n      this.builder.diagnose(\n        'jsonld-value-object-dropped',\n        'warning',\n        'value object used where a node was expected was ignored',\n      )\n      return null\n    }\n    if (this.depth >= this.builder.maxDepth) {\n      this.noteJsonLdNestingLimit()\n      return null\n    }\n    this.depth++\n    try {\n      return this.processNodeBody(node, context)\n    } finally {\n      this.depth--\n    }\n  }\n\n  noteJsonLdNestingLimit() {\n    this.builder.diagnose(\n      'nesting-limit',\n      'error',\n      'JSON-LD nesting depth limit of ' + this.builder.maxDepth +\n        ' reached; the nested branch was skipped',\n    )\n  }\n\n  processNodeBody(node, context) {\n    const graphWithoutId = ontoRdfHas(node, '@graph') && !ontoRdfHas(node, '@id')\n    if (graphWithoutId) {\n      const graph = node['@graph']\n      const items = Array.isArray(graph) ? graph : [graph]\n      for (let i = 0; i < items.length; i++) {\n        if (this.builder.truncated) break\n        this.processNode(items[i], context)\n      }\n    }\n\n    let subject\n    if (ontoRdfHas(node, '@id')) {\n      const id = node['@id']\n      if (typeof id !== 'string') {\n        this.builder.warn('non-string @id was replaced by a blank node')\n        subject = this.builder.freshBlank()\n      } else {\n        const expanded = this.expandIri(id, context, { vocab: false, document: true })\n        subject = this.normalizeIri(expanded || id, context)\n        if (typeof subject === 'string' && subject.charAt(0) === '@') {\n          this.builder.warn('keyword \"' + subject + '\" cannot be used as @id')\n          subject = this.builder.freshBlank()\n        }\n      }\n    } else {\n      subject = this.builder.freshBlank()\n    }\n\n    if (ontoRdfHas(node, '@type')) {\n      const types = Array.isArray(node['@type']) ? node['@type'] : [node['@type']]\n      for (let i = 0; i < types.length; i++) {\n        if (this.builder.truncated) break\n        const type = types[i]\n        if (typeof type !== 'string') continue\n        const expanded = this.expandIri(type, context, { vocab: true, document: true })\n        if (!expanded || expanded.charAt(0) === '@') {\n          this.builder.warn('could not expand @type \"' + type + '\"')\n          continue\n        }\n        const iri = this.normalizeIri(expanded, context)\n        this.builder.add(subject, ONTO_RDF_TYPE, iri, iri.slice(0, 2) === '_:' ? 'blank' : 'iri')\n      }\n    }\n\n    const keys = Object.keys(node)\n    for (let i = 0; i < keys.length; i++) {\n      if (this.builder.truncated) break\n      const key = keys[i]\n      if (key === '@context' || key === '@id' || key === '@type' || key === '@index') continue\n      if (key === '@graph') {\n        if (graphWithoutId) continue\n        // A @graph sibling of @id names a graph. This subset keeps the\n        // statements but cannot express the graph term, so they are marked\n        // unknown instead of being silently promoted to the default graph.\n        this.builder.diagnose(\n          'named-graph-unavailable',\n          'warning',\n          'JSON-LD named graphs are not supported; statements were kept with an unknown graph context',\n        )\n        const previousGraph = this.builder.currentGraph\n        this.builder.currentGraph = ONTO_SHARED_UNKNOWN_GRAPH\n        try {\n          const graph = node[key]\n          const items = Array.isArray(graph) ? graph : [graph]\n          for (let g = 0; g < items.length; g++) {\n            if (this.builder.truncated) break\n            this.processNode(items[g], context)\n          }\n        } finally {\n          this.builder.currentGraph = previousGraph\n        }\n        continue\n      }\n      if (key === '@reverse') {\n        this.builder.diagnose(\n          'jsonld-node-reverse-ignored',\n          'warning',\n          '@reverse is not supported and was skipped',\n        )\n        continue\n      }\n      if (key === '@included' || key === '@nest') {\n        this.builder.diagnose(\n          'jsonld-included-nest-ignored',\n          'warning',\n          '\"' + key + '\" is not supported and was skipped',\n        )\n        continue\n      }\n      if (key === '@value' || key === '@list' || key === '@set' || key === '@language') continue\n\n      const definition = ontoRdfHas(context.terms, key) ? context.terms[key] : null\n      const predicate = this.expandIri(key, context, { vocab: true, document: false })\n      if (!predicate || predicate.charAt(0) === '@') {\n        this.builder.warn('term \"' + key + '\" has no IRI mapping and was skipped')\n        continue\n      }\n      this.addValue(subject, predicate, node[key], context, definition)\n    }\n    return subject\n  }\n\n  addValue(subject, predicate, value, context, definition) {\n    if (this.builder.truncated) return\n    if (value === null || value === undefined) return\n    const container = definition ? definition.container : null\n    const containers = Array.isArray(container) ? container : (container ? [container] : [])\n\n    // A term-level `@container: \"@list\"` must become an RDF list, so this has to\n    // be decided before arrays are flattened into separate triples.\n    if (containers.indexOf('@list') !== -1) {\n      const items = Array.isArray(value) ? value : [value]\n      const head = this.buildList(items, context, definition)\n      this.builder.add(subject, predicate, head, this.kindOf(head))\n      return\n    }\n\n    if (Array.isArray(value)) {\n      if (this.depth >= this.builder.maxDepth) {\n        this.noteJsonLdNestingLimit()\n        return\n      }\n      this.depth++\n      try {\n        for (let i = 0; i < value.length; i++) {\n          if (this.builder.truncated) break\n          this.addValue(subject, predicate, value[i], context, definition)\n        }\n      } finally {\n        this.depth--\n      }\n      return\n    }\n\n    if (containers.indexOf('@language') !== -1 && value && typeof value === 'object' && !Array.isArray(value) &&\n      !ontoRdfHas(value, '@value') && !ontoRdfHas(value, '@id')) {\n      const languages = Object.keys(value)\n      for (let i = 0; i < languages.length; i++) {\n        const language = languages[i] === '@none' ? undefined : languages[i].toLowerCase()\n        const entries = Array.isArray(value[languages[i]]) ? value[languages[i]] : [value[languages[i]]]\n        for (let e = 0; e < entries.length; e++) {\n          const entry = entries[e]\n          if (entry === null || entry === undefined || typeof entry === 'object') continue\n          this.builder.add(subject, predicate, String(entry), 'literal', undefined, language)\n        }\n      }\n      return\n    }\n\n    if (containers.indexOf('@index') !== -1 && value && typeof value === 'object' && !Array.isArray(value) &&\n      !ontoRdfHas(value, '@value') && !ontoRdfHas(value, '@id')) {\n      const indexes = Object.keys(value)\n      for (let i = 0; i < indexes.length; i++) {\n        this.addValue(subject, predicate, value[indexes[i]], context, definition)\n      }\n      return\n    }\n\n    if (value && typeof value === 'object') {\n      if (ontoRdfHas(value, '@list')) {\n        const head = this.buildList(value['@list'], context, definition)\n        this.builder.add(subject, predicate, head, this.kindOf(head))\n        return\n      }\n      if (ontoRdfHas(value, '@set')) {\n        this.addValue(subject, predicate, value['@set'], context, definition)\n        return\n      }\n      if (ontoRdfHas(value, '@value')) {\n        const descriptor = this.literalDescriptor(value, context, definition)\n        if (descriptor) {\n          this.builder.add(subject, predicate, descriptor.term, 'literal', descriptor.dt, descriptor.lang)\n        }\n        return\n      }\n      const child = this.processNode(value, context)\n      if (child) this.builder.add(subject, predicate, child, this.kindOf(child))\n      return\n    }\n\n    if (definition && (definition.type === '@id' || definition.type === '@vocab') && typeof value === 'string') {\n      const expanded = this.expandIri(value, context, {\n        vocab: definition.type === '@vocab',\n        document: definition.type === '@id',\n      })\n      const iri = this.normalizeIri(expanded || value, context)\n      this.builder.add(subject, predicate, iri, this.kindOf(iri))\n      return\n    }\n\n    if (definition && definition.type && definition.type !== '@id' && definition.type !== '@json' &&\n      definition.type !== '@vocab') {\n      this.builder.add(subject, predicate, this.primitiveLexical(value), 'literal', definition.type)\n      return\n    }\n\n    if (typeof value === 'string') {\n      this.builder.add(\n        subject,\n        predicate,\n        value,\n        'literal',\n        undefined,\n        this.literalLanguage(definition, context),\n      )\n      return\n    }\n    if (typeof value === 'boolean') {\n      this.builder.add(subject, predicate, value ? 'true' : 'false', 'literal', ONTO_XSD_BOOLEAN)\n      return\n    }\n    if (typeof value === 'number') {\n      this.builder.add(\n        subject,\n        predicate,\n        String(value),\n        'literal',\n        Number.isInteger(value) ? ONTO_XSD_INTEGER : ONTO_XSD_DOUBLE,\n      )\n    }\n  }\n\n  primitiveLexical(value) {\n    if (typeof value === 'boolean') return value ? 'true' : 'false'\n    if (value === null || value === undefined) return ''\n    return String(value)\n  }\n\n  literalDescriptor(valueObject, context, definition) {\n    const raw = valueObject['@value']\n    if (raw === null || raw === undefined) return null\n    let language\n    let datatype\n    if (ontoRdfHas(valueObject, '@type')) {\n      const type = valueObject['@type']\n      if (typeof type === 'string') {\n        if (type === '@json') {\n          return { term: JSON.stringify(raw), dt: ONTO_RDF_JSON, lang: undefined }\n        }\n        const expanded = this.expandIri(type, context, { vocab: true, document: true })\n        datatype = this.normalizeIri(expanded || type, context)\n      }\n    } else if (ontoRdfHas(valueObject, '@language')) {\n      const explicit = valueObject['@language']\n      if (typeof explicit === 'string') language = explicit.toLowerCase()\n    } else if (typeof raw === 'string') {\n      language = this.literalLanguage(definition, context)\n    } else if (definition && definition.type && definition.type !== '@id' &&\n      definition.type !== '@json' && definition.type !== '@vocab') {\n      datatype = definition.type\n    }\n\n    let term\n    if (typeof raw === 'string') {\n      term = raw\n    } else if (typeof raw === 'number') {\n      term = String(raw)\n      if (!datatype) datatype = Number.isInteger(raw) ? ONTO_XSD_INTEGER : ONTO_XSD_DOUBLE\n    } else if (typeof raw === 'boolean') {\n      term = raw ? 'true' : 'false'\n      if (!datatype) datatype = ONTO_XSD_BOOLEAN\n    } else {\n      term = JSON.stringify(raw)\n      if (!datatype) datatype = ONTO_RDF_JSON\n    }\n    return { term: term, dt: datatype, lang: language }\n  }\n\n  buildList(items, context, definition) {\n    if (!Array.isArray(items) || items.length === 0) return ONTO_RDF_NIL\n    if (this.depth >= this.builder.maxDepth) {\n      this.noteJsonLdNestingLimit()\n      return ONTO_RDF_NIL\n    }\n    this.depth++\n    try {\n      const head = this.builder.freshBlank()\n      let current = head\n      for (let i = 0; i < items.length; i++) {\n        if (this.builder.truncated) break\n        const descriptor = this.itemDescriptor(items[i], context, definition)\n        if (descriptor) {\n          this.builder.add(current, ONTO_RDF_FIRST, descriptor.term, descriptor.kind, descriptor.dt, descriptor.lang)\n        }\n        if (i < items.length - 1) {\n          const next = this.builder.freshBlank()\n          this.builder.add(current, ONTO_RDF_REST, next, 'blank')\n          current = next\n        } else {\n          this.builder.add(current, ONTO_RDF_REST, ONTO_RDF_NIL, 'iri')\n        }\n      }\n      return head\n    } finally {\n      this.depth--\n    }\n  }\n\n  itemDescriptor(item, context, definition) {\n    if (item === null || item === undefined) return null\n    if (typeof item === 'object') {\n      if (ontoRdfHas(item, '@value')) {\n        const descriptor = this.literalDescriptor(item, context, definition)\n        return descriptor ? { term: descriptor.term, kind: 'literal', dt: descriptor.dt, lang: descriptor.lang } : null\n      }\n      if (ontoRdfHas(item, '@list')) {\n        const head = this.buildList(item['@list'], context, definition)\n        return { term: head, kind: this.kindOf(head) }\n      }\n      const child = this.processNode(item, context)\n      return child ? { term: child, kind: this.kindOf(child) } : null\n    }\n    if (typeof item === 'string') {\n      return { term: item, kind: 'literal', lang: this.literalLanguage(definition, context) }\n    }\n    if (typeof item === 'boolean') {\n      return { term: item ? 'true' : 'false', kind: 'literal', dt: ONTO_XSD_BOOLEAN }\n    }\n    if (typeof item === 'number') {\n      return {\n        term: String(item),\n        kind: 'literal',\n        dt: Number.isInteger(item) ? ONTO_XSD_INTEGER : ONTO_XSD_DOUBLE,\n      }\n    }\n    return null\n  }\n\n  kindOf(term) {\n    return typeof term === 'string' && term.slice(0, 2) === '_:' ? 'blank' : 'iri'\n  }\n}\n\n/* ------------------------------------------------------------------ */\n/* Public parsers                                                     */\n/* ------------------------------------------------------------------ */\n\n/** Parse Turtle (also used for N3 and TriG, whose graph labels are ignored). */\nfunction parseTurtle(text, options) {\n  return new OntoTurtleParser(text, options).parse()\n}\n\n/** Parse N-Triples (N-Quads graph terms are ignored). */\nfunction parseNTriples(text, options) {\n  return new OntoNTriplesParser(text, options).parse()\n}\n\n/** Parse RDF/XML. */\nfunction parseRdfXml(text, options) {\n  return new OntoRdfXmlParser(text, options).parse()\n}\n\n/** Parse a JSON-LD document (practical 1.1 expansion subset). */\nfunction parseJsonLd(text, options) {\n  return new OntoJsonLdParser(text, options).parse()\n}\n\n/* ------------------------------------------------------------------ */\n/* Identity helpers shared with the workspace and host adapters        */\n/* ------------------------------------------------------------------ */\n\n/** True when a value is a DSH session file route (authorization, not RDF). */\nfunction isDshResourceAddress(value) {\n  return ontoRdfIsDshResourceAddress(value)\n}\n\n/** Split a DSH session route into `{ authority, sessionId, path }`, or null. */\nfunction parseDshResourceAddress(value) {\n  return ontoRdfParseDshResourceAddress(value)\n}\n\n/** The single host-path → file-URI conversion used by every entry point. */\nfunction fileUriFromPath(value) {\n  return ontoRdfFileUriFromPath(value)\n}\n\n/** Detect the RDF serialization from a file name and/or the document text. */\nfunction detectFormat(text, fileName) {\n  const source = ontoRdfNormalizeText(text)\n  const extension = ontoRdfFileExtension(fileName)\n  if (extension === 'ttl' || extension === 'turtle' || extension === 'n3' || extension === 'trig') return 'turtle'\n  if (extension === 'nt' || extension === 'nq') return 'ntriples'\n  if (extension === 'jsonld') return 'jsonld'\n  if (extension === 'rdf' || extension === 'owl' || extension === 'xml') return 'rdfxml'\n\n  const start = ontoRdfSkipLeadingSpace(source)\n  const first = source.charAt(start)\n  if (first === '{' || first === '[') return 'jsonld'\n  const head = source.slice(start, start + 4096).toLowerCase()\n  if (head.slice(0, 5) === '<?xml' || head.indexOf('<rdf:') >= 0) return 'rdfxml'\n  if (/<rdf:RDF/i.test(source)) return 'rdfxml'\n  if (source.indexOf('@prefix') >= 0) return 'turtle'\n  if (/(^|[\\r\\n])\\s*(?:PREFIX|BASE)\\s/i.test(source)) return 'turtle'\n  if (extension === 'ttl' || extension === 'turtle') return 'turtle'\n  return 'ntriples'\n}\n\nfunction ontoRdfSkipLeadingSpace(source) {\n  let index = 0\n  if (source.charCodeAt(0) === 0xfeff) index = 1\n  while (index < source.length && ontoRdfIsWhitespace(source.charAt(index))) index++\n  return index\n}\n\nfunction ontoRdfNormalizeFormat(value) {\n  if (typeof value !== 'string') return null\n  const format = value.trim().toLowerCase()\n  if (format === 'ttl' || format === 'turtle' || format === 'n3' || format === 'trig') return 'turtle'\n  if (format === 'nt' || format === 'ntriples' || format === 'n-triples' ||\n    format === 'nq' || format === 'nquads' || format === 'n-quads') return 'ntriples'\n  if (format === 'rdf' || format === 'rdfxml' || format === 'rdf/xml' ||\n    format === 'xml' || format === 'owl') return 'rdfxml'\n  if (format === 'jsonld' || format === 'json-ld' || format === 'json') return 'jsonld'\n  return null\n}\n\nfunction ontoRdfEmptyDocument(format, text, options) {\n  return new OntoRdfBuilder(format, text, options).finish()\n}\n\n/**\n * Parse any supported serialization. Never throws.\n * options: {\n *   fileName?: string,          // display name, used for format detection only\n *   resourceAddress?: string,   // legacy real resource address (never a DSH route)\n *   navigationAddress?: string, // DSH session route: navigation only, never a base\n *   absolutePath?: string,      // host-confirmed absolute file path (the base)\n *   rdfBase?: string,           // explicit trusted base IRI\n *   format?: string,\n *   maxTriples?: number,\n *   maxLiteralLength?: number,\n *   maxDepth?: number,\n *   maxDiagnostics?: number\n * }\n */\nfunction parseOntology(text, options) {\n  const opts = options || {}\n  if (typeof text !== 'string') {\n    const result = ontoRdfEmptyDocument('unknown', '', opts)\n    result.errors.push('input is not a string')\n    return result\n  }\n  const parserOptions = {\n    fileName: opts.fileName,\n    resourceAddress: opts.resourceAddress,\n    navigationAddress: opts.navigationAddress,\n    absolutePath: opts.absolutePath,\n    rdfBase: opts.rdfBase,\n    maxTriples: opts.maxTriples,\n    maxLiteralLength: opts.maxLiteralLength,\n    maxDepth: opts.maxDepth,\n    maxDiagnostics: opts.maxDiagnostics,\n  }\n  let format\n  const declared = typeof opts.format === 'string' && opts.format.trim() !== ''\n  if (declared) {\n    format = ontoRdfNormalizeFormat(opts.format)\n    if (!format) {\n      const result = ontoRdfEmptyDocument('unknown', text, parserOptions)\n      result.errors.push('unsupported RDF format: ' + opts.format)\n      return result\n    }\n  } else {\n    format = detectFormat(text, opts.fileName)\n  }\n  try {\n    if (format === 'turtle') return parseTurtle(text, parserOptions)\n    if (format === 'ntriples') return parseNTriples(text, parserOptions)\n    if (format === 'rdfxml') return parseRdfXml(text, parserOptions)\n    if (format === 'jsonld') return parseJsonLd(text, parserOptions)\n  } catch (error) {\n    const result = ontoRdfEmptyDocument('unknown', text, parserOptions)\n    result.errors.push(\n      'parser crashed: ' + (error && error.message ? error.message : String(error)),\n    )\n    return result\n  }\n  const result = ontoRdfEmptyDocument('unknown', text, parserOptions)\n  result.errors.push('unsupported RDF format: ' + String(format))\n  return result\n}\n\n// ==== src/ontology-identity.js ====\n/**\n * Entity identity for merged multi-file RDF data.\n *\n * The viewer merges statements from several sources into one node-link model.\n * Absolute RDF IRIs identify themselves; blank nodes, unresolved relative\n * IRIs and unknown graph contexts are scoped to the source document, so the\n * same label in two files never becomes the same entity.\n *\n * Internal keys use a marker character that a valid RDF IRI cannot contain\n * (U+0000), and every part is length-prefixed. A user IRI can therefore never\n * collide with an internal key, and blank labels containing separators cannot\n * shift key boundaries.\n *\n * Plain ECMAScript: this module is concatenated into the Client bundle and the\n * embedded Worker (see build/build.mjs), and imported directly by Node tests.\n */\n\nconst ONTO_IDENTITY_MARKER = '\\u0000'\n\n/** Length-prefix one key part so separators inside values are unambiguous. */\nfunction ontoIdentityPart(value) {\n  const text = typeof value === 'string' ? value : String(value)\n  return text.length + ':' + text\n}\n\n/** Build one internal, collision-resistant key from its parts. */\nfunction ontoIdentityKey(kind, parts) {\n  let key = ONTO_IDENTITY_MARKER + kind + ONTO_IDENTITY_MARKER\n  for (let index = 0; index < parts.length; index++) {\n    key += ontoIdentityPart(parts[index])\n  }\n  return key\n}\n\n/** True when a key is a workspace-internal identity rather than an RDF IRI. */\nfunction isInternalEntityKey(value) {\n  if (typeof value !== 'string') return false\n  if (value.charAt(0) === ONTO_IDENTITY_MARKER) return true\n  return value.slice(0, 2) === '_:' && value.charAt(2) === ONTO_IDENTITY_MARKER\n}\n\n/** Split an internal key back into `{ kind, parts }`, or null for real IRIs. */\nfunction describeInternalEntityKey(value) {\n  if (!isInternalEntityKey(value)) return null\n  const body = value.charAt(0) === ONTO_IDENTITY_MARKER ? value.slice(1) : value.slice(3)\n  const marker = body.indexOf(ONTO_IDENTITY_MARKER)\n  if (marker < 0) return null\n  const kind = body.slice(0, marker)\n  const rest = body.slice(marker + 1)\n  const parts = []\n  let index = 0\n  while (index < rest.length) {\n    const colon = rest.indexOf(':', index)\n    if (colon < 0) return null\n    const length = Number(rest.slice(index, colon))\n    if (!Number.isInteger(length) || length < 0) return null\n    const start = colon + 1\n    parts.push(rest.slice(start, start + length))\n    index = start + length\n  }\n  return { kind: kind, parts: parts }\n}\n\n/**\n * Identity of one blank node inside a source document. The `_:` prefix keeps\n * the graph model's blank-node classification working on the scoped id; the\n * marker after it still makes the key impossible to forge with an RDF IRI.\n */\nfunction blankEntityKey(sourceId, label) {\n  return '_:' + ontoIdentityKey('blank', [sourceId, label])\n}\n\n/** Identity of one unresolved relative IRI inside a source document. */\nfunction relativeEntityKey(sourceId, raw) {\n  return ontoIdentityKey('relative', [sourceId, raw])\n}\n\n/** Stable identity of one statement (source + ordinal). */\nfunction statementIdFor(sourceId, ordinal) {\n  return ontoIdentityKey('statement', [sourceId, String(ordinal)])\n}\n\n/**\n * Identity of the graph context of one statement. Default graphs share one\n * identity; IRI graphs identify themselves; blank and unknown contexts stay\n * scoped to their source document.\n */\nfunction graphIdentityFor(sourceId, graph) {\n  if (!graph || graph.kind === 'default') return 'default'\n  if (graph.kind === 'iri' && typeof graph.value === 'string' && graph.value !== '') {\n    return 'iri\\t' + graph.value\n  }\n  if (graph.kind === 'blank') return blankEntityKey(sourceId, graph.value || '')\n  return 'unknown\\t' + sourceId\n}\n\n/**\n * Entity identity of one RDF term string. An absolute IRI keeps its own\n * identity; a blank node or a relative IRI is scoped to the source.\n */\nfunction entityKeyForTerm(term, sourceId) {\n  const value = typeof term === 'string' ? term : ''\n  if (value.slice(0, 2) === '_:') return blankEntityKey(sourceId, value)\n  if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(value)) return value\n  return relativeEntityKey(sourceId, value)\n}\n\n// ==== src/graph-model.js ====\n/**\n * Graph model + deterministic layout for the ontology viewer.\n *\n * This module is pure ECMAScript on purpose: it is concatenated into the\n * browser Client bundle (see build/build.mjs) and also imported directly by\n * the Node test runner. No DOM, no React, no Node globals, no imports.\n *\n * The input contract is the parsed-RDF shape produced by src/rdf-parse.js:\n *   { prefixes, base, triples: [{ s, p, o, oKind, lang?, dt? }], stats, warnings }\n *\n * Export surface (additive; the first seven keep their V1.0.0 signatures and\n * defaults, see design §10):\n *   buildGraph, shortenIri, localName, matchNodes, subgraph, neighborhood,\n *   layoutGraph,\n *   filterGraph, applyEdgeBudget, exploreNeighborhood, connectionGroups,\n *   createLayoutTask, budgetRecord.\n *\n * Data layers (design §1.5) that callers must state when they read them:\n *   L1 fullGraph      -- buildGraph output, read by search/details/exploration/totals\n *   L2 filteredGraph  -- filterGraph projection, read by exploration start\n *   L3 exploredGraph  -- exploreNeighborhood output, read for exploration counts\n *   L4 drawnGraph     -- applyEdgeBudget projection, read ONLY by rendering\n */\n\nconst RDF_NS = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#'\nconst RDFS_NS = 'http://www.w3.org/2000/01/rdf-schema#'\nconst OWL_NS = 'http://www.w3.org/2002/07/owl#'\nconst SKOS_NS = 'http://www.w3.org/2004/02/skos/core#'\nconst FOAF_NS = 'http://xmlns.com/foaf/0.1/'\nconst DCTERMS_NS = 'http://purl.org/dc/terms/'\nconst XSD_NS = 'http://www.w3.org/2001/XMLSchema#'\n\nconst RDF_TYPE = RDF_NS + 'type'\nconst RDF_FIRST = RDF_NS + 'first'\nconst RDF_REST = RDF_NS + 'rest'\nconst RDF_NIL = RDF_NS + 'nil'\nconst RDF_PROPERTY = RDF_NS + 'Property'\nconst RDFS_LABEL = RDFS_NS + 'label'\nconst RDFS_COMMENT = RDFS_NS + 'comment'\nconst RDFS_SUBCLASSOF = RDFS_NS + 'subClassOf'\nconst RDFS_CLASS = RDFS_NS + 'Class'\nconst OWL_CLASS = OWL_NS + 'Class'\nconst OWL_OBJECT_PROPERTY = OWL_NS + 'ObjectProperty'\nconst OWL_DATATYPE_PROPERTY = OWL_NS + 'DatatypeProperty'\nconst SKOS_PREFLABEL = SKOS_NS + 'prefLabel'\nconst FOAF_NAME = FOAF_NS + 'name'\nconst DCTERMS_TITLE = DCTERMS_NS + 'title'\n\n/** Common XSD datatypes, kept for callers that need to recognise literal types. */\nconst XSD_COMMON = new Set([\n  XSD_NS + 'string', XSD_NS + 'boolean', XSD_NS + 'decimal', XSD_NS + 'integer',\n  XSD_NS + 'int', XSD_NS + 'long', XSD_NS + 'short', XSD_NS + 'byte',\n  XSD_NS + 'float', XSD_NS + 'double', XSD_NS + 'date', XSD_NS + 'dateTime',\n  XSD_NS + 'time', XSD_NS + 'duration', XSD_NS + 'anyURI', XSD_NS + 'nonNegativeInteger',\n  XSD_NS + 'positiveInteger', XSD_NS + 'unsignedInt', XSD_NS + 'unsignedLong',\n])\n\nconst CLASS_TYPES = new Set([OWL_CLASS, RDFS_CLASS])\nconst PROPERTY_TYPES = new Set([OWL_OBJECT_PROPERTY, OWL_DATATYPE_PROPERTY, RDF_PROPERTY])\n\n/** Predicates that are list plumbing, not semantic edges. */\nconst LIST_PREDICATES = new Set([RDF_FIRST, RDF_REST])\n\n/**\n * Preferred label predicates, best first. Lower rank wins; a later lower-rank\n * literal replaces an earlier weaker label so the result does not depend on\n * triple order in a surprising way.\n */\nconst LABEL_RANK = new Map([\n  [RDFS_LABEL, 0],\n  [SKOS_PREFLABEL, 1],\n  [FOAF_NAME, 2],\n  [DCTERMS_TITLE, 3],\n  [RDFS_COMMENT, 4],\n])\n\nconst BLANK_PREFIX = '_:'\n\nfunction isObject(value) {\n  return value !== null && typeof value === 'object'\n}\n\nfunction stringValue(value) {\n  return value === null || value === undefined ? '' : String(value)\n}\n\nfunction labelRank(predicate) {\n  const rank = LABEL_RANK.get(predicate)\n  return rank === undefined ? 9 : rank\n}\n\nfunction compareStrings(a, b) {\n  if (a === b) return 0\n  return a < b ? -1 : 1\n}\n\n/**\n * Structured budget record. Every truncation level reports the same\n * `{ total, kept, truncated, reason }` shape (design §1.5 / §8.2) so the UI can\n * derive counts and notices from one representation. `truncated` is a number\n * (kept vs total delta), `reason` is null when nothing was dropped.\n *\n * @param {number} total\n * @param {number} kept\n * @param {string} [reason]\n * @returns {{total: number, kept: number, truncated: number, reason: string|null}}\n */\nfunction budgetRecord(total, kept, reason) {\n  const totalValue = typeof total === 'number' && Number.isFinite(total) && total > 0 ? Math.floor(total) : 0\n  let keptValue = typeof kept === 'number' && Number.isFinite(kept) && kept > 0 ? Math.floor(kept) : 0\n  if (keptValue > totalValue) keptValue = totalValue\n  const truncated = totalValue - keptValue\n  return {\n    total: totalValue,\n    kept: keptValue,\n    truncated,\n    reason: truncated > 0 ? (typeof reason === 'string' && reason ? reason : 'budget') : null,\n  }\n}\n\nfunction emptyStats() {\n  return {\n    triples: 0,\n    nodes: 0,\n    edges: 0,\n    literals: 0,\n    classes: 0,\n    properties: 0,\n    individuals: 0,\n    blanks: 0,\n    droppedNodes: 0,\n    droppedEdges: 0,\n    droppedLiterals: 0,\n  }\n}\n\n/**\n * Resolve how an object term should be treated. Parsers normally set `oKind`,\n * but a wrong/absent value must never turn a literal into a node.\n */\nfunction resolveObjectKind(triple, value) {\n  const declared = typeof triple.oKind === 'string' ? triple.oKind : ''\n  if (declared === 'literal' || declared === 'iri' || declared === 'blank') return declared\n  if (typeof value !== 'string') return 'literal'\n  if (value.startsWith(BLANK_PREFIX)) return 'blank'\n  if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(value) && !/\\s/.test(value)) return 'iri'\n  return 'literal'\n}\n\n/**\n * Resolve graph-level source metadata (spec \"源位置预留\", design §1.4).\n *\n * `options.source` is the authoritative explicit input; otherwise the parsed\n * document is consulted defensively (`resourceAddress` first, then a\n * resource-derived `base`). A document-declared `@base` is not a resource\n * address and must not be reported as one. Missing values are empty strings,\n * never a fabricated address or display name.\n *\n * @param {any} opts buildGraph options\n * @param {any} input parsed document\n * @returns {{address: string, displayName: string, format: string}}\n */\nfunction resolveGraphSource(opts, input) {\n  const explicit = isObject(opts.source) ? opts.source : {}\n  let address = ''\n  if (typeof explicit.address === 'string') address = explicit.address\n  else if (typeof input.resourceAddress === 'string') address = input.resourceAddress\n  else if (typeof input.base === 'string' && input.baseSource !== 'document') address = input.base\n  let displayName = ''\n  if (typeof explicit.displayName === 'string') displayName = explicit.displayName\n  else if (typeof input.displayName === 'string') displayName = input.displayName\n  else if (typeof input.fileName === 'string') displayName = input.fileName\n  let format = ''\n  if (typeof explicit.format === 'string') format = explicit.format\n  else if (typeof input.format === 'string') format = input.format\n  return { address, displayName, format }\n}\n\n/**\n * Graph context used when a caller hands over statements that predate the\n * graph field: the model never claims those statements belong to the default\n * graph, because the source may have lost that information.\n */\nconst FALLBACK_STATEMENT_GRAPH = Object.freeze({ kind: 'unknown' })\nconst LEGACY_SOURCE_ID = 'single'\n\n/**\n * Expand the input into flat statements that carry source and statement\n * identity. The workspace composes merged records and passes the expanded\n * occurrences through `options.statements`; a plain parsed document keeps the\n * V1.0.0 `triples` contract and is wrapped as one legacy source.\n */\nfunction normalizeStatements(input, opts) {\n  if (Array.isArray(opts.statements)) return opts.statements\n  const triples = Array.isArray(input.triples) ? input.triples : []\n  const explicit = typeof opts.sourceId === 'string' && opts.sourceId\n    ? opts.sourceId\n    : (typeof input.sourceId === 'string' && input.sourceId ? input.sourceId : LEGACY_SOURCE_ID)\n  const statements = new Array(triples.length)\n  for (let index = 0; index < triples.length; index++) {\n    const triple = triples[index]\n    if (!isObject(triple)) {\n      statements[index] = triple\n      continue\n    }\n    statements[index] = {\n      s: triple.s,\n      p: triple.p,\n      o: triple.o,\n      oKind: triple.oKind,\n      dt: triple.dt,\n      lang: triple.lang,\n      literalTruncated: triple.literalTruncated,\n      graph: isObject(triple.graph) ? triple.graph : FALLBACK_STATEMENT_GRAPH,\n      sourceId: typeof triple.sourceId === 'string' && triple.sourceId ? triple.sourceId : explicit,\n      statementId: typeof triple.statementId === 'string' && triple.statementId\n        ? triple.statementId\n        : 'legacy:' + explicit + ':' + index,\n    }\n  }\n  return statements\n}\n\n/** Sorted copy of a Set of strings, for stable output. */\nfunction sortedValues(set) {\n  const values = []\n  for (const value of set) values.push(value)\n  return values.sort(compareStrings)\n}\n\n/**\n * Turn parsed triples into a renderable node-link graph.\n *\n * Classification (deterministic precedence, first match wins):\n *   1. blank      -- the id starts with \"_:\"\n *   2. property   -- typed owl:ObjectProperty / owl:DatatypeProperty / rdf:Property\n *   3. class      -- typed owl:Class / rdfs:Class, used as the object of an\n *                    rdf:type statement, or involved in rdfs:subClassOf\n *   4. external   -- a leaf target (no outgoing edges, no literals, no types,\n *                    at most one incoming edge); a reference to something the\n *                    document does not describe\n *   5. individual -- everything else\n *\n * Literals never become nodes; they are collected on the subject as\n * `node.literals`. rdf:first / rdf:rest triples are list plumbing and are\n * dropped from the graph (they still count in `stats.triples`).\n *\n * Provenance: nodes, literals and edges carry `sourceIds` / `statementIds`\n * collected from the statements that produced them. They never infer a byte,\n * line or column position (`location` stays null upstream).\n *\n * Budgets (all optional, all structured, none silent):\n *   - maxNodes (default 1200): highest total degree first, id as stable tie-break.\n *   - maxLiteralsPerNode (default 60): per-node literal statements kept.\n *   - maxEdges (default off): model-level distinct edge budget. Kept edges are\n *     ordered by combined parallel `count` desc, full-graph degree sum desc,\n *     then (source, predicate, target) lexicographic; output order stays the\n *     first-occurrence order so ids remain stable.\n *   - maxLiteralLength (default off): single literal value `length` cap; a\n *     truncated value is marked with `literal.truncated = true`.\n *\n * @param {{triples?: any[], prefixes?: Record<string, string>, sources?: any[]}} parsed\n * @param {{statements?: any[], sources?: any[], sourceId?: string,\n *          maxNodes?: number, maxLiteralsPerNode?: number, maxEdges?: number,\n *          maxLiteralLength?: number,\n *          source?: {address?: string, displayName?: string, format?: string}}} [options]\n * @returns {{nodes: any[], edges: any[], stats: any, warnings: string[],\n *            truncation: any, sources: any[],\n *            source: {address: string, displayName: string, format: string}}}\n */\nfunction buildGraph(parsed, options) {\n  const opts = isObject(options) ? options : {}\n  const maxNodes = positiveInteger(opts.maxNodes, 1200)\n  const maxLiterals = positiveInteger(opts.maxLiteralsPerNode, 60)\n  const maxLiteralLength = optionalPositiveInteger(opts.maxLiteralLength)\n  const maxEdges = optionalPositiveInteger(opts.maxEdges)\n\n  const input = isObject(parsed) ? parsed : {}\n  const statements = normalizeStatements(input, opts)\n  const prefixes = isObject(input.prefixes) ? input.prefixes : {}\n  const warnings = []\n  const source = resolveGraphSource(opts, input)\n  const sources = Array.isArray(opts.sources)\n    ? opts.sources\n    : (Array.isArray(input.sources) ? input.sources : [])\n\n  /** id -> { id, types, literals, out, in, label, labelRank } */\n  const records = new Map()\n  /** id -> { sourceIds: Set, statementIds: Set, roles: Set } */\n  const provenance = new Map()\n  /** id -> true when the node is used as the object of rdf:type (i.e. a class-like IRI) */\n  const usedAsType = new Set()\n  /** ids involved in rdfs:subClassOf (subject or IRI object) */\n  const subclassNodes = new Set()\n  /** \"s\\0p\\0o\" -> collapsed edge draft */\n  const edgeDrafts = new Map()\n  /** literal value truncations applied because of maxLiteralLength */\n  let truncatedValues = 0\n\n  function ensureRecord(id) {\n    let record = records.get(id)\n    if (record === undefined) {\n      record = { id, types: [], literals: [], out: 0, in: 0, label: '', labelRank: 99 }\n      records.set(id, record)\n    }\n    return record\n  }\n\n  /** Record one entity occurrence for provenance, without inferring positions. */\n  function noteProvenance(id, statement, role) {\n    let entry = provenance.get(id)\n    if (entry === undefined) {\n      entry = { sourceIds: new Set(), statementIds: new Set(), roles: new Set(), bySource: new Map() }\n      provenance.set(id, entry)\n    }\n    if (typeof statement.sourceId === 'string' && statement.sourceId) {\n      entry.sourceIds.add(statement.sourceId)\n      let contribution = entry.bySource.get(statement.sourceId)\n      if (!contribution) {\n        contribution = { roles: new Set(), statementIds: new Set() }\n        entry.bySource.set(statement.sourceId, contribution)\n      }\n      contribution.roles.add(role)\n      if (statement.statementId) contribution.statementIds.add(statement.statementId)\n    }\n    if (typeof statement.statementId === 'string' && statement.statementId) {\n      entry.statementIds.add(statement.statementId)\n    }\n    entry.roles.add(role)\n  }\n\n  /**\n   * Remember one distinct graph context of an edge. Blank and unknown graph\n   * names stay scoped to their source so equal labels do not merge them.\n   */\n  function noteDraftGraph(draft, statement) {\n    const graph = isObject(statement.graph) ? statement.graph : FALLBACK_STATEMENT_GRAPH\n    const sourceId = typeof statement.sourceId === 'string' ? statement.sourceId : ''\n    let kind = 'default'\n    if (graph.kind === 'iri' && typeof graph.value === 'string' && graph.value !== '') kind = 'iri'\n    else if (graph.kind === 'blank') kind = 'blank'\n    else if (graph.kind === 'unknown') kind = 'unknown'\n    let key = 'd'\n    if (kind === 'iri') key = 'i\\t' + graph.value\n    else if (kind === 'blank') key = 'b\\t' + sourceId + '\\t' + String(graph.value || '')\n    else if (kind === 'unknown') key = 'u\\t' + sourceId\n    let entry = draft.graphMap.get(key)\n    if (entry === undefined) {\n      entry = { kind: kind, sourceIds: new Set() }\n      if (kind === 'iri' || kind === 'blank') entry.value = String(graph.value)\n      draft.graphMap.set(key, entry)\n    }\n    if (sourceId) entry.sourceIds.add(sourceId)\n  }\n\n  for (const triple of statements) {\n    if (!isObject(triple)) continue\n    const subject = typeof triple.s === 'string' ? triple.s : ''\n    const predicate = typeof triple.p === 'string' ? triple.p : ''\n    if (!subject || !predicate) continue\n    if (triple.o === null || triple.o === undefined) continue\n\n    const objectKind = resolveObjectKind(triple, triple.o)\n    const objectText = stringValue(triple.o)\n\n    if (objectKind === 'literal') {\n      // List plumbing literals are irrelevant once the list is skipped.\n      if (LIST_PREDICATES.has(predicate)) continue\n      const record = ensureRecord(subject)\n      noteProvenance(subject, triple, 'subject')\n      const rank = labelRank(predicate)\n      let value = objectText\n      let valueTruncated = false\n      if (maxLiteralLength > 0 && value.length > maxLiteralLength) {\n        value = value.slice(0, maxLiteralLength)\n        valueTruncated = true\n        truncatedValues += 1\n      }\n      const literal = {\n        p: predicate,\n        value,\n        order: record.literals.length,\n        rank,\n        sourceIds: typeof triple.sourceId === 'string' && triple.sourceId ? [triple.sourceId] : [],\n        statementIds: typeof triple.statementId === 'string' && triple.statementId\n          ? [triple.statementId]\n          : [],\n      }\n      if (valueTruncated) literal.truncated = true\n      if (typeof triple.dt === 'string' && triple.dt) literal.dt = triple.dt\n      if (typeof triple.lang === 'string' && triple.lang) literal.lang = triple.lang\n      record.literals.push(literal)\n      // rdfs:comment is useful in the detail panel but must not become the\n      // node label; only ranks 0..3 are label predicates.\n      if (rank <= 3 && rank < record.labelRank) {\n        record.labelRank = rank\n        record.label = value\n      }\n      continue\n    }\n\n    if (LIST_PREDICATES.has(predicate)) continue\n\n    const object = objectText\n    if (!object) continue\n    const sourceRecord = ensureRecord(subject)\n    const targetRecord = ensureRecord(object)\n    sourceRecord.out += 1\n    targetRecord.in += 1\n\n    if (predicate === RDF_TYPE) {\n      if (!sourceRecord.types.includes(object)) sourceRecord.types.push(object)\n      if (objectKind === 'iri') usedAsType.add(object)\n    } else if (predicate === RDFS_SUBCLASSOF) {\n      subclassNodes.add(subject)\n      subclassNodes.add(object)\n    }\n\n    const key = subject + '\\u0000' + predicate + '\\u0000' + object\n    let draft = edgeDrafts.get(key)\n    if (draft === undefined) {\n      draft = {\n        source: subject,\n        target: object,\n        p: predicate,\n        count: 0,\n        sourceIds: new Set(),\n        statementIds: new Set(),\n        graphMap: new Map(),\n      }\n      edgeDrafts.set(key, draft)\n    }\n    draft.count += 1\n    noteProvenance(subject, triple, 'subject')\n    noteProvenance(object, triple, 'object')\n    noteProvenance(predicate, triple, 'predicate')\n    if (typeof triple.sourceId === 'string' && triple.sourceId) draft.sourceIds.add(triple.sourceId)\n    if (typeof triple.statementId === 'string' && triple.statementId) {\n      draft.statementIds.add(triple.statementId)\n    }\n    noteDraftGraph(draft, triple)\n  }\n\n  function degreeOf(id) {\n    const record = records.get(id)\n    return record === undefined ? 0 : record.out + record.in\n  }\n\n  // Rank before capping: highest degree first, id as a stable tie-breaker.\n  const ranked = []\n  for (const record of records.values()) {\n    ranked.push({ record, rank: record.out + record.in })\n  }\n  ranked.sort((a, b) => b.rank - a.rank || compareStrings(a.record.id, b.record.id))\n\n  const droppedNodes = Math.max(0, ranked.length - maxNodes)\n  const keptRecords = ranked.slice(0, maxNodes).map((entry) => entry.record)\n  const keptIds = new Set(keptRecords.map((record) => record.id))\n  if (droppedNodes > 0) {\n    warnings.push(\n      'Graph node limit reached: kept ' + maxNodes + ' of ' + ranked.length +\n      ' nodes (highest degree first), dropped ' + droppedNodes + '.'\n    )\n  }\n\n  // Keep only edges whose endpoints survived capping, then optionally apply\n  // the model-level distinct-edge budget.\n  const totalEdgeCandidates = edgeDrafts.size\n  const retainedDrafts = []\n  for (const draft of edgeDrafts.values()) {\n    if (!keptIds.has(draft.source) || !keptIds.has(draft.target)) continue\n    retainedDrafts.push(draft)\n  }\n  const droppedByNodeLimit = totalEdgeCandidates - retainedDrafts.length\n  let keptDrafts = retainedDrafts\n  let droppedByBudget = 0\n  if (maxEdges > 0 && retainedDrafts.length > maxEdges) {\n    // Deterministic priority: parallel count first, then full-graph degree\n    // sum, then the canonical (source, predicate, target) key.\n    const rankedEdges = retainedDrafts.slice()\n    rankedEdges.sort((a, b) => {\n      if (a.count !== b.count) return b.count - a.count\n      const degreeA = degreeOf(a.source) + degreeOf(a.target)\n      const degreeB = degreeOf(b.source) + degreeOf(b.target)\n      if (degreeA !== degreeB) return degreeB - degreeA\n      return compareStrings(a.source, b.source) ||\n        compareStrings(a.p, b.p) ||\n        compareStrings(a.target, b.target)\n    })\n    const keptSet = new Set(rankedEdges.slice(0, maxEdges))\n    keptDrafts = retainedDrafts.filter((draft) => keptSet.has(draft))\n    droppedByBudget = retainedDrafts.length - keptDrafts.length\n    warnings.push(\n      'Graph edge limit reached: kept ' + keptDrafts.length + ' of ' +\n      retainedDrafts.length + ' edges, dropped ' + droppedByBudget + '.'\n    )\n  }\n  const keptDraftSet = new Set(keptDrafts)\n\n  // Emit edges in first-occurrence order so ids stay stable across budgets.\n  const edges = []\n  function graphsOf(draft) {\n    const list = []\n    for (const entry of draft.graphMap.values()) {\n      const item = { kind: entry.kind }\n      if (entry.value !== undefined) item.value = entry.value\n      item.sourceIds = sortedValues(entry.sourceIds)\n      list.push(item)\n    }\n    list.sort((a, b) => compareStrings(a.kind, b.kind) ||\n      compareStrings(String(a.value || ''), String(b.value || '')))\n    return list\n  }\n  for (const draft of edgeDrafts.values()) {\n    if (!keptDraftSet.has(draft)) continue\n    let kind = 'object'\n    if (draft.p === RDF_TYPE) kind = 'type'\n    else if (draft.p === RDFS_SUBCLASSOF) kind = 'subclass'\n    else if (draft.source.startsWith(BLANK_PREFIX) || draft.target.startsWith(BLANK_PREFIX)) kind = 'blank'\n    edges.push({\n      id: 'e' + edges.length,\n      source: draft.source,\n      target: draft.target,\n      p: draft.p,\n      label: shortenIri(draft.p, prefixes),\n      kind,\n      count: draft.count,\n      sourceIds: sortedValues(draft.sourceIds),\n      statementIds: sortedValues(draft.statementIds),\n      graphs: graphsOf(draft),\n    })\n  }\n\n  // Recompute degrees from the retained edges so width/radius match what is drawn.\n  const outEdges = new Map()\n  const inEdges = new Map()\n  for (const record of keptRecords) {\n    outEdges.set(record.id, 0)\n    inEdges.set(record.id, 0)\n  }\n  for (const edge of edges) {\n    outEdges.set(edge.source, (outEdges.get(edge.source) || 0) + 1)\n    inEdges.set(edge.target, (inEdges.get(edge.target) || 0) + 1)\n  }\n\n  const nodes = []\n  const stats = emptyStats()\n  stats.triples = statements.length || Number(input.stats && input.stats.tripleCount) || 0\n  let literalCandidates = 0\n  let keptLiteralCount = 0\n  let droppedLiteralCount = 0\n  let truncatedLiteralNodes = 0\n\n  for (const record of keptRecords) {\n    const out = outEdges.get(record.id) || 0\n    const incoming = inEdges.get(record.id) || 0\n    const types = record.types.slice()\n    let kind\n    if (record.id.startsWith(BLANK_PREFIX)) kind = 'blank'\n    else if (types.some((type) => PROPERTY_TYPES.has(type))) kind = 'property'\n    else if (types.some((type) => CLASS_TYPES.has(type)) || usedAsType.has(record.id) || subclassNodes.has(record.id)) kind = 'class'\n    else if (out === 0 && incoming <= 1 && record.literals.length === 0 && types.length === 0) kind = 'external'\n    else kind = 'individual'\n\n    // Labels first, then rdfs:comment, then the rest in document order.\n    record.literals.sort((a, b) => a.rank - b.rank || a.order - b.order)\n    const totalForNode = record.literals.length\n    literalCandidates += totalForNode\n    const keptLiterals = record.literals.slice(0, maxLiterals)\n    const droppedForNode = totalForNode - keptLiterals.length\n    if (droppedForNode > 0) {\n      truncatedLiteralNodes += 1\n      droppedLiteralCount += droppedForNode\n    }\n    keptLiteralCount += keptLiterals.length\n    const literals = keptLiterals.map((literal) => {\n      const item = {\n        p: literal.p,\n        pLabel: shortenIri(literal.p, prefixes),\n        value: literal.value,\n        sourceIds: Array.isArray(literal.sourceIds) ? literal.sourceIds.slice() : [],\n        statementIds: Array.isArray(literal.statementIds) ? literal.statementIds.slice() : [],\n      }\n      if (literal.dt) item.dt = literal.dt\n      if (literal.lang) item.lang = literal.lang\n      if (literal.truncated) item.truncated = true\n      return item\n    })\n\n    const rawLocal = localName(record.id)\n    const local = rawLocal || record.id\n    const label = record.label || local\n    const origin = provenance.get(record.id)\n\n    if (kind === 'class') stats.classes += 1\n    else if (kind === 'property') stats.properties += 1\n    else if (kind === 'blank') stats.blanks += 1\n    else if (kind === 'individual') stats.individuals += 1\n\n    nodes.push({\n      id: record.id,\n      label,\n      iri: record.id,\n      local,\n      kind,\n      types,\n      degree: out + incoming,\n      literals,\n      outEdges: out,\n      inEdges: incoming,\n      provenance: {\n        sourceIds: origin === undefined ? [] : sortedValues(origin.sourceIds),\n        statementIds: origin === undefined ? [] : sortedValues(origin.statementIds),\n        roles: origin === undefined ? [] : sortedValues(origin.roles),\n        bySource: origin === undefined ? [] : Array.from(origin.bySource, ([sourceId, value]) => ({\n          sourceId: sourceId, roles: sortedValues(value.roles), statementIds: sortedValues(value.statementIds),\n        })),\n      },\n      // Reserved source location: always null in this change (spec\n      // \"源位置预留\"); never inferred from filenames or document order.\n      literalsTruncated: droppedForNode,\n      source: null,\n    })\n  }\n\n  if (truncatedLiteralNodes > 0) {\n    warnings.push('Literal properties were truncated to ' + maxLiterals + ' per node.')\n  }\n  if (truncatedValues > 0) {\n    warnings.push('Literal values were truncated to ' + maxLiteralLength + ' characters.')\n  }\n\n  stats.nodes = nodes.length\n  stats.edges = edges.length\n  stats.literals = keptLiteralCount\n  stats.droppedNodes = droppedNodes\n  stats.droppedEdges = totalEdgeCandidates - edges.length\n  stats.droppedLiterals = droppedLiteralCount\n\n  const truncation = {\n    nodes: budgetRecord(ranked.length, keptRecords.length, 'max-nodes'),\n    literals: Object.assign(\n      budgetRecord(literalCandidates, keptLiteralCount, 'max-literals-per-node'),\n      {\n        perNodeLimit: maxLiterals,\n        truncatedNodes: truncatedLiteralNodes,\n        valueTruncated: truncatedValues,\n      },\n    ),\n    edges: Object.assign(\n      budgetRecord(totalEdgeCandidates, edges.length, droppedByBudget > 0 ? 'max-edges' : 'node-limit'),\n      { droppedByNodeLimit, droppedByBudget },\n    ),\n  }\n\n  return { nodes, edges, stats, warnings, truncation, sources, source }\n}\n\n/**\n * Source-contribution projection (L1 → L2).\n *\n * An empty or absent selection means \"all sources\". Otherwise an edge is kept\n * only when at least one selected source contributed it, a node only when a\n * selected source contributed to it or it touches a kept edge, and a literal\n * only when a selected source contributed it. The input graph is never\n * mutated: nodes are shallow-copied when their literal list changes.\n *\n * This projection runs before the existing type/predicate/direction filter and\n * exploration, so a shared node cannot drag another source's edges back in.\n *\n * @param {any} graph L1 graph produced by buildGraph\n * @param {string[]} sourceIds selected source ids (empty = all)\n * @returns {{nodes: any[], edges: any[], stats: any, hidden: object}}\n */\nfunction filterBySources(graph, sourceIds) {\n  const input = isObject(graph) ? graph : {}\n  const nodes = Array.isArray(input.nodes) ? input.nodes : []\n  const edges = Array.isArray(input.edges) ? input.edges : []\n  const selected = new Set(\n    (Array.isArray(sourceIds) ? sourceIds : []).filter((id) => typeof id === 'string'),\n  )\n  const all = selected.size === 0\n  const contributes = (ids) => all || (Array.isArray(ids) && ids.some((id) => selected.has(id)))\n\n  const keptEdges = edges.filter((edge) => contributes(edge && edge.sourceIds))\n  const keptEdgeSet = new Set(keptEdges)\n  const touched = new Set()\n  for (const edge of keptEdges) {\n    touched.add(edge.source)\n    touched.add(edge.target)\n  }\n\n  const keptNodes = []\n  let hiddenNodes = 0\n  let hiddenLiterals = 0\n  for (const node of nodes) {\n    if (!isObject(node)) continue\n    const origin = isObject(node.provenance) ? node.provenance : null\n    const literals = Array.isArray(node.literals) ? node.literals : []\n    const keptLiterals = all\n      ? literals\n      : literals.filter((literal) => contributes(literal && literal.sourceIds))\n    const droppedHere = literals.length - keptLiterals.length\n    if (!all && !touched.has(node.id) && !contributes(origin && origin.sourceIds)) {\n      hiddenNodes += 1\n      hiddenLiterals += literals.length\n      continue\n    }\n    if (droppedHere > 0 || keptLiterals !== literals) {\n      hiddenLiterals += droppedHere\n      keptNodes.push(Object.assign({}, node, { literals: keptLiterals }))\n    } else {\n      keptNodes.push(node)\n    }\n  }\n\n  const stats = statsFor(keptNodes, keptEdges, input.stats && input.stats.triples)\n  return {\n    nodes: keptNodes,\n    edges: keptEdges,\n    stats: stats,\n    hidden: {\n      nodes: hiddenNodes,\n      edges: edges.length - keptEdges.length,\n      literals: hiddenLiterals,\n    },\n    sourceIds: all ? [] : Array.from(selected),\n  }\n}\n\n/**\n * Shorten an IRI with a prefix map: \"foaf:Person\", else the local name, else\n * the original IRI. The longest matching namespace wins; an empty prefix\n * expands to the bare local name.\n */\nfunction shortenIri(iri, prefixes) {\n  if (typeof iri !== 'string' || !iri) return ''\n  if (isObject(prefixes)) {\n    let bestPrefix = null\n    let bestNamespace = ''\n    for (const prefix of Object.keys(prefixes)) {\n      const namespace = prefixes[prefix]\n      if (typeof namespace !== 'string' || !namespace) continue\n      if (!iri.startsWith(namespace)) continue\n      if (namespace.length > bestNamespace.length ||\n          (namespace.length === bestNamespace.length && bestPrefix !== null && prefix < bestPrefix)) {\n        bestPrefix = prefix\n        bestNamespace = namespace\n      }\n    }\n    if (bestPrefix !== null && iri.length > bestNamespace.length) {\n      const local = iri.slice(bestNamespace.length)\n      return bestPrefix ? bestPrefix + ':' + local : local\n    }\n  }\n  const local = localName(iri)\n  return local || iri\n}\n\n/**\n * Local name after the last \"#\" or \"/\". For URNs the part after the last \":\"\n * is used, and blank-node ids lose their \"_:\" marker. May be empty for an IRI\n * whose last segment is empty.\n */\nfunction localName(iri) {\n  if (typeof iri !== 'string') return ''\n  let value = iri.trim()\n  if (!value) return ''\n  if (value.startsWith(BLANK_PREFIX)) value = value.slice(2)\n  const hash = value.lastIndexOf('#')\n  const slash = value.lastIndexOf('/')\n  const cut = hash > slash ? hash : slash\n  if (cut >= 0) return value.slice(cut + 1)\n  const colon = value.lastIndexOf(':')\n  if (colon >= 0) return value.slice(colon + 1)\n  return value\n}\n\n/**\n * Find nodes whose label, IRI or local name contains the query\n * (case-insensitive). Results are ordered best match first: exact, prefix,\n * label substring, then local/IRI substring. Returns node ids.\n */\nfunction matchNodes(graph, query, limit) {\n  const nodes = isObject(graph) && Array.isArray(graph.nodes) ? graph.nodes : []\n  const needle = typeof query === 'string' ? query.trim().toLowerCase() : ''\n  if (!needle) return []\n  const max = typeof limit === 'number' && Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : nodes.length\n  const scored = []\n\n  for (let index = 0; index < nodes.length; index += 1) {\n    const node = nodes[index]\n    if (!isObject(node) || typeof node.id !== 'string') continue\n    const label = stringValue(node.label).toLowerCase()\n    const iri = stringValue(node.iri || node.id).toLowerCase()\n    const local = stringValue(node.local).toLowerCase()\n    let score = 0\n    if (label === needle || local === needle || iri === needle) score = 100\n    else if (label.startsWith(needle) || local.startsWith(needle)) score = 60\n    else if (label.indexOf(needle) >= 0) score = 40\n    else if (local.indexOf(needle) >= 0 || iri.indexOf(needle) >= 0) score = 20\n    if (score > 0) scored.push({ id: node.id, score, index })\n  }\n\n  scored.sort((a, b) => b.score - a.score || a.index - b.index)\n  return scored.slice(0, max).map((entry) => entry.id)\n}\n\n/** Statistics for an already-selected node/edge subset. */\nfunction statsFor(nodes, edges, triples) {\n  const stats = emptyStats()\n  stats.triples = Number.isFinite(triples) ? triples : 0\n  stats.nodes = nodes.length\n  stats.edges = edges.length\n  for (const node of nodes) {\n    if (!isObject(node)) continue\n    if (Array.isArray(node.literals)) stats.literals += node.literals.length\n    if (node.kind === 'class') stats.classes += 1\n    else if (node.kind === 'property') stats.properties += 1\n    else if (node.kind === 'blank') stats.blanks += 1\n    else if (node.kind === 'individual') stats.individuals += 1\n  }\n  return stats\n}\n\n/**\n * Subgraph induced by the given node ids; edges survive only when both ends\n * are inside. Node objects are reused as-is (their degree still reflects the\n * full graph), which keeps focus-mode filtering cheap.\n */\nfunction subgraph(graph, nodeIds) {\n  const input = isObject(graph) ? graph : {}\n  const nodes = Array.isArray(input.nodes) ? input.nodes : []\n  const edges = Array.isArray(input.edges) ? input.edges : []\n  const wanted = new Set(Array.isArray(nodeIds) ? nodeIds.filter((id) => typeof id === 'string') : [])\n\n  const keptNodes = nodes.filter((node) => isObject(node) && typeof node.id === 'string' && wanted.has(node.id))\n  const keptIds = new Set(keptNodes.map((node) => node.id))\n  const keptEdges = edges.filter((edge) =>\n    isObject(edge) && keptIds.has(edge.source) && keptIds.has(edge.target))\n\n  return {\n    nodes: keptNodes,\n    edges: keptEdges,\n    stats: statsFor(keptNodes, keptEdges, input.stats && input.stats.triples),\n    warnings: Array.isArray(input.warnings) ? input.warnings.slice() : [],\n  }\n}\n\n/**\n * Neighbour ids of one node within `depth` hops (default 1), including the\n * node itself. Unknown nodes return an empty array.\n */\nfunction neighborhood(graph, nodeId, depth) {\n  const input = isObject(graph) ? graph : {}\n  const nodes = Array.isArray(input.nodes) ? input.nodes : []\n  const edges = Array.isArray(input.edges) ? input.edges : []\n  if (typeof nodeId !== 'string' || !nodes.some((node) => isObject(node) && node.id === nodeId)) return []\n\n  const requestedDepth = Number.isFinite(depth) ? Math.floor(depth) : 1\n  const limit = Math.max(0, Math.min(10, requestedDepth))\n  const adjacency = new Map()\n  for (const node of nodes) {\n    if (isObject(node) && typeof node.id === 'string') adjacency.set(node.id, [])\n  }\n  for (const edge of edges) {\n    if (!isObject(edge) || typeof edge.source !== 'string' || typeof edge.target !== 'string') continue\n    if (edge.source === edge.target) continue\n    const from = adjacency.get(edge.source)\n    const to = adjacency.get(edge.target)\n    if (from) from.push(edge.target)\n    if (to) to.push(edge.source)\n  }\n\n  const seen = new Set([nodeId])\n  const order = [nodeId]\n  let frontier = [nodeId]\n  for (let step = 0; step < limit; step += 1) {\n    const next = []\n    for (const current of frontier) {\n      const neighbours = adjacency.get(current)\n      if (!neighbours) continue\n      for (const neighbour of neighbours) {\n        if (seen.has(neighbour)) continue\n        seen.add(neighbour)\n        order.push(neighbour)\n        next.push(neighbour)\n      }\n    }\n    if (next.length === 0) break\n    frontier = next\n  }\n  return order\n}\n\n// ---------------------------------------------------------------------------\n// Filter projection (L2, design §4)\n// ---------------------------------------------------------------------------\n\n/**\n * Pure display projection over the retained full graph (L1). Never mutates the\n * input graph or the parsed data, never re-parses.\n *\n * Criteria semantics (design §4.2):\n *   - `kinds`: node kind allow-list (class/property/individual/blank/external);\n *     empty/absent = all kinds.\n *   - `predicates`: edge predicate allow-list; empty/absent = all predicates.\n *   - `direction`: direction relative to `anchorId`, applied to direct relation\n *     edges only (1 hop): `'out'` keeps edges whose source is the anchor,\n *     `'in'` edges whose target is the anchor, `'both'` edges touching the\n *     anchor in either direction. This is a projection filter, not a traversal:\n *     multi-hop expansion belongs to `exploreNeighborhood`, which applies the\n *     direction again on every hop (so the filter layer must not pre-compute a\n *     reachability cone). Without a usable anchor, or when no direction is\n *     provided at all, the direction condition is inert (spec \"无锚点时方向条件\n *     不生效\").\n *   - `anchorId`: the selected node; it is always retained, even when it fails\n *     the kind filter, so the selection context cannot vanish.\n *\n * When a relation filter is active (predicates or a direction), nodes that have\n * no retained incident edge are dropped, except the anchor -- relation filtering\n * making isolated nodes disappear is expected behaviour (design §4.2). A pure\n * kind filter keeps matching nodes connected or not.\n *\n * The result is `{ nodes, edges, stats, hidden, graph }` where `graph` is the\n * same projection shaped like a graph model (design names this `{ graph, stats,\n * hidden }`; the flat fields are kept for direct use). `hidden` reports total\n * hidden counts plus independent marginal counts by kind / predicate / direction\n * (the marginals can overlap; totals are exact).\n *\n * @param {any} graph full (L1) or filtered (L2/L3) graph model\n * @param {{kinds?: string[], predicates?: string[], direction?: 'both'|'out'|'in', anchorId?: string}} criteria\n * @param {any} [_options] reserved\n */\nfunction filterGraph(graph, criteria, _options) {\n  const input = isObject(graph) ? graph : {}\n  const spec = isObject(criteria) ? criteria : {}\n  const allNodes = Array.isArray(input.nodes) ? input.nodes : []\n  const allEdges = Array.isArray(input.edges) ? input.edges : []\n\n  const kindSet = new Set(Array.isArray(spec.kinds) ? spec.kinds.filter((kind) => typeof kind === 'string') : [])\n  const predicateSet = new Set(Array.isArray(spec.predicates) ? spec.predicates.filter((predicate) => typeof predicate === 'string') : [])\n  const directionSpecified = spec.direction === 'out' || spec.direction === 'in' || spec.direction === 'both'\n  const requestedDirection = spec.direction === 'out' || spec.direction === 'in' ? spec.direction : 'both'\n  const anchorId = typeof spec.anchorId === 'string' ? spec.anchorId : ''\n  const hasAnchor = anchorId !== '' && allNodes.some((node) => isObject(node) && node.id === anchorId)\n  // Direction filtering only runs when the caller explicitly asks for it and an\n  // anchor exists. With an anchor all three directions are meaningful --\n  // including 'both', which keeps the anchor's direct in+out relations.\n  const directionActive = hasAnchor && directionSpecified\n  const kindsActive = kindSet.size > 0\n  const predicatesActive = predicateSet.size > 0\n  const relationActive = predicatesActive || directionActive\n\n  function nodeAllowed(node) {\n    if (!kindsActive) return true\n    return kindSet.has(node.kind)\n  }\n\n  const keptNodeIds = new Set()\n  const keptNodes = []\n  for (const node of allNodes) {\n    if (!isObject(node) || typeof node.id !== 'string') continue\n    if (node.id === anchorId || nodeAllowed(node)) {\n      keptNodeIds.add(node.id)\n      keptNodes.push(node)\n    }\n  }\n\n  function edgeAllowed(edge) {\n    if (!predicatesActive) return true\n    return predicateSet.has(edge.p)\n  }\n\n  const predicateEdges = allEdges.filter((edge) =>\n    isObject(edge) &&\n    keptNodeIds.has(edge.source) &&\n    keptNodeIds.has(edge.target) &&\n    edgeAllowed(edge))\n\n  // Direction filters direct relation edges relative to the anchor (1 hop).\n  // The filter layer never traverses: multi-hop expansion belongs to\n  // exploreNeighborhood, which re-applies the direction on every hop.\n  let finalEdges = predicateEdges\n  if (directionActive) {\n    finalEdges = predicateEdges.filter((edge) => {\n      if (requestedDirection === 'out') return edge.source === anchorId\n      if (requestedDirection === 'in') return edge.target === anchorId\n      return edge.source === anchorId || edge.target === anchorId\n    })\n  }\n\n  let finalNodes = keptNodes\n  if (relationActive) {\n    const incident = new Set()\n    for (const edge of finalEdges) {\n      incident.add(edge.source)\n      incident.add(edge.target)\n    }\n    finalNodes = keptNodes.filter((node) => node.id === anchorId || incident.has(node.id))\n  }\n\n  const stats = statsFor(finalNodes, finalEdges, input.stats && input.stats.triples)\n  stats.totalNodes = allNodes.length\n  stats.totalEdges = allEdges.length\n\n  let hiddenByKindNodes = 0\n  for (const node of allNodes) {\n    if (!isObject(node) || typeof node.id !== 'string' || node.id === anchorId) continue\n    if (!nodeAllowed(node)) hiddenByKindNodes += 1\n  }\n  let hiddenByPredicateEdges = 0\n  for (const edge of allEdges) {\n    if (!isObject(edge)) continue\n    if (!edgeAllowed(edge)) hiddenByPredicateEdges += 1\n  }\n  let hiddenByDirectionEdges = 0\n  if (directionActive) {\n    for (const edge of allEdges) {\n      if (!isObject(edge)) continue\n      if (!edgeAllowed(edge)) continue\n      if (!keptNodeIds.has(edge.source) || !keptNodeIds.has(edge.target)) continue\n      let incident\n      if (requestedDirection === 'out') incident = edge.source === anchorId\n      else if (requestedDirection === 'in') incident = edge.target === anchorId\n      else incident = edge.source === anchorId || edge.target === anchorId\n      if (!incident) hiddenByDirectionEdges += 1\n    }\n  }\n\n  const hidden = {\n    nodes: allNodes.length - finalNodes.length,\n    edges: allEdges.length - finalEdges.length,\n    byKind: { nodes: hiddenByKindNodes },\n    byPredicate: { edges: hiddenByPredicateEdges },\n    byDirection: { edges: hiddenByDirectionEdges },\n  }\n\n  const projectedGraph = {\n    nodes: finalNodes,\n    edges: finalEdges,\n    stats,\n    warnings: Array.isArray(input.warnings) ? input.warnings.slice() : [],\n    source: isObject(input.source) ? input.source : null,\n    truncation: isObject(input.truncation) ? input.truncation : null,\n  }\n\n  return { nodes: finalNodes, edges: finalEdges, stats, hidden, graph: projectedGraph }\n}\n\n// ---------------------------------------------------------------------------\n// Draw budget (L4, design §8 / spec \"绘制预算\")\n// ---------------------------------------------------------------------------\n\n/**\n * Deterministic drawing projection: keep at most `maxEdges` distinct edges\n * (optionally bounded further by `maxElements`, where one element is one node\n * plus one edge). The result is display-only: search, exploration, details and\n * totals must keep reading the retained full graph (L1).\n *\n * Priority (design §8.3): edges incident to `priorityIds` (selected node /\n * search hit) first, then higher parallel `count`, then edge id lexicographic.\n * Output keeps the input edge order so z-order stays stable.\n *\n * @param {any} graph\n * @param {{maxEdges?: number, maxElements?: number, priorityIds?: string[]}} [budget]\n * @returns {{nodes: any[], edges: any[], stats: {keptEdges: number, hiddenEdges: number, totalEdges: number},\n *            truncation: {edges: any}, displayOnly: true}}\n */\nfunction applyEdgeBudget(graph, budget) {\n  const input = isObject(graph) ? graph : {}\n  const spec = isObject(budget) ? budget : {}\n  const allNodes = Array.isArray(input.nodes) ? input.nodes : []\n  const allEdges = Array.isArray(input.edges) ? input.edges : []\n  const requestedMaxEdges = optionalPositiveInteger(spec.maxEdges)\n  const requestedMaxElements = optionalPositiveInteger(spec.maxElements)\n  const prioritySet = new Set(Array.isArray(spec.priorityIds) ? spec.priorityIds.filter((id) => typeof id === 'string') : [])\n\n  let limit = Infinity\n  let reason = null\n  if (requestedMaxEdges > 0) {\n    limit = requestedMaxEdges\n    reason = 'max-edges'\n  }\n  if (requestedMaxElements > 0) {\n    // One element per node plus one per edge is the approximate SVG cost.\n    const elementLimit = Math.max(0, requestedMaxElements - allNodes.length)\n    if (elementLimit < limit) {\n      limit = elementLimit\n      reason = 'max-elements'\n    }\n  }\n\n  const total = allEdges.length\n  let keptEdges = allEdges\n  if (Number.isFinite(limit) && total > limit) {\n    const ranked = allEdges.map((edge, index) => ({ edge, index }))\n    ranked.sort((a, b) => {\n      const aPriority = isPriorityEdge(a.edge, prioritySet) ? 0 : 1\n      const bPriority = isPriorityEdge(b.edge, prioritySet) ? 0 : 1\n      if (aPriority !== bPriority) return aPriority - bPriority\n      const aCount = isObject(a.edge) && Number.isFinite(a.edge.count) ? a.edge.count : 0\n      const bCount = isObject(b.edge) && Number.isFinite(b.edge.count) ? b.edge.count : 0\n      if (aCount !== bCount) return bCount - aCount\n      const aId = isObject(a.edge) && typeof a.edge.id === 'string' ? a.edge.id : ''\n      const bId = isObject(b.edge) && typeof b.edge.id === 'string' ? b.edge.id : ''\n      return compareStrings(aId, bId) || a.index - b.index\n    })\n    const keptIndexes = new Set(ranked.slice(0, limit).map((entry) => entry.index))\n    keptEdges = allEdges.filter((edge, index) => keptIndexes.has(index))\n  }\n\n  const truncation = {\n    edges: budgetRecord(total, keptEdges.length, reason === null ? 'max-edges' : reason),\n  }\n  return {\n    nodes: allNodes,\n    edges: keptEdges,\n    stats: {\n      keptEdges: keptEdges.length,\n      hiddenEdges: total - keptEdges.length,\n      totalEdges: total,\n    },\n    truncation,\n    displayOnly: true,\n  }\n}\n\nfunction isPriorityEdge(edge, prioritySet) {\n  if (prioritySet.size === 0 || !isObject(edge)) return false\n  return prioritySet.has(edge.source) || prioritySet.has(edge.target)\n}\n\n// ---------------------------------------------------------------------------\n// Multi-hop exploration (L3, design §5 / spec \"多跳探索与展开预算\")\n// ---------------------------------------------------------------------------\n\nfunction edgeIdentity(edge) {\n  return stringValue(edge.source) + '\\u0000' + stringValue(edge.p) + '\\u0000' + stringValue(edge.target)\n}\n\nfunction cursorExtension(cursor) {\n  let value = NaN\n  if (typeof cursor === 'number' && Number.isFinite(cursor)) value = cursor\n  else if (isObject(cursor)) {\n    if (Number.isFinite(cursor.extension)) value = cursor.extension\n    else if (Number.isFinite(cursor.extensions)) value = cursor.extensions\n  }\n  if (!Number.isFinite(value) || value < 0) return 0\n  return Math.min(1000, Math.floor(value))\n}\n\n/**\n * Budgeted BFS over an already-filtered graph (L2/L3). Hidden/filtered-away\n * nodes are simply absent, so they can never act as stepping stones.\n *\n *   - depth: clamped to 1..5 (hard cap); request > 5 reports `depthCapped`.\n *   - direction: applies to every hop (out edges / in edges / both).\n *   - predicates: predicate allow-list applied on every hop.\n *   - neighbour order: predicate IRI first, then neighbour node id (deterministic).\n *   - budget: `perHopNodes` new nodes per hop, `maxEdges` global distinct edges.\n *   - cursor: a deterministic effective-budget extension `{ extension: k }`.\n *     Continuing with the returned cursor increases the effective budgets\n *     (base * (k + 1)), so a continued result is always a superset of the\n *     previous result with no duplicate nodes/edges; identical input + cursor\n *     gives an identical result.\n *\n * Result: `{ nodes, edges, nodeIds, stats, truncation, truncated, nextCursor,\n * nextBudget, depthCapped, reachedDepthLimit }`. `stats` carries `nodes`,\n * `edges`, `hops`, `depth`, `totalNodes`, `totalEdges`, `perHopNodes`,\n * `maxEdges`, `extension`, `depthLimit`; `truncation.{nodes,edges}` are\n * `{ total, kept, truncated, reason }` records where `total` is the unbudgeted\n * expansion available within the requested depth (so the UI can show \"已展开\n * X / 共 Y\"). `truncated` is true when a budget cut the expansion or the\n * requested depth exceeded the hard cap; `nextCursor` is non-null only for\n * budget truncation.\n *\n * @param {any} graph\n * @param {{startId?: string, depth?: number, direction?: 'out'|'in'|'both',\n *          predicates?: string[], budget?: {perHopNodes?: number, maxEdges?: number},\n *          cursor?: number|{extension?: number}}} [options]\n */\nfunction exploreNeighborhood(graph, options) {\n  const input = isObject(graph) ? graph : {}\n  const opts = isObject(options) ? options : {}\n  const allNodes = Array.isArray(input.nodes) ? input.nodes : []\n  const allEdges = Array.isArray(input.edges) ? input.edges : []\n  const nodeById = new Map()\n  for (const node of allNodes) {\n    if (isObject(node) && typeof node.id === 'string' && !nodeById.has(node.id)) nodeById.set(node.id, node)\n  }\n\n  const requestedDepth = Number.isFinite(opts.depth) ? Math.floor(opts.depth) : 1\n  const depth = Math.max(1, Math.min(5, requestedDepth))\n  const depthCapped = requestedDepth > 5\n  const direction = opts.direction === 'out' || opts.direction === 'in' ? opts.direction : 'both'\n  const predicateSet = new Set(Array.isArray(opts.predicates)\n    ? opts.predicates.filter((predicate) => typeof predicate === 'string')\n    : [])\n  const budgetOptions = isObject(opts.budget) ? opts.budget : {}\n  const basePerHopNodes = positiveInteger(budgetOptions.perHopNodes, 300)\n  const baseMaxEdges = positiveInteger(budgetOptions.maxEdges, 800)\n  const extension = cursorExtension(opts.cursor)\n  const perHopNodes = basePerHopNodes * (1 + extension)\n  const maxEdges = baseMaxEdges * (1 + extension)\n\n  const stats = {\n    nodes: 0,\n    edges: 0,\n    hops: 0,\n    depth,\n    requestedDepth,\n    totalNodes: nodeById.size,\n    totalEdges: allEdges.length,\n    perHopNodes,\n    maxEdges,\n    extension,\n    depthLimit: 5,\n  }\n\n  const startId = typeof opts.startId === 'string' ? opts.startId : ''\n  if (!nodeById.has(startId)) {\n    return {\n      nodes: [],\n      edges: [],\n      nodeIds: [],\n      stats,\n      truncation: {\n        nodes: budgetRecord(0, 0, null),\n        edges: budgetRecord(0, 0, null),\n      },\n      truncated: false,\n      nextCursor: null,\n      nextBudget: null,\n      depthCapped,\n      reachedDepthLimit: false,\n    }\n  }\n\n  const outAdjacency = new Map()\n  const inAdjacency = new Map()\n  for (const id of nodeById.keys()) {\n    outAdjacency.set(id, [])\n    inAdjacency.set(id, [])\n  }\n  for (const edge of allEdges) {\n    if (!isObject(edge)) continue\n    if (!nodeById.has(edge.source) || !nodeById.has(edge.target)) continue\n    if (predicateSet.size > 0 && !predicateSet.has(edge.p)) continue\n    const p = stringValue(edge.p)\n    outAdjacency.get(edge.source).push({ edge, p, other: edge.target })\n    inAdjacency.get(edge.target).push({ edge, p, other: edge.source })\n  }\n\n  function byPredicateThenNode(a, b) {\n    return compareStrings(a.p, b.p) || compareStrings(a.other, b.other)\n  }\n  for (const list of outAdjacency.values()) list.sort(byPredicateThenNode)\n  for (const list of inAdjacency.values()) list.sort(byPredicateThenNode)\n\n  function candidatesFor(currentId) {\n    if (direction === 'out') return outAdjacency.get(currentId) || []\n    if (direction === 'in') return inAdjacency.get(currentId) || []\n    const outgoing = outAdjacency.get(currentId) || []\n    const incoming = inAdjacency.get(currentId) || []\n    if (outgoing.length === 0) return incoming\n    if (incoming.length === 0) return outgoing\n    const merged = outgoing.concat(incoming)\n    merged.sort(byPredicateThenNode)\n    const seen = new Set()\n    const unique = []\n    for (const candidate of merged) {\n      const key = edgeIdentity(candidate.edge)\n      if (seen.has(key)) continue\n      seen.add(key)\n      unique.push(candidate)\n    }\n    return unique\n  }\n\n  function runBfs(perHopLimit, edgeLimit) {\n    const included = new Set([startId])\n    const nodeOrder = [startId]\n    const includedEdges = []\n    const seenEdgeKeys = new Set()\n    let frontier = [startId]\n    let hops = 0\n    let truncated = false\n    let stopReason = null\n\n    for (let hop = 1; hop <= depth && stopReason === null; hop += 1) {\n      const nextFrontier = []\n      let addedInHop = 0\n      outer: for (const current of frontier) {\n        const candidates = candidatesFor(current)\n        for (const candidate of candidates) {\n          const key = edgeIdentity(candidate.edge)\n          const neighborId = candidate.other\n          if (included.has(neighborId)) {\n            if (seenEdgeKeys.has(key)) continue\n            if (includedEdges.length >= edgeLimit) {\n              truncated = true\n              stopReason = 'max-edges'\n              break outer\n            }\n            seenEdgeKeys.add(key)\n            includedEdges.push(candidate.edge)\n            continue\n          }\n          if (addedInHop >= perHopLimit) {\n            truncated = true\n            stopReason = 'per-hop-nodes'\n            break outer\n          }\n          if (includedEdges.length >= edgeLimit) {\n            truncated = true\n            stopReason = 'max-edges'\n            break outer\n          }\n          included.add(neighborId)\n          nodeOrder.push(neighborId)\n          nextFrontier.push(neighborId)\n          addedInHop += 1\n          seenEdgeKeys.add(key)\n          includedEdges.push(candidate.edge)\n        }\n      }\n      if (stopReason !== null) {\n        hops = hop\n        break\n      }\n      if (nextFrontier.length === 0) {\n        hops = hop - 1\n        break\n      }\n      hops = hop\n      frontier = nextFrontier\n    }\n\n    return { nodeOrder, edges: includedEdges, hops, truncated, stopReason }\n  }\n\n  const budgeted = runBfs(perHopNodes, maxEdges)\n  // Only pay for the unbudgeted reference run when a budget actually cut the\n  // expansion; it supplies the \"已展开 X / 共 Y\" totals without changing the\n  // deterministic budgeted result.\n  const unbudgeted = budgeted.truncated ? runBfs(Infinity, Infinity) : budgeted\n\n  const nodes = budgeted.nodeOrder.map((id) => nodeById.get(id))\n  stats.nodes = nodes.length\n  stats.edges = budgeted.edges.length\n  stats.hops = budgeted.hops\n\n  const truncation = {\n    nodes: budgetRecord(unbudgeted.nodeOrder.length, nodes.length, budgeted.stopReason),\n    edges: budgetRecord(unbudgeted.edges.length, budgeted.edges.length, budgeted.stopReason),\n  }\n\n  const nextCursor = budgeted.truncated ? { extension: extension + 1 } : null\n  const reachedDepthLimit = depth >= 5 && budgeted.hops >= 5\n  return {\n    nodes,\n    edges: budgeted.edges,\n    nodeIds: budgeted.nodeOrder,\n    stats,\n    truncation,\n    truncated: budgeted.truncated || depthCapped,\n    nextCursor,\n    nextBudget: nextCursor,\n    depthCapped,\n    reachedDepthLimit,\n  }\n}\n\n// ---------------------------------------------------------------------------\n// Detail connection groups (design §6 / spec \"详情连接分组\")\n// ---------------------------------------------------------------------------\n\n/**\n * Group a node's outgoing/incoming edges by predicate for the detail panel.\n * Read-only, deterministic, computed on demand from the retained full graph\n * (never from the draw-budget projection).\n *\n * Group order: `rdf:type` first, then group edge count descending, then\n * predicate IRI lexicographic. Items within a group are ordered by neighbour\n * node id. Each group keeps at most `maxPerGroup` items (default 10) and\n * reports `hidden` = count - items.length so the panel can offer \"show more\"\n * by re-calling with a larger `maxPerGroup`.\n *\n * @param {any} graph\n * @param {string} nodeId\n * @param {{maxPerGroup?: number}} [options]\n * @returns {{out: any[], in: any[], summary: {outEdges: number, inEdges: number, degree: number}}}\n */\nfunction connectionGroups(graph, nodeId, options) {\n  const input = isObject(graph) ? graph : {}\n  const opts = isObject(options) ? options : {}\n  const allNodes = Array.isArray(input.nodes) ? input.nodes : []\n  const allEdges = Array.isArray(input.edges) ? input.edges : []\n  const maxPerGroup = positiveInteger(opts.maxPerGroup, 10)\n  const nodeById = new Map()\n  for (const node of allNodes) {\n    if (isObject(node) && typeof node.id === 'string' && !nodeById.has(node.id)) nodeById.set(node.id, node)\n  }\n\n  if (typeof nodeId !== 'string' || !nodeById.has(nodeId)) {\n    return { out: [], in: [], summary: { outEdges: 0, inEdges: 0, degree: 0 } }\n  }\n\n  const outGroups = new Map()\n  const inGroups = new Map()\n\n  function addEdge(groupMap, predicate, neighborId, edge) {\n    let group = groupMap.get(predicate)\n    if (group === undefined) {\n      group = {\n        predicate,\n        label: stringValue(edge.label) || localName(predicate) || predicate,\n        count: 0,\n        neighbors: new Map(),\n      }\n      groupMap.set(predicate, group)\n    }\n    group.count += 1\n    if (group.neighbors.has(neighborId)) return\n    const neighbor = nodeById.get(neighborId)\n    group.neighbors.set(neighborId, {\n      id: neighborId,\n      label: stringValue(neighbor && neighbor.label) || localName(neighborId) || neighborId,\n      kind: neighbor && typeof neighbor.kind === 'string' ? neighbor.kind : 'external',\n    })\n  }\n\n  let outEdges = 0\n  let inEdges = 0\n  for (const edge of allEdges) {\n    if (!isObject(edge)) continue\n    const predicate = typeof edge.p === 'string' ? edge.p : ''\n    if (edge.source === nodeId) {\n      outEdges += 1\n      addEdge(outGroups, predicate, edge.target, edge)\n    }\n    if (edge.target === nodeId) {\n      inEdges += 1\n      addEdge(inGroups, predicate, edge.source, edge)\n    }\n  }\n\n  function finalize(groupMap) {\n    const groups = []\n    for (const group of groupMap.values()) {\n      const items = Array.from(group.neighbors.values())\n        .sort((a, b) => compareStrings(a.id, b.id))\n      const keptItems = items.slice(0, maxPerGroup)\n      groups.push({\n        predicate: group.predicate,\n        label: group.label,\n        count: group.count,\n        items: keptItems,\n        hidden: Math.max(0, group.count - keptItems.length),\n      })\n    }\n    groups.sort((a, b) => {\n      const aType = a.predicate === RDF_TYPE ? 0 : 1\n      const bType = b.predicate === RDF_TYPE ? 0 : 1\n      if (aType !== bType) return aType - bType\n      if (a.count !== b.count) return b.count - a.count\n      return compareStrings(a.predicate, b.predicate)\n    })\n    return groups\n  }\n\n  return {\n    out: finalize(outGroups),\n    in: finalize(inGroups),\n    summary: { outEdges, inEdges, degree: outEdges + inEdges },\n  }\n}\n\n// ---------------------------------------------------------------------------\n// Layout\n// ---------------------------------------------------------------------------\n\nfunction positiveInteger(value, fallback) {\n  if (typeof value !== 'number' || !Number.isFinite(value)) return fallback\n  const integer = Math.floor(value)\n  return integer > 0 ? integer : fallback\n}\n\n/** Positive integer or 0 meaning \"budget disabled\". */\nfunction optionalPositiveInteger(value) {\n  if (typeof value !== 'number' || !Number.isFinite(value)) return 0\n  const integer = Math.floor(value)\n  return integer > 0 ? integer : 0\n}\n\nfunction numberOption(value, fallback) {\n  return typeof value === 'number' && Number.isFinite(value) ? value : fallback\n}\n\nfunction finiteOr(value, fallback) {\n  return Number.isFinite(value) ? value : fallback\n}\n\n/** Mulberry32: tiny, fast, deterministic PRNG (never Math.random). */\nfunction mulberry32(seed) {\n  let state = seed >>> 0\n  return function random() {\n    state = (state + 0x6d2b79f5) >>> 0\n    let t = state\n    t = Math.imul(t ^ (t >>> 15), t | 1)\n    t ^= t + Math.imul(t ^ (t >>> 7), t | 61)\n    return ((t ^ (t >>> 14)) >>> 0) / 4294967296\n  }\n}\n\n/** Deterministic per-index pseudo-random value in [0, 1) for cheap sampling. */\nfunction hashUnit(a, b, c) {\n  let value = Math.imul(a + 1, 0x9e3779b1)\n  value ^= Math.imul(b + 1, 0x85ebca6b)\n  value ^= Math.imul(c + 1, 0xc2b2ae35)\n  value ^= value >>> 15\n  value = Math.imul(value, 0x2545f491)\n  value ^= value >>> 13\n  return (value >>> 0) / 4294967296\n}\n\nconst layoutNow = typeof performance !== 'undefined' && performance && typeof performance.now === 'function'\n  ? function now() { return performance.now() }\n  : function now() { return Date.now() }\n\n/**\n * Prepare the deterministic layout state shared by `layoutGraph` and\n * `createLayoutTask`: split connected components, seed them on a grid of\n * cells, and allocate all force-pass buffers. Only seeding consumes the seeded\n * PRNG, so stepping the force pass later cannot change the result.\n *\n * @param {any} graph\n * @param {any} options\n * @returns {any} layout state\n */\nfunction prepareLayout(graph, options) {\n  const opts = isObject(options) ? options : {}\n  const width = Math.max(1, numberOption(opts.width, 900))\n  const height = Math.max(1, numberOption(opts.height, 600))\n  const iterations = Math.max(0, Math.min(2000, Math.floor(numberOption(opts.iterations, 320))))\n  const seed = Number.isFinite(opts.seed) ? Math.floor(opts.seed) >>> 0 : 1\n  const requestedPadding = Math.max(0, numberOption(opts.padding, 24))\n  const padding = Math.min(requestedPadding, Math.min(width, height) * 0.45)\n\n  const nodes = isObject(graph) && Array.isArray(graph.nodes) ? graph.nodes : []\n  const edges = isObject(graph) && Array.isArray(graph.edges) ? graph.edges : []\n\n  // Deduplicate ids while preserving input order; the caller normally sends\n  // already-deduped buildGraph output.\n  const ids = []\n  const indexById = new Map()\n  for (const node of nodes) {\n    if (!isObject(node) || typeof node.id !== 'string') continue\n    if (indexById.has(node.id)) continue\n    indexById.set(node.id, ids.length)\n    ids.push(node.id)\n  }\n\n  const count = ids.length\n  if (count === 0) {\n    return { empty: true, single: false, count: 0, ids, width, height, iterations: 0, seed, padding }\n  }\n  if (count === 1) {\n    return { empty: false, single: true, count: 1, ids, width, height, iterations: 0, seed, padding }\n  }\n\n  const adjacency = []\n  for (let i = 0; i < count; i += 1) adjacency.push([])\n  const usableEdges = []\n  for (const edge of edges) {\n    if (!isObject(edge)) continue\n    const source = indexById.get(edge.source)\n    const target = indexById.get(edge.target)\n    if (source === undefined || target === undefined || source === target) continue\n    adjacency[source].push(target)\n    adjacency[target].push(source)\n    usableEdges.push([source, target])\n  }\n\n  // --- connected components -------------------------------------------------\n  const componentOf = new Int32Array(count).fill(-1)\n  const components = []\n  for (let start = 0; start < count; start += 1) {\n    if (componentOf[start] !== -1) continue\n    const componentIndex = components.length\n    const members = [start]\n    componentOf[start] = componentIndex\n    const stack = [start]\n    while (stack.length > 0) {\n      const current = stack.pop()\n      for (const neighbour of adjacency[current]) {\n        if (componentOf[neighbour] !== -1) continue\n        componentOf[neighbour] = componentIndex\n        members.push(neighbour)\n        stack.push(neighbour)\n      }\n    }\n    components.push(members)\n  }\n\n  const placement = components.map((members, index) => ({ members, index }))\n  placement.sort((a, b) => b.members.length - a.members.length || a.members[0] - b.members[0])\n\n  const random = mulberry32(seed)\n  const xs = new Float64Array(count)\n  const ys = new Float64Array(count)\n  const centerX = new Float64Array(components.length)\n  const centerY = new Float64Array(components.length)\n\n  const columns = Math.max(1, Math.ceil(Math.sqrt(components.length)))\n  const rows = Math.max(1, Math.ceil(components.length / columns))\n  const cellWidth = width / columns\n  const cellHeight = height / rows\n  const largest = placement[0].members.length\n  const ideal = Math.max(6, Math.min(0.45 * Math.min(width, height), 0.8 * Math.sqrt((width * height) / count)))\n  const goldenAngle = Math.PI * (3 - Math.sqrt(5))\n\n  for (let slot = 0; slot < placement.length; slot += 1) {\n    const entry = placement[slot]\n    const column = slot % columns\n    const row = Math.floor(slot / columns)\n    const cx = (column + 0.5) * cellWidth\n    const cy = (row + 0.5) * cellHeight\n    centerX[entry.index] = cx\n    centerY[entry.index] = cy\n\n    const members = entry.members\n    const sizeFactor = Math.sqrt(members.length / Math.max(1, largest))\n    const radius = 0.42 * Math.min(cellWidth, cellHeight) * sizeFactor\n    for (let position = 0; position < members.length; position += 1) {\n      const nodeIndex = members[position]\n      // Seeded jitter breaks the perfect rotational symmetry and makes a\n      // different seed produce a different (but still stable) drawing.\n      const angle = position * goldenAngle + (random() - 0.5) * 0.7\n      const distance = radius * Math.sqrt((position + 0.5) / members.length) * (0.9 + random() * 0.2)\n      xs[nodeIndex] = cx + Math.cos(angle) * distance\n      ys[nodeIndex] = cy + Math.sin(angle) * distance\n    }\n  }\n\n  const exactRepulsion = count <= 420\n  const sampleCount = Math.min(count - 1, 28)\n\n  return {\n    empty: false,\n    single: false,\n    count,\n    ids,\n    width,\n    height,\n    iterations,\n    seed,\n    padding,\n    usableEdges,\n    componentOf,\n    centerX,\n    centerY,\n    xs,\n    ys,\n    exactRepulsion,\n    sampleCount,\n    repulsionScale: exactRepulsion ? 1 : (count - 1) / sampleCount,\n    edgeStride: usableEdges.length > 30000 ? Math.ceil(usableEdges.length / 30000) : 1,\n    dispX: new Float64Array(count),\n    dispY: new Float64Array(count),\n    startTemperature: ideal * 0.9,\n    ideal,\n  }\n}\n\n/**\n * Run the Fruchterman-Reingold style force pass for iterations [from, to).\n * The body is the single source of truth shared by the one-shot layout and the\n * stepped layout task, which is what makes them mathematically identical.\n */\nfunction runLayoutIterations(state, from, to) {\n  const count = state.count\n  const xs = state.xs\n  const ys = state.ys\n  const usableEdges = state.usableEdges\n  const edgeStride = state.edgeStride\n  const ideal = state.ideal\n  const componentOf = state.componentOf\n  const centerX = state.centerX\n  const centerY = state.centerY\n  const dispX = state.dispX\n  const dispY = state.dispY\n  const exactRepulsion = state.exactRepulsion\n  const sampleCount = state.sampleCount\n  const repulsionScale = state.repulsionScale\n  const startTemperature = state.startTemperature\n  const seed = state.seed\n  const iterations = state.iterations\n\n  for (let iteration = from; iteration < to; iteration += 1) {\n    dispX.fill(0)\n    dispY.fill(0)\n\n    // Attractive forces along edges (Fruchterman-Reingold f = d^2 / k).\n    for (let index = 0; index < usableEdges.length; index += edgeStride) {\n      const edge = usableEdges[index]\n      const source = edge[0]\n      const target = edge[1]\n      let dx = xs[source] - xs[target]\n      let dy = ys[source] - ys[target]\n      let distance = Math.sqrt(dx * dx + dy * dy)\n      if (distance < 0.01) {\n        dx = (hashUnit(source, target, iteration) - 0.5) * 0.02\n        dy = (hashUnit(target, source, iteration) - 0.5) * 0.02\n        distance = Math.sqrt(dx * dx + dy * dy)\n      }\n      if (!(distance > 1e-9)) {\n        dx = 0.01\n        dy = 0\n        distance = 0.01\n      }\n      const force = Math.min((distance * distance) / ideal, ideal * 4) * edgeStride\n      const ux = dx / distance\n      const uy = dy / distance\n      dispX[source] -= ux * force\n      dispY[source] -= uy * force\n      dispX[target] += ux * force\n      dispY[target] += uy * force\n    }\n\n    // Repulsive forces between nodes.\n    if (exactRepulsion) {\n      for (let i = 0; i < count; i += 1) {\n        for (let j = i + 1; j < count; j += 1) {\n          let dx = xs[i] - xs[j]\n          let dy = ys[i] - ys[j]\n          let distance = Math.sqrt(dx * dx + dy * dy)\n          if (distance < 0.01) {\n            dx = (hashUnit(i, j, iteration) - 0.5) * 0.02\n            dy = (hashUnit(j, i, iteration) - 0.5) * 0.02\n            distance = Math.sqrt(dx * dx + dy * dy)\n          }\n          if (!(distance > 1e-9)) {\n            dx = 0.01\n            dy = 0\n            distance = 0.01\n          }\n          const force = Math.min((ideal * ideal) / distance, ideal * 8)\n          const ux = dx / distance\n          const uy = dy / distance\n          dispX[i] += ux * force\n          dispY[i] += uy * force\n          dispX[j] -= ux * force\n          dispY[j] -= uy * force\n        }\n      }\n    } else {\n      for (let i = 0; i < count; i += 1) {\n        for (let sample = 0; sample < sampleCount; sample += 1) {\n          let j = Math.floor(hashUnit(i, sample, iteration + seed) * count)\n          if (j >= count) j = count - 1\n          if (j === i) continue\n          let dx = xs[i] - xs[j]\n          let dy = ys[i] - ys[j]\n          let distance = Math.sqrt(dx * dx + dy * dy)\n          if (distance < 0.01) {\n            dx = (hashUnit(i, sample, iteration) - 0.5) * 0.02\n            dy = (hashUnit(sample, i, iteration) - 0.5) * 0.02\n            distance = Math.sqrt(dx * dx + dy * dy)\n          }\n          if (!(distance > 1e-9)) {\n            dx = 0.01\n            dy = 0\n            distance = 0.01\n          }\n          const force = Math.min((ideal * ideal) / distance, ideal * 8) * repulsionScale\n          const ux = dx / distance\n          const uy = dy / distance\n          dispX[i] += ux * force\n          dispY[i] += uy * force\n          dispX[j] -= ux * force * 0.25\n          dispY[j] -= uy * force * 0.25\n        }\n      }\n    }\n\n    // Weak gravity towards each component's grid cell centre keeps\n    // disconnected clusters in their own region of the canvas.\n    for (let i = 0; i < count; i += 1) {\n      const component = componentOf[i]\n      dispX[i] += (centerX[component] - xs[i]) * 0.02\n      dispY[i] += (centerY[component] - ys[i]) * 0.02\n    }\n\n    // Cool down and apply a capped displacement.\n    const temperature = startTemperature * (1 - (iteration + 1) / iterations) + ideal * 0.002\n    for (let i = 0; i < count; i += 1) {\n      const dx = dispX[i]\n      const dy = dispY[i]\n      const distance = Math.sqrt(dx * dx + dy * dy)\n      if (!Number.isFinite(distance) || distance < 1e-9) continue\n      const step = Math.min(distance, temperature) / distance\n      const nextX = xs[i] + dx * step\n      const nextY = ys[i] + dy * step\n      if (Number.isFinite(nextX)) xs[i] = nextX\n      if (Number.isFinite(nextY)) ys[i] = nextY\n    }\n  }\n}\n\n/** Scale and centre the solved coordinates into the padded box. */\nfunction finalizeLayout(state) {\n  const count = state.count\n  const xs = state.xs\n  const ys = state.ys\n  const ids = state.ids\n  const width = state.width\n  const height = state.height\n  const padding = state.padding\n\n  let minX = Infinity\n  let maxX = -Infinity\n  let minY = Infinity\n  let maxY = -Infinity\n  for (let i = 0; i < count; i += 1) {\n    if (xs[i] < minX) minX = xs[i]\n    if (xs[i] > maxX) maxX = xs[i]\n    if (ys[i] < minY) minY = ys[i]\n    if (ys[i] > maxY) maxY = ys[i]\n  }\n  if (!Number.isFinite(minX) || !Number.isFinite(maxX) || !Number.isFinite(minY) || !Number.isFinite(maxY)) {\n    minX = maxX = minY = maxY = 0\n  }\n\n  const spanX = maxX - minX\n  const spanY = maxY - minY\n  const availableWidth = Math.max(0, width - padding * 2)\n  const availableHeight = Math.max(0, height - padding * 2)\n  const scaleX = spanX > 1e-9 ? availableWidth / spanX : Infinity\n  const scaleY = spanY > 1e-9 ? availableHeight / spanY : Infinity\n  let scale = Math.min(scaleX, scaleY)\n  if (!Number.isFinite(scale) || scale <= 0) scale = 1\n  const offsetX = (width - spanX * scale) / 2 - minX * scale\n  const offsetY = (height - spanY * scale) / 2 - minY * scale\n  const lowerX = padding\n  const upperX = width - padding\n  const lowerY = padding\n  const upperY = height - padding\n\n  const result = new Array(count)\n  for (let i = 0; i < count; i += 1) {\n    let x = offsetX + xs[i] * scale\n    let y = offsetY + ys[i] * scale\n    if (!Number.isFinite(x)) x = width / 2\n    if (!Number.isFinite(y)) y = height / 2\n    x = Math.min(upperX, Math.max(lowerX, x))\n    y = Math.min(upperY, Math.max(lowerY, y))\n    result[i] = { id: ids[i], x, y, vx: 0, vy: 0 }\n  }\n  return result\n}\n\nfunction singlePoint(state) {\n  return [{ id: state.ids[0], x: state.width / 2, y: state.height / 2, vx: 0, vy: 0 }]\n}\n\n/**\n * Deterministic force-directed layout in a width x height box.\n *\n * The graph is split into connected components, components are seeded on a\n * grid of cells (so they cannot collapse onto each other), and each cell gets\n * a phyllotaxis seed. A Fruchterman-Reingold style pass then runs with:\n *   - attractive forces along edges,\n *   - repulsive forces between nodes (exact for small graphs, deterministic\n *     sampling for large ones so 1200 nodes stay interactive),\n *   - a weak pull towards the component's grid cell centre,\n *   - a linear cooling schedule and a per-iteration displacement cap.\n * The result is finally scaled and centred into the padded box.\n *\n * Same graph + same seed => byte-identical positions.\n *\n * @param {any} graph\n * @param {{width?: number, height?: number, iterations?: number, seed?: number, padding?: number}} [options]\n * @returns {{id: string, x: number, y: number, vx: number, vy: number}[]}\n */\nfunction layoutGraph(graph, options) {\n  const state = prepareLayout(graph, options)\n  if (state.empty) return []\n  if (state.single) return singlePoint(state)\n  runLayoutIterations(state, 0, state.iterations)\n  return finalizeLayout(state)\n}\n\n/**\n * Chunked, cancellable layout task used when layout must not block the main\n * thread (design §3.4). It shares `prepareLayout` / `runLayoutIterations` /\n * `finalizeLayout` with `layoutGraph`, so running it to completion yields\n * mathematically identical positions (same seed, iteration order and sampling\n * decisions; a Node test asserts deep equality).\n *\n * @param {any} graph\n * @param {{width?: number, height?: number, iterations?: number, seed?: number, padding?: number}} [options]\n * @returns {{step: (maxMillis?: number) => {done: boolean, progress: number, canceled?: boolean},\n *            result: () => any[]|null, cancel: () => void}}\n */\nfunction createLayoutTask(graph, options) {\n  const state = prepareLayout(graph, options)\n  let next = 0\n  let done = state.empty || state.single || state.iterations === 0\n  let positions = null\n  if (state.empty) positions = []\n  else if (state.single) positions = singlePoint(state)\n  else if (done) positions = finalizeLayout(state)\n  let progress = done ? 1 : 0\n  let canceled = false\n\n  function step(maxMillis) {\n    if (canceled) return { done: true, progress: 1, canceled: true }\n    if (done) return { done: true, progress: 1 }\n    const budget = typeof maxMillis === 'number' && Number.isFinite(maxMillis) ? maxMillis : 8\n    const started = layoutNow()\n    while (next < state.iterations) {\n      runLayoutIterations(state, next, next + 1)\n      next += 1\n      if (budget <= 0) break\n      if (layoutNow() - started >= budget) break\n    }\n    progress = Math.min(1, next / state.iterations)\n    if (next >= state.iterations) {\n      positions = finalizeLayout(state)\n      done = true\n      progress = 1\n      return { done: true, progress }\n    }\n    return { done: false, progress }\n  }\n\n  function result() {\n    return positions\n  }\n\n  function cancel() {\n    canceled = true\n    done = true\n    progress = 1\n    positions = null\n  }\n\n  return { step, result, cancel }\n}\n\n// ==== src/ontology-workspace.js ====\n/**\n * Multi-file ontology workspace: source records, bounded L0 storage and the\n * merged statement index that the graph model renders.\n *\n * This module is plain ECMAScript and is concatenated into the Client bundle\n * and the embedded Worker (see build/build.mjs) as well as imported directly\n * by Node tests. Like `ontology-job.js` it resolves the few helpers that live\n * in sibling modules through explicit injection or the shared closure, so the\n * module stays import-free:\n *\n *   createWorkspace({ buildGraph, identity })\n *   addSource(workspace, input)       // input.parsed is a parseOntology result\n *   removeSource(workspace, sourceId)\n *   replaceSource(workspace, sourceId, input)\n *   workspaceAdmission(workspace, byteSize)\n *   composeWorkspaceGraph(workspace, options)\n *   workspaceSummary(workspace)\n *\n * Layers: this module owns L0 (bounded parsed statements and their sources).\n * The graph model derives L1 (bounded node-link model), the view filters it to\n * L2, exploration is L3 and the drawn edge budget is L4. Nothing here infers a\n * source position: statements only say which file they came from.\n */\n\n/** Candidate admission limits. They are tuned by benchmarks, not contracts. */\nconst WORKSPACE_LIMITS = Object.freeze({\n  maxFiles: 16,\n  maxTotalSourceBytes: 24 * 1024 * 1024,\n  maxOccurrences: 120000,\n  maxTriplesPerSource: 120000,\n  degradedMaxOccurrences: 60000,\n})\n\nconst WORKSPACE_STATUS = Object.freeze({\n  READY: 'ready',\n  PARTIAL: 'partial',\n  EMPTY: 'empty',\n  ERROR: 'error',\n})\n\n/** UTF-8 byte length of a string, falling back to code units. */\nfunction workspaceByteLength(text) {\n  if (typeof text !== 'string') return 0\n  try {\n    if (typeof TextEncoder === 'function') return new TextEncoder().encode(text).length\n  } catch (error) {\n    // fall through to code units\n  }\n  return text.length\n}\n\n/** Resolve the graph builder from an explicit option or the bundle closure. */\nfunction resolveWorkspaceBuildGraph(explicit) {\n  if (typeof explicit === 'function') return explicit\n  try {\n    if (typeof buildGraph === 'function') return buildGraph\n  } catch (error) {\n    // no graph model in this scope\n  }\n  try {\n    if (typeof globalThis === 'object' && globalThis &&\n      typeof globalThis.buildGraph === 'function') return globalThis.buildGraph\n  } catch (error) {\n    // ignored\n  }\n  return null\n}\n\n/** Resolve identity helpers from an explicit option or the bundle closure. */\nfunction resolveWorkspaceIdentity(explicit) {\n  if (explicit && typeof explicit.entityKeyForTerm === 'function' &&\n    typeof explicit.statementIdFor === 'function') {\n    return explicit\n  }\n  try {\n    if (typeof entityKeyForTerm === 'function' && typeof statementIdFor === 'function') {\n      return {\n        entityKeyForTerm: entityKeyForTerm,\n        statementIdFor: statementIdFor,\n        graphIdentityFor: graphIdentityFor,\n      }\n    }\n  } catch (error) {\n    // no identity module in this scope\n  }\n  return null\n}\n\nfunction workspaceLimits(limits) {\n  const input = limits && typeof limits === 'object' ? limits : {}\n  const read = (value, fallback) => (\n    typeof value === 'number' && Number.isFinite(value) && value > 0\n      ? Math.floor(value)\n      : fallback\n  )\n  return {\n    maxFiles: read(input.maxFiles, WORKSPACE_LIMITS.maxFiles),\n    maxTotalSourceBytes: read(input.maxTotalSourceBytes, WORKSPACE_LIMITS.maxTotalSourceBytes),\n    maxOccurrences: read(input.maxOccurrences, WORKSPACE_LIMITS.maxOccurrences),\n    maxTriplesPerSource: read(input.maxTriplesPerSource, WORKSPACE_LIMITS.maxTriplesPerSource),\n    degradedMaxOccurrences: read(input.degradedMaxOccurrences, WORKSPACE_LIMITS.degradedMaxOccurrences),\n  }\n}\n\n/** Total accepted bytes of the sources that still count against the budget. */\nfunction workspaceUsedBytes(workspace) {\n  let total = 0\n  for (const source of workspace.sources) total += Number(source.byteSize) || 0\n  return total\n}\n\n/** Total accepted statement occurrences. */\nfunction workspaceUsedOccurrences(workspace) {\n  let total = 0\n  for (const source of workspace.sources) total += Number(source.occurrenceCount) || 0\n  return total\n}\n\n/**\n * Create an empty workspace.\n * @param {{limits?: object, buildGraph?: Function, identity?: object}} [options]\n */\nfunction createWorkspace(options) {\n  const opts = options && typeof options === 'object' ? options : {}\n  return {\n    limits: workspaceLimits(opts.limits),\n    buildGraph: resolveWorkspaceBuildGraph(opts.buildGraph),\n    identity: resolveWorkspaceIdentity(opts.identity),\n    revision: 0,\n    nextSourceNumber: 1,\n    sources: [],\n  }\n}\n\n/**\n * Ask whether one more source of `byteSize` bytes can be parsed and admitted.\n * The caller passes `maxTriples` to the parser; the workspace then re-checks\n * the real occurrence count when the parse result arrives.\n * @returns {{allowed: boolean, maxTriples: number, reason: string|null}}\n */\nfunction workspaceAdmission(workspace, byteSize) {\n  const state = workspace || createWorkspace()\n  const limits = state.limits\n  const bytes = Math.max(0, Number(byteSize) || 0)\n  if (state.sources.length >= limits.maxFiles) {\n    return { allowed: false, maxTriples: 0, reason: 'file-limit' }\n  }\n  if (workspaceUsedBytes(state) + bytes > limits.maxTotalSourceBytes) {\n    return { allowed: false, maxTriples: 0, reason: 'byte-budget' }\n  }\n  const remaining = limits.maxOccurrences - workspaceUsedOccurrences(state)\n  if (remaining <= 0) {\n    return { allowed: false, maxTriples: 0, reason: 'occurrence-budget' }\n  }\n  return {\n    allowed: true,\n    maxTriples: Math.min(limits.maxTriplesPerSource, remaining),\n    reason: null,\n  }\n}\n\n/** Derive the presentation status of one parsed source. */\nfunction workspaceSourceStatus(parsed, text) {\n  if (!parsed || typeof parsed !== 'object') return WORKSPACE_STATUS.ERROR\n  const triples = Array.isArray(parsed.triples) ? parsed.triples : []\n  const errors = Array.isArray(parsed.errors) ? parsed.errors : []\n  if (triples.length === 0) {\n    if (typeof text === 'string' && text.trim() !== '' && errors.length > 0) {\n      return WORKSPACE_STATUS.ERROR\n    }\n    return WORKSPACE_STATUS.EMPTY\n  }\n  const stats = parsed.stats && typeof parsed.stats === 'object' ? parsed.stats : {}\n  if (stats.truncated || errors.length > 0) return WORKSPACE_STATUS.PARTIAL\n  return WORKSPACE_STATUS.READY\n}\n\n/** Copy only what L0 and the UI need from one parse result. */\nfunction workspaceParsedSnapshot(parsed) {\n  const input = parsed && typeof parsed === 'object' ? parsed : {}\n  const stats = input.stats && typeof input.stats === 'object' ? input.stats : {}\n  return {\n    format: typeof input.format === 'string' ? input.format : '',\n    prefixes: input.prefixes && typeof input.prefixes === 'object' ? input.prefixes : {},\n    base: typeof input.base === 'string' ? input.base : '',\n    baseSource: typeof input.baseSource === 'string' ? input.baseSource : 'none',\n    triples: Array.isArray(input.triples) ? input.triples : [],\n    diagnostics: Array.isArray(input.diagnostics) ? input.diagnostics : [],\n    warnings: Array.isArray(input.warnings) ? input.warnings : [],\n    errors: Array.isArray(input.errors) ? input.errors : [],\n    stats: {\n      tripleCount: Number(stats.tripleCount) || (Array.isArray(input.triples) ? input.triples.length : 0),\n      truncated: !!stats.truncated,\n      truncation: stats.truncation || null,\n    },\n  }\n}\n\n/**\n * Add one parsed source. The caller parses first (with `workspaceAdmission`),\n * so this transaction only validates budgets and records the source.\n * @returns {{workspace: object, status: string, source: object|null, reason: string|null}}\n */\nfunction addSource(workspace, input) {\n  const state = workspace || createWorkspace()\n  const request = input && typeof input === 'object' ? input : {}\n  const parsed = request.parsed\n  const text = typeof request.text === 'string' ? request.text : ''\n  const byteSize = Number.isFinite(request.byteSize)\n    ? Math.max(0, Number(request.byteSize))\n    : (typeof request.text === 'string' ? workspaceByteLength(text) : 0)\n  const admission = workspaceAdmission(state, byteSize)\n  if (!admission.allowed) {\n    return { workspace: state, status: 'rejected', source: null, reason: admission.reason }\n  }\n  const snapshot = workspaceParsedSnapshot(parsed)\n  if (snapshot.triples.length > admission.maxTriples) {\n    // The parser ignored the admission limit; never admit more than budgeted.\n    return { workspace: state, status: 'rejected', source: null, reason: 'occurrence-budget' }\n  }\n  const status = typeof request.error === 'string' && request.error\n    ? WORKSPACE_STATUS.ERROR\n    : workspaceSourceStatus(parsed, text)\n  const sourceId = typeof request.sourceId === 'string' && request.sourceId\n    ? request.sourceId\n    : 'src' + state.nextSourceNumber\n  const revision = Number.isFinite(request.revision) && request.revision > 0\n    ? Math.floor(request.revision)\n    : 1\n  const record = {\n    sourceId: sourceId,\n    origin: request.origin === 'browser' ? 'browser' : 'host',\n    displayName: typeof request.displayName === 'string' ? request.displayName : '',\n    navigationAddress: typeof request.navigationAddress === 'string' ? request.navigationAddress : null,\n    absolutePath: typeof request.absolutePath === 'string' && request.absolutePath\n      ? request.absolutePath\n      : null,\n    rdfBase: typeof request.rdfBase === 'string' ? request.rdfBase : '',\n    format: typeof request.format === 'string' && request.format\n      ? request.format\n      : snapshot.format,\n    revision: revision,\n    status: status,\n    byteSize: byteSize,\n    occurrenceCount: snapshot.triples.length,\n    error: typeof request.error === 'string' ? request.error : null,\n    stale: false,\n    parsed: snapshot,\n    addedOrder: state.sources.length,\n  }\n  const next = Object.assign({}, state, {\n    sources: state.sources.concat([record]),\n    revision: state.revision + 1,\n    nextSourceNumber: sourceId === 'src' + state.nextSourceNumber\n      ? state.nextSourceNumber + 1\n      : state.nextSourceNumber,\n  })\n  return { workspace: next, status: status, source: record, reason: null }\n}\n\n/** Remove one source; entities only it contributed disappear with it. */\nfunction removeSource(workspace, sourceId) {\n  const state = workspace || createWorkspace()\n  const remaining = state.sources.filter((source) => source.sourceId !== sourceId)\n  if (remaining.length === state.sources.length) return { workspace: state, removed: false }\n  return {\n    workspace: Object.assign({}, state, { sources: remaining, revision: state.revision + 1 }),\n    removed: true,\n  }\n}\n\n/**\n * Atomically replace one source with a newly parsed version. A rejected\n * candidate leaves the previous version untouched (no partial state).\n */\nfunction replaceSource(workspace, sourceId, input) {\n  const state = workspace || createWorkspace()\n  const index = state.sources.findIndex((source) => source.sourceId === sourceId)\n  if (index < 0) {\n    return { workspace: state, status: 'missing', source: null, reason: 'unknown-source' }\n  }\n  const previous = state.sources[index]\n  const request = Object.assign({}, input && typeof input === 'object' ? input : {})\n  // A failed read or a missing parse result must not replace good data.\n  if (typeof request.error === 'string' && request.error) {\n    return { workspace: state, status: 'rejected', source: previous, reason: 'read-failed' }\n  }\n  if (!request.parsed || typeof request.parsed !== 'object' ||\n    !Array.isArray(request.parsed.triples)) {\n    return { workspace: state, status: 'rejected', source: previous, reason: 'missing-parse' }\n  }\n  const staged = Object.assign({}, state, {\n    sources: state.sources.slice(0, index).concat(state.sources.slice(index + 1)),\n    revision: state.revision,\n  })\n  request.sourceId = sourceId\n  request.revision = (Number(previous.revision) || 1) + 1\n  if (request.displayName === undefined) request.displayName = previous.displayName\n  if (request.origin === undefined) request.origin = previous.origin\n  if (request.navigationAddress === undefined) request.navigationAddress = previous.navigationAddress\n  if (request.absolutePath === undefined) request.absolutePath = previous.absolutePath\n  const added = addSource(staged, request)\n  if (added.status === 'rejected') {\n    return { workspace: state, status: 'rejected', source: previous, reason: added.reason }\n  }\n  const restored = staged.sources.slice()\n  restored.splice(index, 0, added.source)\n  return {\n    workspace: Object.assign({}, added.workspace, {\n      sources: restored,\n      revision: state.revision + 1,\n    }),\n    status: added.status,\n    source: added.source,\n    reason: null,\n  }\n}\n\n/** Mark one source as changed on disk without dropping its last good data. */\nfunction markSourceStale(workspace, sourceId, version) {\n  const state = workspace || createWorkspace()\n  let changed = false\n  const sources = state.sources.map((source) => {\n    if (source.sourceId !== sourceId) return source\n    if (version !== undefined && source.version === version) return source\n    changed = true\n    return Object.assign({}, source, { stale: true, version: version })\n  })\n  if (!changed) return { workspace: state, changed: false }\n  return {\n    workspace: Object.assign({}, state, { sources: sources, revision: state.revision + 1 }),\n    changed: true,\n  }\n}\n\n/** Valid source ids for a selection; an empty/absent selection means all. */\nfunction selectSourceIds(workspace, sourceIds) {\n  const state = workspace || createWorkspace()\n  const wanted = Array.isArray(sourceIds) ? new Set(sourceIds.filter((id) => typeof id === 'string')) : null\n  if (!wanted || wanted.size === 0) return state.sources.map((source) => source.sourceId)\n  return state.sources\n    .filter((source) => wanted.has(source.sourceId))\n    .map((source) => source.sourceId)\n}\n\n/** Public source summaries for the source panel (never the parsed triples). */\nfunction workspaceSummary(workspace) {\n  const state = workspace || createWorkspace()\n  return state.sources.map((source) => ({\n    sourceId: source.sourceId,\n    origin: source.origin,\n    displayName: source.displayName,\n    navigationAddress: source.navigationAddress,\n    absolutePath: source.absolutePath,\n    format: source.format,\n    revision: source.revision,\n    status: source.status,\n    byteSize: source.byteSize,\n    tripleCount: source.occurrenceCount,\n    errorCount: source.parsed && Array.isArray(source.parsed.errors) ? source.parsed.errors.length : 0,\n    warningCount: source.parsed && Array.isArray(source.parsed.warnings)\n      ? source.parsed.warnings.length\n      : 0,\n    truncated: !!(source.parsed && source.parsed.stats && source.parsed.stats.truncated),\n    stale: !!source.stale,\n    base: source.parsed ? source.parsed.base : '',\n  }))\n}\n\n/** Workspace-level counters derived from the accepted sources. */\nfunction workspaceTotals(workspace) {\n  const state = workspace || createWorkspace()\n  return {\n    files: state.sources.length,\n    bytes: workspaceUsedBytes(state),\n    occurrences: workspaceUsedOccurrences(state),\n    maxFiles: state.limits.maxFiles,\n    maxTotalSourceBytes: state.limits.maxTotalSourceBytes,\n    maxOccurrences: state.limits.maxOccurrences,\n    revision: state.revision,\n  }\n}\n\n/** Statement key: every term identity plus the statement graph identity. */\nfunction workspaceStatementKey(identity, terms, graphKey) {\n  return [\n    terms.s,\n    terms.p,\n    terms.oKind,\n    terms.o,\n    terms.dt || '',\n    terms.lang || '',\n    graphKey,\n    terms.literalTruncated ? 'truncated' : '',\n  ].join('\\u0001')\n}\n\n/**\n * Merge the selected sources into statement records with occurrences.\n * Identical statements (same terms and graph identity) merge; every\n * occurrence keeps its source and revision.\n */\nfunction workspaceMergeRecords(workspace, selectedIds) {\n  const identity = workspace.identity\n  if (!identity) throw new Error('workspace identity helpers are unavailable')\n  const selected = selectedIds ? new Set(selectedIds) : null\n  const records = new Map()\n  const order = []\n  let occurrences = 0\n  for (const source of workspace.sources) {\n    if (selected && !selected.has(source.sourceId)) continue\n    const parsed = source.parsed\n    if (!parsed || !Array.isArray(parsed.triples)) continue\n    const triples = parsed.triples\n    for (let ordinal = 0; ordinal < triples.length; ordinal++) {\n      const triple = triples[ordinal]\n      if (!triple || typeof triple.s !== 'string' || typeof triple.p !== 'string') continue\n      if (triple.o === null || triple.o === undefined) continue\n      const objectKind = triple.oKind === 'literal' || triple.oKind === 'blank'\n        ? triple.oKind\n        : 'iri'\n      const graph = triple.graph && typeof triple.graph === 'object'\n        ? triple.graph\n        : { kind: 'unknown' }\n      const terms = {\n        s: identity.entityKeyForTerm(triple.s, source.sourceId),\n        p: identity.entityKeyForTerm(triple.p, source.sourceId),\n        o: objectKind === 'literal'\n          ? String(triple.o)\n          : identity.entityKeyForTerm(String(triple.o), source.sourceId),\n        oKind: objectKind,\n        dt: typeof triple.dt === 'string' ? triple.dt : undefined,\n        lang: typeof triple.lang === 'string' ? triple.lang : undefined,\n        literalTruncated: !!triple.literalTruncated,\n      }\n      const graphKey = identity.graphIdentityFor(source.sourceId, graph)\n      const key = workspaceStatementKey(identity, terms, graphKey)\n      let record = records.get(key)\n      if (record === undefined) {\n        record = Object.assign({ key: key, statementId: identity.statementIdFor(source.sourceId, ordinal), terms: terms }, {\n          occurrences: [],\n        })\n        records.set(key, record)\n        order.push(record)\n      }\n      record.occurrences.push({\n        sourceId: source.sourceId,\n        revision: source.revision,\n        graph: graph,\n      })\n      occurrences += 1\n    }\n  }\n  return { records: order, occurrences: occurrences }\n}\n\n/**\n * Build the L1 graph for the selected sources (all by default).\n * The graph model receives expanded statement occurrences plus the source\n * table, so node/edge provenance survives without re-parsing anything.\n * @param {{sourceIds?: string[], maxNodes?: number, maxEdges?: number,\n *          maxLiteralsPerNode?: number, maxLiteralLength?: number}} [options]\n */\nfunction composeWorkspaceGraph(workspace, options) {\n  const state = workspace || createWorkspace()\n  const opts = options && typeof options === 'object' ? options : {}\n  const builder = state.buildGraph\n  if (typeof builder !== 'function') {\n    return { error: 'graph-model-unavailable', graph: null, statements: 0, occurrences: 0 }\n  }\n  const selectedIds = opts.sourceIds === undefined\n    ? state.sources.map((source) => source.sourceId)\n    : selectSourceIds(state, opts.sourceIds)\n  const merged = workspaceMergeRecords(state, selectedIds)\n  const statements = []\n  for (const record of merged.records) {\n    for (const occurrence of record.occurrences) {\n      statements.push({\n        s: record.terms.s,\n        p: record.terms.p,\n        o: record.terms.o,\n        oKind: record.terms.oKind,\n        dt: record.terms.dt,\n        lang: record.terms.lang,\n        literalTruncated: record.terms.literalTruncated,\n        graph: occurrence.graph,\n        sourceId: occurrence.sourceId,\n        statementId: record.statementId,\n      })\n    }\n  }\n  const sources = workspaceSummary(state).filter((source) => selectedIds.indexOf(source.sourceId) >= 0)\n  const single = sources.length === 1 ? sources[0] : null\n  const prefixes = {}\n  for (const source of state.sources) {\n    if (selectedIds.indexOf(source.sourceId) < 0) continue\n    if (!source.parsed || !source.parsed.prefixes) continue\n    const keys = Object.keys(source.parsed.prefixes)\n    for (let index = 0; index < keys.length; index++) {\n      const name = keys[index]\n      if (typeof prefixes[name] !== 'string') prefixes[name] = source.parsed.prefixes[name]\n    }\n  }\n  const graph = builder(\n    { prefixes: prefixes, triples: [], sources: sources },\n    {\n      statements: statements,\n      sources: sources,\n      maxNodes: opts.maxNodes,\n      maxEdges: opts.maxEdges,\n      maxLiteralsPerNode: opts.maxLiteralsPerNode,\n      maxLiteralLength: opts.maxLiteralLength,\n      source: single\n        ? {\n            address: single.navigationAddress || single.absolutePath || '',\n            displayName: single.displayName,\n            format: single.format,\n          }\n        : { address: '', displayName: '', format: '' },\n    },\n  )\n  return {\n    graph: graph,\n    statements: merged.records.length,\n    occurrences: merged.occurrences,\n    sourceIds: selectedIds,\n  }\n}\n\n// ==== src/ontology-views.js ====\n/**\n * Semantic projections over the L1 graph: the class/property hierarchy tree\n * and the layered relation view.\n *\n * Both projections are read-only. They never add synthetic RDF entities or\n * assertions to the graph: display references, cycle groups and layout\n * coordinates live only in the projection result. All coordinates are\n * deterministic (stable ordering, no Math.random) and bounded by explicit\n * budgets.\n *\n * Plain ECMAScript: concatenated into the Client bundle and the embedded\n * Worker (see build/build.mjs), and imported directly by Node tests.\n */\n\nconst VIEW_RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type'\nconst VIEW_RDF_PROPERTY = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#Property'\nconst VIEW_RDFS_SUBCLASSOF = 'http://www.w3.org/2000/01/rdf-schema#subClassOf'\nconst VIEW_RDFS_SUBPROPERTYOF = 'http://www.w3.org/2000/01/rdf-schema#subPropertyOf'\nconst VIEW_RDFS_LABEL = 'http://www.w3.org/2000/01/rdf-schema#label'\nconst VIEW_OWL_CLASS = 'http://www.w3.org/2002/07/owl#Class'\nconst VIEW_RDFS_CLASS = 'http://www.w3.org/2000/01/rdf-schema#Class'\nconst VIEW_OWL_OBJECT_PROPERTY = 'http://www.w3.org/2002/07/owl#ObjectProperty'\nconst VIEW_OWL_DATATYPE_PROPERTY = 'http://www.w3.org/2002/07/owl#DatatypeProperty'\n\nconst VIEW_HIERARCHY_DEFAULT_PREDICATE = VIEW_RDFS_SUBCLASSOF\nconst VIEW_GROUP_MARKER = '\\u0000group\\u0000'\n\n/** Default element/expansion budgets (callers may override). */\nconst VIEW_BUDGETS = Object.freeze({\n  maxEntities: 1200,\n  maxRefs: 2000,\n  maxDepth: 12,\n  maxLayers: 200,\n  maxLayerWidth: 80,\n})\n\nfunction viewIsObject(value) {\n  return value !== null && typeof value === 'object'\n}\n\nfunction viewCompare(a, b) {\n  if (a === b) return 0\n  return a < b ? -1 : 1\n}\n\nfunction viewString(value) {\n  return value === null || value === undefined ? '' : String(value)\n}\n\nfunction viewPositive(value, fallback) {\n  if (typeof value === 'number' && Number.isFinite(value) && value > 0) return Math.floor(value)\n  return fallback\n}\n\n/**\n * Iterative Tarjan strongly-connected components.\n *\n * @param {string[]} ids node ids in deterministic order\n * @param {Map<string, string[]>} outAdjacency outgoing edges per id\n * @returns {{componentOf: Map<string, number>, components: string[][]}}\n */\nfunction computeStronglyConnectedComponents(ids, outAdjacency) {\n  const index = new Map()\n  const low = new Map()\n  const onStack = new Set()\n  const stack = []\n  const componentOf = new Map()\n  const components = []\n  let counter = 0\n\n  for (const rootId of ids) {\n    if (index.has(rootId)) continue\n    const frames = [{ id: rootId, next: 0 }]\n    index.set(rootId, counter)\n    low.set(rootId, counter)\n    counter += 1\n    stack.push(rootId)\n    onStack.add(rootId)\n    while (frames.length > 0) {\n      const frame = frames[frames.length - 1]\n      const neighbors = outAdjacency.get(frame.id) || []\n      if (frame.next < neighbors.length) {\n        const nextId = neighbors[frame.next]\n        frame.next += 1\n        if (!index.has(nextId)) {\n          index.set(nextId, counter)\n          low.set(nextId, counter)\n          counter += 1\n          stack.push(nextId)\n          onStack.add(nextId)\n          frames.push({ id: nextId, next: 0 })\n        } else if (onStack.has(nextId)) {\n          low.set(frame.id, Math.min(low.get(frame.id), index.get(nextId)))\n        }\n        continue\n      }\n      frames.pop()\n      if (frames.length > 0) {\n        const parent = frames[frames.length - 1]\n        low.set(parent.id, Math.min(low.get(parent.id), low.get(frame.id)))\n      }\n      if (low.get(frame.id) === index.get(frame.id)) {\n        const component = []\n        let member\n        do {\n          member = stack.pop()\n          onStack.delete(member)\n          component.push(member)\n          componentOf.set(member, components.length)\n        } while (member !== frame.id)\n        components.push(component)\n      }\n    }\n  }\n  return { componentOf, components }\n}\n\n/** Node ids in graph order, plus a lookup for one node by id. */\nfunction viewNodeIndex(graph) {\n  const nodes = viewIsObject(graph) && Array.isArray(graph.nodes) ? graph.nodes : []\n  const byId = new Map()\n  for (const node of nodes) {\n    if (!viewIsObject(node) || typeof node.id !== 'string') continue\n    if (!byId.has(node.id)) byId.set(node.id, node)\n  }\n  return { nodes: Array.from(byId.values()), byId }\n}\n\n/** Class-like candidate ids derived from explicit declarations and hierarchy. */\nfunction viewClassCandidates(byId) {\n  const candidates = new Set()\n  for (const node of byId.values()) {\n    if (node.kind === 'class') candidates.add(node.id)\n  }\n  return candidates\n}\n\n/**\n * Build the class or property hierarchy projection.\n *\n * Mode `class` follows explicit rdfs:subClassOf; mode `property` follows\n * explicit rdfs:subPropertyOf. `rdf:type` never becomes inheritance. The\n * result reports roots, orphan entities, cycles and budget truncation so the\n * view can explain missing structure instead of silently inventing it.\n *\n * @param {any} graph L1 graph\n * @param {{mode?: 'class'|'property', predicate?: string,\n *          maxEntities?: number}} [options]\n */\nfunction buildHierarchy(graph, options) {\n  const opts = viewIsObject(options) ? options : {}\n  const mode = opts.mode === 'property' ? 'property' : 'class'\n  const predicate = typeof opts.predicate === 'string' && opts.predicate\n    ? opts.predicate\n    : (mode === 'property' ? VIEW_RDFS_SUBPROPERTYOF : VIEW_HIERARCHY_DEFAULT_PREDICATE)\n  const maxEntities = viewPositive(opts.maxEntities, VIEW_BUDGETS.maxEntities)\n  const { nodes, byId } = viewNodeIndex(graph)\n  const edges = viewIsObject(graph) && Array.isArray(graph.edges) ? graph.edges : []\n\n  // Candidates are entities the document explicitly declares as classes (or\n  // properties) plus both ends of a hierarchy relation. A node that is only\n  // the object of rdf:type is a vocabulary reference, not a declared class, so\n  // it does not flood the tree with owl:Class / rdfs:Class entries.\n  const declaredTypes = mode === 'property'\n    ? [VIEW_OWL_OBJECT_PROPERTY, VIEW_OWL_DATATYPE_PROPERTY, VIEW_RDF_PROPERTY]\n    : [VIEW_OWL_CLASS, VIEW_RDFS_CLASS]\n  const candidates = new Set()\n  for (const node of nodes) {\n    const types = Array.isArray(node.types) ? node.types : []\n    for (const type of declaredTypes) {\n      if (types.indexOf(type) >= 0) {\n        candidates.add(node.id)\n        break\n      }\n    }\n  }\n  for (const edge of edges) {\n    if (!viewIsObject(edge) || edge.p !== predicate) continue\n    if (typeof edge.source === 'string' && byId.has(edge.source)) candidates.add(edge.source)\n    if (typeof edge.target === 'string' && byId.has(edge.target)) candidates.add(edge.target)\n  }\n\n  // Deterministic budget: keep the entities with the most hierarchy relations,\n  // then the lexicographically smallest id.\n  const relationCount = new Map()\n  for (const id of candidates) relationCount.set(id, 0)\n  for (const edge of edges) {\n    if (!viewIsObject(edge) || edge.p !== predicate) continue\n    if (relationCount.has(edge.source)) relationCount.set(edge.source, relationCount.get(edge.source) + 1)\n    if (relationCount.has(edge.target)) relationCount.set(edge.target, relationCount.get(edge.target) + 1)\n  }\n  let keptIds = Array.from(candidates)\n  keptIds.sort((a, b) => {\n    const diff = (relationCount.get(b) || 0) - (relationCount.get(a) || 0)\n    return diff !== 0 ? diff : viewCompare(a, b)\n  })\n  const entityTruncated = Math.max(0, keptIds.length - maxEntities)\n  keptIds = keptIds.slice(0, maxEntities)\n  const kept = new Set(keptIds)\n\n  const entities = new Map()\n  for (const id of keptIds) {\n    const node = byId.get(id)\n    entities.set(id, {\n      id: id,\n      label: node && typeof node.label === 'string' && node.label ? node.label : id,\n      kind: node ? node.kind : 'external',\n      iri: node && typeof node.iri === 'string' ? node.iri : id,\n      parents: [],\n      children: [],\n      sourceIds: node && viewIsObject(node.provenance) && Array.isArray(node.provenance.sourceIds)\n        ? node.provenance.sourceIds.slice()\n        : [],\n      inCycle: false,\n      orphan: false,\n    })\n  }\n\n  // Child -> parent edge direction. `relationId` points at the real graph edge.\n  for (let index = 0; index < edges.length; index++) {\n    const edge = edges[index]\n    if (!viewIsObject(edge) || edge.p !== predicate) continue\n    if (!kept.has(edge.source) || !kept.has(edge.target)) continue\n    if (edge.source === edge.target) continue\n    const relation = {\n      relationId: typeof edge.id === 'string' ? edge.id : 'edge:' + index,\n      predicate: edge.p,\n      statementIds: Array.isArray(edge.statementIds) ? edge.statementIds.slice() : [],\n      sourceIds: Array.isArray(edge.sourceIds) ? edge.sourceIds.slice() : [],\n      graphs: Array.isArray(edge.graphs) ? edge.graphs.slice() : [],\n    }\n    const child = entities.get(edge.source)\n    const parent = entities.get(edge.target)\n    if (!child || !parent) continue\n    child.parents.push(Object.assign({ parentId: edge.target }, relation))\n    parent.children.push(Object.assign({ childId: edge.source }, relation))\n  }\n\n  // Self loops are cycles too; they stay visible as a cycle mark on the entity.\n  for (const edge of edges) {\n    if (!viewIsObject(edge) || edge.p !== predicate || edge.source !== edge.target) continue\n    const entity = entities.get(edge.source)\n    if (entity) entity.inCycle = true\n  }\n\n  const ids = keptIds.slice()\n  const outAdjacency = new Map()\n  for (const id of ids) outAdjacency.set(id, [])\n  for (const entity of entities.values()) {\n    const parents = entity.parents.map((relation) => relation.parentId).sort(viewCompare)\n    outAdjacency.set(entity.id, parents)\n  }\n  const { componentOf, components } = computeStronglyConnectedComponents(ids, outAdjacency)\n  for (const entity of entities.values()) {\n    const component = components[componentOf.get(entity.id)]\n    if (component.length > 1) entity.inCycle = true\n  }\n\n  const roots = []\n  const cycles = []\n  const orphans = []\n  const componentMembers = new Map()\n  for (const component of components) {\n    if (component.length < 2) continue\n    const members = component.slice().sort(viewCompare)\n    componentMembers.set(component[0], members)\n    for (const id of members) {\n      const entity = entities.get(id)\n      if (entity) entity.componentId = component[0]\n    }\n  }\n  for (const id of ids) {\n    const entity = entities.get(id)\n    if (!entity) continue\n    if (entity.inCycle) {\n      const members = componentMembers.get(id)\n      if (members) {\n        // One group per multi-node SCC, emitted from its first member.\n        if (!cycles.some((cycle) => cycle.id === id)) {\n          const hasIncoming = members.some((memberId) => {\n            const member = entities.get(memberId)\n            return member && member.parents.some((relation) => members.indexOf(relation.parentId) < 0)\n          })\n          cycles.push({ id: id, members: members, hasExternalParent: hasIncoming })\n        }\n        continue\n      }\n      // A self loop marks the entity; with no other structure it stays a\n      // visible root entry so the cycle is reachable.\n      if (entity.parents.length === 0 && entity.children.length === 0) {\n        entity.selfCycle = true\n        roots.push(id)\n      }\n      continue\n    }\n    if (entity.parents.length === 0) {\n      if (entity.children.length === 0) orphans.push(id)\n      else roots.push(id)\n    }\n  }\n  roots.sort(viewCompare)\n  orphans.sort(viewCompare)\n  cycles.sort((a, b) => viewCompare(a.id, b.id))\n\n  let relationCountTotal = 0\n  for (const entity of entities.values()) relationCountTotal += entity.parents.length\n\n  return {\n    mode: mode,\n    predicate: predicate,\n    entities: entities,\n    entityIds: ids,\n    roots: roots,\n    orphans: orphans,\n    cycles: cycles,\n    stats: {\n      entities: entities.size,\n      relations: relationCountTotal,\n      roots: roots.length,\n      orphans: orphans.length,\n      cycles: cycles.length,\n      truncated: entityTruncated,\n      maxEntities: maxEntities,\n    },\n  }\n}\n\n/**\n * Materialize only the expanded paths of a hierarchy into display references.\n *\n * Roots and orphan entries always get one reference. Every child of an\n * expanded entity becomes its own reference, so one entity reached by several\n * paths appears several times while every reference still points at the same\n * entity id. A path that revisits an entity gets a `cycle` reference instead\n * of recursing.\n *\n * @param {ReturnType<typeof buildHierarchy>} hierarchy\n * @param {{expandedIds?: string[], maxRefs?: number, maxDepth?: number}} [options]\n */\nfunction expandHierarchy(hierarchy, options) {\n  const input = viewIsObject(hierarchy) ? hierarchy : { entities: new Map() }\n  const opts = viewIsObject(options) ? options : {}\n  const maxRefs = viewPositive(opts.maxRefs, VIEW_BUDGETS.maxRefs)\n  const maxDepth = viewPositive(opts.maxDepth, VIEW_BUDGETS.maxDepth)\n  const expanded = new Set(Array.isArray(opts.expandedIds) ? opts.expandedIds : [])\n  const entities = input.entities instanceof Map ? input.entities : new Map()\n  const refs = []\n  let truncatedRefs = 0\n\n  function pushRef(entityId, parentRefId, depth, path, relation) {\n    if (refs.length >= maxRefs) {\n      truncatedRefs += 1\n      return null\n    }\n    const entity = entities.get(entityId)\n    if (!entity) return null\n    const cycle = path.indexOf(entityId) >= 0\n    const ref = {\n      refId: 'r' + refs.length,\n      entityId: entityId,\n      parentRefId: parentRefId,\n      depth: depth,\n      cycle: cycle,\n      expanded: !cycle && expanded.has(entityId),\n      childCount: entity.children.length,\n      orphan: !!entity.orphan,\n      inCycle: !!entity.inCycle,\n      label: entity.label,\n      kind: entity.kind,\n    }\n    if (relation) {\n      ref.relationId = relation.relationId\n      ref.statementIds = relation.statementIds\n      ref.sourceIds = relation.sourceIds\n    }\n    refs.push(ref)\n    return ref\n  }\n\n  const queue = []\n  for (const id of input.roots || []) queue.push({ entityId: id, parentRefId: null, depth: 0, path: [], relation: null })\n  for (const cycle of input.cycles || []) {\n    queue.push({\n      entityId: cycle.members[0],\n      parentRefId: null,\n      depth: 0,\n      path: [],\n      relation: null,\n      cycleGroup: cycle.members.slice(),\n    })\n  }\n  for (const id of input.orphans || []) {\n    queue.push({ entityId: id, parentRefId: null, depth: 0, path: [], relation: null, orphan: true })\n  }\n  let cursor = 0\n  while (cursor < queue.length) {\n    const item = queue[cursor]\n    cursor += 1\n    const entity = entities.get(item.entityId)\n    if (!entity) continue\n    const ref = pushRef(item.entityId, item.parentRefId, item.depth, item.path, item.relation)\n    if (!ref) continue\n    if (item.cycleGroup) ref.cycleGroup = item.cycleGroup\n    if (item.orphan) ref.orphan = true\n    if (!ref.expanded || ref.depth >= maxDepth) continue\n    const path = item.path.concat([item.entityId])\n    for (const relation of entity.children) {\n      queue.push({\n        entityId: relation.childId,\n        parentRefId: ref.refId,\n        depth: ref.depth + 1,\n        path: path,\n        relation: relation,\n      })\n    }\n  }\n  return {\n    refs: refs,\n    stats: {\n      refs: refs.length,\n      entities: entities.size,\n      truncated: truncatedRefs,\n      maxRefs: maxRefs,\n    },\n  }\n}\n\n/** Effective predicates of a layered projection (user-selected, else one). */\nfunction viewPredicates(options, fallback) {\n  if (Array.isArray(options.predicates)) {\n    const unique = []\n    for (const value of options.predicates) {\n      if (typeof value === 'string' && value && unique.indexOf(value) < 0) unique.push(value)\n    }\n    if (unique.length > 0) return unique.sort(viewCompare)\n  }\n  return [fallback]\n}\n\n/**\n * Build and lay out the layered relation graph.\n *\n * The selected predicates are projected onto the L1 graph, strongly connected\n * components are contracted into visible groups, and the condensation is\n * layered with a longest-path assignment plus a bounded barycenter sweep.\n * Coordinates are deterministic and limited to the requested canvas.\n *\n * @param {any} graph L1 (or L2) graph\n * @param {{predicates?: string[], orientation?: 'down'|'right',\n *          width?: number, height?: number, maxNodes?: number,\n *          maxLayers?: number}} [options]\n */\nfunction layoutLayeredGraph(graph, options) {\n  const opts = viewIsObject(options) ? options : {}\n  const predicates = viewPredicates(opts, VIEW_RDFS_SUBCLASSOF)\n  const orientation = opts.orientation === 'right' ? 'right' : 'down'\n  const width = viewPositive(opts.width, 900)\n  const height = viewPositive(opts.height, 600)\n  const maxNodes = viewPositive(opts.maxNodes, VIEW_BUDGETS.maxEntities)\n  const maxLayers = viewPositive(opts.maxLayers, VIEW_BUDGETS.maxLayers)\n  const { nodes, byId } = viewNodeIndex(graph)\n  const edges = viewIsObject(graph) && Array.isArray(graph.edges) ? graph.edges : []\n\n  const predicateSet = new Set(predicates)\n  const projected = []\n  const selfLoopEdges = []\n  const used = new Set()\n  for (const edge of edges) {\n    if (!viewIsObject(edge) || !predicateSet.has(edge.p)) continue\n    if (typeof edge.source !== 'string' || typeof edge.target !== 'string') continue\n    if (!byId.has(edge.source) || !byId.has(edge.target)) continue\n    if (edge.source === edge.target) {\n      selfLoopEdges.push(edge)\n      used.add(edge.source)\n      continue\n    }\n    projected.push({ edge: edge, internal: false })\n    used.add(edge.source)\n    used.add(edge.target)\n  }\n\n  let candidates = Array.from(used)\n  candidates.sort(viewCompare)\n  const nodeTruncated = Math.max(0, candidates.length - maxNodes)\n  candidates = candidates.slice(0, maxNodes)\n  const kept = new Set(candidates)\n\n  // Self loops stay visible on their entity; other edges respect the budget.\n  const keptEdges = []\n  for (const item of projected) {\n    if (item.internal) continue\n    if (kept.has(item.edge.source) && kept.has(item.edge.target)) keptEdges.push(item.edge)\n  }\n\n  const adjacency = new Map()\n  for (const id of candidates) adjacency.set(id, [])\n  for (const edge of keptEdges) adjacency.get(edge.source).push(edge.target)\n  const { componentOf, components } = computeStronglyConnectedComponents(candidates, adjacency)\n\n  const groups = []\n  const groupKeyOf = new Map()\n  const displayIdOf = new Map()\n  for (const id of candidates) {\n    const component = components[componentOf.get(id)]\n    if (component.length > 1) {\n      const anchor = component.slice().sort(viewCompare)[0]\n      groupKeyOf.set(id, anchor)\n      displayIdOf.set(id, VIEW_GROUP_MARKER + anchor)\n    } else {\n      displayIdOf.set(id, id)\n    }\n  }\n  const groupAnchors = new Set()\n  for (const id of candidates) {\n    const anchor = groupKeyOf.get(id)\n    if (anchor === undefined || groupAnchors.has(anchor)) continue\n    groupAnchors.add(anchor)\n    groups.push({\n      id: VIEW_GROUP_MARKER + anchor,\n      anchor: anchor,\n      members: components[componentOf.get(anchor)].slice().sort(viewCompare),\n    })\n  }\n  groups.sort((a, b) => viewCompare(a.anchor, b.anchor))\n\n  const displayIds = []\n  for (const group of groups) displayIds.push(group.id)\n  for (const id of candidates) {\n    if (groupKeyOf.has(id)) continue\n    displayIds.push(id)\n  }\n  displayIds.sort(viewCompare)\n  const displayIndex = new Map()\n  for (let index = 0; index < displayIds.length; index++) displayIndex.set(displayIds[index], index)\n\n  // Condensation edges between display nodes.\n  const displayAdjacency = new Map()\n  for (const id of displayIds) displayAdjacency.set(id, [])\n  const crossEdges = []\n  const internalEdges = []\n  for (const edge of keptEdges) {\n    const from = displayIdOf.get(edge.source)\n    const to = displayIdOf.get(edge.target)\n    if (from === to) {\n      internalEdges.push(edge)\n      continue\n    }\n    crossEdges.push(edge)\n    displayAdjacency.get(from).push(to)\n  }\n  // Parallel condensation edges collapse for layering, not for rendering.\n  for (const id of displayIds) {\n    const unique = Array.from(new Set(displayAdjacency.get(id))).sort(viewCompare)\n    displayAdjacency.set(id, unique)\n  }\n\n  // Longest-path layering over the condensation DAG (Kahn order).\n  const indegree = new Map()\n  for (const id of displayIds) indegree.set(id, 0)\n  for (const id of displayIds) {\n    for (const next of displayAdjacency.get(id)) indegree.set(next, indegree.get(next) + 1)\n  }\n  const queue = displayIds.filter((id) => indegree.get(id) === 0)\n  queue.sort(viewCompare)\n  const layer = new Map()\n  for (const id of displayIds) layer.set(id, 0)\n  const order = []\n  while (queue.length > 0) {\n    const id = queue.shift()\n    order.push(id)\n    for (const next of displayAdjacency.get(id)) {\n      layer.set(next, Math.max(layer.get(next), layer.get(id) + 1))\n      indegree.set(next, indegree.get(next) - 1)\n      if (indegree.get(next) === 0) {\n        queue.push(next)\n        queue.sort(viewCompare)\n      }\n    }\n  }\n  // Every display node is in the condensation DAG, so `order` is complete.\n\n  // Layer budget: drop deepest layers deterministically.\n  let layerCount = 0\n  for (const id of displayIds) layerCount = Math.max(layerCount, layer.get(id) + 1)\n  const layerTruncated = Math.max(0, layerCount - maxLayers)\n  const visible = new Set()\n  for (const id of displayIds) {\n    if (layer.get(id) < maxLayers) visible.add(id)\n  }\n\n  // Barycenter sweeps (bounded) to reduce crossings within layers.\n  const layers = []\n  for (let index = 0; index < layerCount && index < maxLayers; index++) layers.push([])\n  for (const id of order) {\n    if (!visible.has(id)) continue\n    layers[layer.get(id)].push(id)\n  }\n  for (const list of layers) list.sort(viewCompare)\n  const position = new Map()\n  function reindex() {\n    for (const list of layers) {\n      for (let index = 0; index < list.length; index++) position.set(list[index], index)\n    }\n  }\n  reindex()\n  const incoming = new Map()\n  for (const id of displayIds) incoming.set(id, [])\n  for (const id of displayIds) {\n    for (const next of displayAdjacency.get(id)) incoming.get(next).push(id)\n  }\n  for (let sweep = 0; sweep < 4; sweep++) {\n    const topDown = sweep % 2 === 0\n    const sequence = topDown ? layers.slice(1) : layers.slice(0, -1).reverse()\n    for (const list of sequence) {\n      const scores = new Map()\n      for (const id of list) {\n        const neighbors = topDown ? incoming.get(id) : displayAdjacency.get(id)\n        let sum = 0\n        let count = 0\n        for (const neighbor of neighbors) {\n          if (!visible.has(neighbor)) continue\n          sum += position.get(neighbor)\n          count += 1\n        }\n        scores.set(id, count === 0 ? position.get(id) : sum / count)\n      }\n      list.sort((a, b) => {\n        const diff = scores.get(a) - scores.get(b)\n        return diff !== 0 ? diff : viewCompare(a, b)\n      })\n    }\n    reindex()\n  }\n\n  // Coordinates: layers along one axis, members spread along the other.\n  const padding = 24\n  const innerWidth = Math.max(1, width - padding * 2)\n  const innerHeight = Math.max(1, height - padding * 2)\n  const positions = new Map()\n  const layerSpan = orientation === 'down' ? innerHeight : innerWidth\n  const laneSpan = orientation === 'down' ? innerWidth : innerHeight\n  const layerStep = Math.max(1, layerSpan / Math.max(1, layers.length))\n  for (let index = 0; index < layers.length; index++) {\n    const list = layers[index]\n    const laneStep = Math.max(1, laneSpan / Math.max(1, list.length))\n    for (let lane = 0; lane < list.length; lane++) {\n      const along = padding + layerStep * (index + 0.5)\n      const across = padding + laneStep * (lane + 0.5)\n      positions.set(list[lane], orientation === 'down'\n        ? { x: across, y: along }\n        : { x: along, y: across })\n    }\n  }\n\n  const layoutNodes = []\n  for (const id of displayIds) {\n    if (!visible.has(id) || !positions.has(id)) continue\n    const point = positions.get(id)\n    const group = groups.find((item) => item.id === id)\n    const node = group ? null : byId.get(id)\n    layoutNodes.push({\n      id: id,\n      x: Math.round(point.x * 100) / 100,\n      y: Math.round(point.y * 100) / 100,\n      layer: layer.get(id),\n      label: group ? id : (node && node.label) || id,\n      kind: group ? 'group' : (node ? node.kind : 'external'),\n      groupId: group ? group.id : null,\n      memberCount: group ? group.members.length : 0,\n    })\n  }\n  const layoutEdges = []\n  for (const edge of crossEdges) {\n    const from = displayIdOf.get(edge.source)\n    const to = displayIdOf.get(edge.target)\n    if (!visible.has(from) || !visible.has(to)) continue\n    layoutEdges.push({\n      id: edge.id,\n      source: from,\n      target: to,\n      p: edge.p,\n      label: edge.label,\n      count: edge.count,\n      sourceIds: edge.sourceIds,\n      statementIds: edge.statementIds,\n    })\n  }\n  const internal = []\n  for (const edge of internalEdges) {\n    internal.push({\n      id: edge.id,\n      source: displayIdOf.get(edge.source),\n      target: displayIdOf.get(edge.target),\n      p: edge.p,\n      label: edge.label,\n      count: edge.count,\n      sourceIds: edge.sourceIds,\n      statementIds: edge.statementIds,\n    })\n  }\n  for (const edge of selfLoopEdges) {\n    if (!visible.has(displayIdOf.get(edge.source))) continue\n    internal.push({\n      id: edge.id,\n      source: displayIdOf.get(edge.source),\n      target: displayIdOf.get(edge.source),\n      p: edge.p,\n      label: edge.label,\n      count: edge.count,\n      sourceIds: edge.sourceIds,\n      statementIds: edge.statementIds,\n      selfLoop: true,\n    })\n  }\n\n  return {\n    orientation: orientation,\n    predicates: predicates,\n    nodes: layoutNodes,\n    edges: layoutEdges,\n    internalEdges: internal,\n    groups: groups.map((group) => ({\n      id: group.id,\n      anchor: group.anchor,\n      members: group.members,\n    })),\n    layers: layers.length,\n    bounds: { minX: padding, minY: padding, width: width - padding * 2, height: height - padding * 2 },\n    stats: {\n      nodes: layoutNodes.length,\n      edges: layoutEdges.length,\n      internalEdges: internal.length,\n      groups: groups.length,\n      layers: layers.length,\n      truncatedNodes: nodeTruncated,\n      truncatedLayers: layerTruncated,\n      maxNodes: maxNodes,\n      maxLayers: maxLayers,\n    },\n  }\n}\n\n/** Class/property hierarchy check used by the view to explain empty modes. */\nfunction hierarchyPredicateFor(mode) {\n  return mode === 'property' ? VIEW_RDFS_SUBPROPERTYOF : VIEW_HIERARCHY_DEFAULT_PREDICATE\n}\n\n/** The rdf:type-based instance grouping predicate (never inheritance). */\nfunction instanceTypePredicate() {\n  return VIEW_RDF_TYPE\n}\n\n/** Explicit class declaration types, for labels and grouping. */\nfunction classDeclarationTypes() {\n  return [VIEW_OWL_CLASS, VIEW_RDFS_CLASS]\n}\n\n/** Label predicate used by the class tree when a node has no preferred label. */\nfunction hierarchyLabelPredicate() {\n  return VIEW_RDFS_LABEL\n}\n\n// ==== src/worker-entry.js ====\n/**\n * Background compute entry (classic Blob Worker script).\n *\n * This file is NEVER concatenated into the main Client closure. `build/build.mjs`\n * reads it together with `src/rdf-parse.js` and `src/graph-model.js`, strips the\n * ES-module export syntax, wraps the three sources in an IIFE and embeds the\n * result as the `ONTOLOGY_WORKER_SOURCE` string inside `client.js`. At runtime\n * the plugin creates a classic worker from a Blob URL, so this script must be\n * fully self-contained: `parseOntology`, `buildGraph` and `layoutGraph` are\n * resolved from the worker closure created by the build. No React, no DOM.\n *\n * Protocol (see `src/ontology-job.js` for the client side):\n *\n *   in:  { type: 'compute', id, text, resourceAddress, displayName,\n *          limits: { maxTriples, maxNodes, maxEdges, maxLiteralsPerNode,\n *                    maxLiteralLength, maxDepth },\n *          layout: { width, height, seed, iterations } }\n *        { type: 'relayout', id, width, height, seed, iterations }\n *\n *   out: { type: 'graph', id, graph, base, baseSource, prefixes, diagnostics,\n *          stats, truncation, timing: { parse, build, layout } }\n *        { type: 'layout', id, positions: Float64Array, timing: { layout } }\n *        { type: 'error', id, message }\n *\n * `positions` is a transferable Float64Array of x/y pairs in `graph.nodes`\n * order (layoutGraph deduplicates ids in input order, so the order matches the\n * node list the main thread already has). The worker caches the last graph by\n * message id so a size change can run `relayout` without re-parsing.\n *\n * Keeping this file free of `import`/`export` matches the build's no-import\n * contract. Only `node --check` and the bundle tests ever read it directly.\n */\n\n/** Monotonic-enough clock inside a worker; Date.now is the fallback. */\nfunction ontologyWorkerNow() {\n  try {\n    if (typeof self !== 'undefined' && self.performance && typeof self.performance.now === 'function') {\n      return self.performance.now()\n    }\n  } catch (error) {\n    // fall through to Date.now\n  }\n  return Date.now()\n}\n\n/** Coerce a finite number, else return the fallback (0 is a valid value). */\nfunction ontologyWorkerNumber(value, fallback) {\n  return typeof value === 'number' && Number.isFinite(value) ? value : fallback\n}\n\n/** Merge protocol limits with the design's initial budgets. */\nfunction ontologyWorkerNormalizeLimits(limits) {\n  const input = limits && typeof limits === 'object' ? limits : {}\n  return {\n    maxTriples: Math.max(1, Math.floor(ontologyWorkerNumber(input.maxTriples, 120000))),\n    maxNodes: Math.max(1, Math.floor(ontologyWorkerNumber(input.maxNodes, 1500))),\n    maxEdges: Math.max(0, Math.floor(ontologyWorkerNumber(input.maxEdges, 6000))),\n    maxLiteralsPerNode: Math.max(0, Math.floor(ontologyWorkerNumber(input.maxLiteralsPerNode, 60))),\n    maxLiteralLength: Math.max(1, Math.floor(ontologyWorkerNumber(input.maxLiteralLength, 16384))),\n    maxDepth: Math.max(1, Math.floor(ontologyWorkerNumber(input.maxDepth, 256))),\n  }\n}\n\n/** Merge protocol layout options with the deterministic layout defaults. */\nfunction ontologyWorkerNormalizeLayout(layout) {\n  const input = layout && typeof layout === 'object' ? layout : {}\n  const width = Math.max(1, ontologyWorkerNumber(input.width, 900))\n  const height = Math.max(1, ontologyWorkerNumber(input.height, 600))\n  const seed = Number.isFinite(input.seed) ? Math.floor(input.seed) >>> 0 : 1\n  const iterations = Math.max(0, Math.min(2000, Math.floor(ontologyWorkerNumber(input.iterations, 320))))\n  return { width, height, seed, iterations }\n}\n\n/** Pack layout points into the transferable x/y pair array. */\nfunction ontologyWorkerPackPositions(positions) {\n  const list = Array.isArray(positions) ? positions : []\n  const packed = new Float64Array(list.length * 2)\n  for (let index = 0; index < list.length; index += 1) {\n    const point = list[index] && typeof list[index] === 'object' ? list[index] : {}\n    packed[index * 2] = Number.isFinite(point.x) ? point.x : 0\n    packed[index * 2 + 1] = Number.isFinite(point.y) ? point.y : 0\n  }\n  return packed\n}\n\n/** Human-readable message for the error protocol message. */\nfunction ontologyWorkerErrorMessage(error) {\n  return error && error.message ? String(error.message) : String(error)\n}\n\n/** Last computed graph, kept so `relayout` does not re-parse the document. */\nlet ontologyWorkerCache = null\n\n/* ------------------------------------------------------------------ */\n/* Workspace protocol (multi-file)                                    */\n/* ------------------------------------------------------------------ */\n\n/** Parsed sources known to this worker, keyed by source id. */\nconst ontologyWorkerSources = new Map()\n\n/** Copy one parse result into the bounded snapshot the workspace keeps. */\nfunction ontologyWorkerParsedSnapshot(parsed) {\n  const input = parsed && typeof parsed === 'object' ? parsed : {}\n  const stats = input.stats && typeof input.stats === 'object' ? input.stats : {}\n  return {\n    format: typeof input.format === 'string' ? input.format : '',\n    prefixes: input.prefixes && typeof input.prefixes === 'object' ? input.prefixes : {},\n    base: typeof input.base === 'string' ? input.base : '',\n    baseSource: typeof input.baseSource === 'string' ? input.baseSource : 'none',\n    triples: Array.isArray(input.triples) ? input.triples : [],\n    diagnostics: Array.isArray(input.diagnostics) ? input.diagnostics : [],\n    warnings: Array.isArray(input.warnings) ? input.warnings : [],\n    errors: Array.isArray(input.errors) ? input.errors : [],\n    stats: {\n      tripleCount: Number(stats.tripleCount) || (Array.isArray(input.triples) ? input.triples.length : 0),\n      truncated: !!stats.truncated,\n      truncation: stats.truncation || null,\n    },\n  }\n}\n\n/** Parse one source and keep it for later composition. */\nfunction ontologyWorkerParseSource(id, message) {\n  const sourceId = typeof message.sourceId === 'string' && message.sourceId\n    ? message.sourceId\n    : 'src' + (ontologyWorkerSources.size + 1)\n  const revision = Number.isFinite(message.revision) && message.revision > 0\n    ? Math.floor(message.revision)\n    : 1\n  const limits = ontologyWorkerNormalizeLimits({ maxTriples: message.maxTriples })\n  const startedAt = ontologyWorkerNow()\n  const parsed = parseOntology(typeof message.text === 'string' ? message.text : '', {\n    fileName: typeof message.displayName === 'string' ? message.displayName : undefined,\n    format: typeof message.format === 'string' && message.format ? message.format : undefined,\n    navigationAddress: typeof message.navigationAddress === 'string' && message.navigationAddress\n      ? message.navigationAddress\n      : undefined,\n    absolutePath: typeof message.absolutePath === 'string' && message.absolutePath\n      ? message.absolutePath\n      : undefined,\n    rdfBase: typeof message.rdfBase === 'string' && message.rdfBase ? message.rdfBase : undefined,\n    maxTriples: limits.maxTriples,\n    maxLiteralLength: limits.maxLiteralLength,\n    maxDepth: limits.maxDepth,\n  }) || {}\n  const snapshot = ontologyWorkerParsedSnapshot(parsed)\n  const byteSize = typeof message.byteSize === 'number' && Number.isFinite(message.byteSize)\n    ? message.byteSize\n    : (typeof message.text === 'string' ? message.text.length : 0)\n  ontologyWorkerSources.set(sourceId, {\n    sourceId: sourceId,\n    revision: revision,\n    origin: message.origin,\n    parsed: snapshot,\n    byteSize: byteSize,\n    displayName: typeof message.displayName === 'string' ? message.displayName : '',\n    navigationAddress: typeof message.navigationAddress === 'string' ? message.navigationAddress : '',\n    absolutePath: typeof message.absolutePath === 'string' ? message.absolutePath : '',\n  })\n  self.postMessage({\n    type: 'source',\n    id: id,\n    sourceId: sourceId,\n    revision: revision,\n    status: snapshot.triples.length === 0 ? 'empty' : 'ready',\n    parsed: snapshot,\n    timing: { parse: ontologyWorkerNow() - startedAt },\n  })\n}\n\n/** Compose the cached sources into one graph and lay it out. */\nfunction ontologyWorkerCompose(id, message) {\n  const sourceIds = Array.isArray(message.sourceIds)\n    ? message.sourceIds.filter(function (value) { return typeof value === 'string' })\n    : []\n  const selected = new Set(sourceIds)\n  let workspace = createWorkspace()\n  for (const entry of ontologyWorkerSources.values()) {\n    if (selected.size > 0 && !selected.has(entry.sourceId)) continue\n    const added = addSource(workspace, {\n      origin: entry.origin === 'browser' ? 'browser' : 'host',\n      displayName: entry.displayName || entry.sourceId,\n      sourceId: entry.sourceId,\n      revision: entry.revision,\n      navigationAddress: entry.navigationAddress || undefined,\n      absolutePath: entry.absolutePath || undefined,\n      parsed: entry.parsed,\n      byteSize: entry.byteSize,\n      text: '',\n    })\n    if (added.status !== 'rejected' && added.workspace) workspace = added.workspace\n  }\n  const composed = composeWorkspaceGraph(workspace, {\n    sourceIds: sourceIds.length > 0 ? sourceIds : undefined,\n    maxNodes: message.maxNodes,\n    maxEdges: message.maxEdges,\n    maxLiteralsPerNode: message.maxLiteralsPerNode,\n    maxLiteralLength: message.maxLiteralLength,\n  })\n  if (!composed || !composed.graph) {\n    self.postMessage({\n      type: 'error',\n      id: id,\n      message: composed && composed.error ? String(composed.error) : 'graph composition failed',\n    })\n    return\n  }\n  ontologyWorkerCache = { id: id, graph: composed.graph }\n  const layoutOptions = ontologyWorkerNormalizeLayout(message.layout)\n  self.postMessage({\n    type: 'graph',\n    id: id,\n    graph: composed.graph,\n    statements: composed.statements,\n    occurrences: composed.occurrences,\n    sourceIds: composed.sourceIds,\n    timing: {},\n  })\n  const laidOutAt = ontologyWorkerNow()\n  const positions = layoutGraph(composed.graph, layoutOptions)\n  ontologyWorkerPostLayout(id, positions, ontologyWorkerNow() - laidOutAt)\n}\n\n/** Post the transferable layout message. */\nfunction ontologyWorkerPostLayout(id, positions, elapsed) {\n  const packed = ontologyWorkerPackPositions(positions)\n  self.postMessage({ type: 'layout', id, positions: packed, timing: { layout: elapsed } }, [packed.buffer])\n}\n\n/** Handle one `compute` request: parse -> build -> layout -> cache. */\nfunction ontologyWorkerCompute(id, message) {\n  const text = typeof message.text === 'string' ? message.text : ''\n  const resourceAddress = typeof message.resourceAddress === 'string' ? message.resourceAddress : ''\n  const displayName = typeof message.displayName === 'string' ? message.displayName : ''\n  const limits = ontologyWorkerNormalizeLimits(message.limits)\n  const layoutOptions = ontologyWorkerNormalizeLayout(message.layout)\n\n  const startedAt = ontologyWorkerNow()\n  const parsed = parseOntology(text, {\n    resourceAddress: resourceAddress || undefined,\n    fileName: displayName || undefined,\n    maxTriples: limits.maxTriples,\n    maxLiteralLength: limits.maxLiteralLength,\n    maxDepth: limits.maxDepth,\n  }) || {}\n  const parsedAt = ontologyWorkerNow()\n\n  const graph = buildGraph(parsed, {\n    maxNodes: limits.maxNodes,\n    maxEdges: limits.maxEdges,\n    maxLiteralsPerNode: limits.maxLiteralsPerNode,\n    maxLiteralLength: limits.maxLiteralLength,\n    source: {\n      address: resourceAddress,\n      displayName: displayName,\n      format: typeof parsed.format === 'string' ? parsed.format : '',\n    },\n  }) || { nodes: [], edges: [], stats: {}, warnings: [] }\n  const builtAt = ontologyWorkerNow()\n\n  const positions = layoutGraph(graph, layoutOptions)\n  const laidOutAt = ontologyWorkerNow()\n\n  ontologyWorkerCache = { id: id, graph: graph }\n\n  const stats = parsed.stats && typeof parsed.stats === 'object' ? parsed.stats : {}\n  self.postMessage({\n    type: 'graph',\n    id: id,\n    graph: graph,\n    base: typeof parsed.base === 'string' ? parsed.base : '',\n    baseSource: typeof parsed.baseSource === 'string' ? parsed.baseSource : 'none',\n    prefixes: parsed.prefixes && typeof parsed.prefixes === 'object' ? parsed.prefixes : {},\n    diagnostics: Array.isArray(parsed.diagnostics) ? parsed.diagnostics : [],\n    stats: stats,\n    truncation: stats.truncation && typeof stats.truncation === 'object' ? stats.truncation : null,\n    timing: {\n      parse: parsedAt - startedAt,\n      build: builtAt - parsedAt,\n      layout: laidOutAt - builtAt,\n    },\n  })\n  ontologyWorkerPostLayout(id, positions, laidOutAt - builtAt)\n}\n\n/** Handle one `relayout` request against the cached graph. */\nfunction ontologyWorkerRelayout(id, message) {\n  if (!ontologyWorkerCache || ontologyWorkerCache.id !== id) {\n    throw new Error('relayout requested before a graph is available')\n  }\n  const layoutOptions = ontologyWorkerNormalizeLayout(message)\n  const startedAt = ontologyWorkerNow()\n  const positions = layoutGraph(ontologyWorkerCache.graph, layoutOptions)\n  ontologyWorkerPostLayout(id, positions, ontologyWorkerNow() - startedAt)\n}\n\n/** Worker message entry point. */\nself.onmessage = function ontologyWorkerOnMessage(event) {\n  const message = event && event.data ? event.data : null\n  if (!message || typeof message !== 'object') return\n  const id = message.id\n  try {\n    if (message.type === 'compute') {\n      ontologyWorkerCompute(id, message)\n      return\n    }\n    if (message.type === 'relayout') {\n      ontologyWorkerRelayout(id, message)\n      return\n    }\n    if (message.type === 'parse-source') {\n      ontologyWorkerParseSource(id, message)\n      return\n    }\n    if (message.type === 'compose') {\n      ontologyWorkerCompose(id, message)\n      return\n    }\n    if (message.type === 'cache-source') {\n      const source = message.source\n      if (source && typeof source.sourceId === 'string' && source.parsed && Array.isArray(source.parsed.triples)) {\n        ontologyWorkerSources.set(source.sourceId, {\n          sourceId: source.sourceId, revision: source.revision,\n          origin: source.origin, displayName: source.displayName,\n          absolutePath: source.absolutePath, navigationAddress: source.navigationAddress,\n          byteSize: source.byteSize, parsed: ontologyWorkerParsedSnapshot(source.parsed),\n        })\n      }\n      return\n    }\n    if (message.type === 'drop-source') {\n      if (typeof message.sourceId === 'string') ontologyWorkerSources.delete(message.sourceId)\n      return\n    }\n  } catch (error) {\n    self.postMessage({ type: 'error', id: id, message: ontologyWorkerErrorMessage(error) })\n  }\n}\n})();";
 
 		// ==== src/ontology-job.js ====
 		/**
@@ -5042,41 +8127,52 @@ window.__ModuleLoader__.load({
 		 */
 		function ontologyJobImpls(override) {
 		  const provided = override && typeof override === 'object' ? override : {}
-		  const resolved = { parseOntology: null, buildGraph: null, layoutGraph: null, createLayoutTask: null }
-		  if (typeof provided.parseOntology === 'function') {
-		    resolved.parseOntology = provided.parseOntology
-		  } else {
-		    try {
-		      if (typeof parseOntology === 'function') resolved.parseOntology = parseOntology
-		    } catch (error) {
-		      // no parser in this scope
-		    }
+		  const resolved = {
+		    parseOntology: null,
+		    buildGraph: null,
+		    layoutGraph: null,
+		    createLayoutTask: null,
+		    createWorkspace: null,
+		    addSource: null,
+		    removeSource: null,
+		    replaceSource: null,
+		    workspaceAdmission: null,
+		    composeWorkspaceGraph: null,
+		    identity: provided.identity || null,
 		  }
-		  if (typeof provided.buildGraph === 'function') {
-		    resolved.buildGraph = provided.buildGraph
-		  } else {
-		    try {
-		      if (typeof buildGraph === 'function') resolved.buildGraph = buildGraph
-		    } catch (error) {
-		      // no graph model in this scope
-		    }
+		  const names = [
+		    'parseOntology', 'buildGraph', 'layoutGraph', 'createLayoutTask',
+		    'createWorkspace', 'addSource', 'removeSource', 'replaceSource',
+		    'workspaceAdmission', 'composeWorkspaceGraph',
+		  ]
+		  // Resolve the concatenated Client bundle's function declarations without
+		  // eval (CSP-safe). `typeof` on an undeclared identifier is safe.
+		  const globalResolvers = {
+		    parseOntology: function () { return typeof parseOntology === 'function' ? parseOntology : null },
+		    buildGraph: function () { return typeof buildGraph === 'function' ? buildGraph : null },
+		    layoutGraph: function () { return typeof layoutGraph === 'function' ? layoutGraph : null },
+		    createLayoutTask: function () { return typeof createLayoutTask === 'function' ? createLayoutTask : null },
+		    createWorkspace: function () { return typeof createWorkspace === 'function' ? createWorkspace : null },
+		    addSource: function () { return typeof addSource === 'function' ? addSource : null },
+		    removeSource: function () { return typeof removeSource === 'function' ? removeSource : null },
+		    replaceSource: function () { return typeof replaceSource === 'function' ? replaceSource : null },
+		    workspaceAdmission: function () {
+		      return typeof workspaceAdmission === 'function' ? workspaceAdmission : null
+		    },
+		    composeWorkspaceGraph: function () {
+		      return typeof composeWorkspaceGraph === 'function' ? composeWorkspaceGraph : null
+		    },
 		  }
-		  if (typeof provided.layoutGraph === 'function') {
-		    resolved.layoutGraph = provided.layoutGraph
-		  } else {
-		    try {
-		      if (typeof layoutGraph === 'function') resolved.layoutGraph = layoutGraph
-		    } catch (error) {
-		      // no layout in this scope
+		  for (const name of names) {
+		    if (typeof provided[name] === 'function') {
+		      resolved[name] = provided[name]
+		      continue
 		    }
-		  }
-		  if (typeof provided.createLayoutTask === 'function') {
-		    resolved.createLayoutTask = provided.createLayoutTask
-		  } else {
 		    try {
-		      if (typeof createLayoutTask === 'function') resolved.createLayoutTask = createLayoutTask
+		      const candidate = globalResolvers[name]()
+		      if (typeof candidate === 'function') resolved[name] = candidate
 		    } catch (error) {
-		      // chunked layout not available; one-shot layout is still used
+		      // helper not available in this scope
 		    }
 		  }
 		  return resolved
@@ -5734,6 +8830,16 @@ window.__ModuleLoader__.load({
 		  let fallbackUsed = false
 		  let layoutSeq = 0
 		  let disposed = false
+		  /** Local L0 workspace (source records + parsed statements). */
+		  let workspaceState = null
+		  /** Pending workspace request handle (parse/compose). */
+		  let workspaceRequest = null
+		  /**
+		   * One background worker for the whole workspace session: parse-source fills
+		   * its cache and compose reuses it, so switching views never re-parses and a
+		   * source is never sent twice. Released on failure and disposal.
+		   */
+		  let workspaceWorker = null
 
 		  function emitEvent(event) {
 		    if (disposed) return
@@ -6037,10 +9143,556 @@ window.__ModuleLoader__.load({
 
 		  function cancel() {
 		    cancelActiveJob()
+		    cancelWorkspaceRequest()
+		  }
+
+		  /* ---------------------- workspace operations ---------------------- */
+
+		  /** Local workspace state, created on first use. */
+		  function ensureWorkspace() {
+		    if (workspaceState) return workspaceState
+		    if (typeof impls.createWorkspace !== 'function') return null
+		    try {
+		      workspaceState = impls.createWorkspace({
+		        buildGraph: impls.buildGraph || undefined,
+		        identity: impls.identity || undefined,
+		      })
+		    } catch (error) {
+		      workspaceState = null
+		    }
+		    return workspaceState
+		  }
+
+		  function cancelWorkspaceRequest() {
+		    const request = workspaceRequest
+		    workspaceRequest = null
+		    if (request && typeof request.cancel === 'function') {
+		      try { request.cancel() } catch (error) { /* ignored */ }
+		    }
+		  }
+
+		  function emitWorkspaceEvent(event) {
+		    if (disposed) return
+		    try { onEvent(Object.assign({}, event, { scope: 'workspace' })) } catch (error) { /* consumer callback errors must not break the job */ }
+		  }
+
+		  function ensureWorkspaceWorker() {
+		    if (workspaceWorker) return workspaceWorker
+		    workspaceWorker = ontologyJobCreateWorker({ workerFactory: workerFactory, workerSource: workerSource })
+		    if (workspaceState) {
+		      for (const source of workspaceState.sources) {
+		        workspaceWorker.worker.postMessage({ type: 'cache-source', source: source })
+		      }
+		    }
+		    return workspaceWorker
+		  }
+
+		  function releaseWorkspaceWorker() {
+		    const handle = workspaceWorker
+		    workspaceWorker = null
+		    if (handle && typeof handle.release === 'function') {
+		      try { handle.release() } catch (error) { /* ignored */ }
+		    }
+		  }
+
+		  function byteSizeOfText(text) {
+		    if (typeof text !== 'string') return 0
+		    try {
+		      if (typeof TextEncoder === 'function') return new TextEncoder().encode(text).length
+		    } catch (error) {
+		      // fall through to code units
+		    }
+		    return text.length
+		  }
+
+		  /** One source summary for the source panel (never the parsed triples). */
+		  function sourceSummaryOf(source) {
+		    if (!source || typeof source !== 'object') return null
+		    const parsed = source.parsed && typeof source.parsed === 'object' ? source.parsed : {}
+		    const diagnostics = Array.isArray(parsed.diagnostics) ? parsed.diagnostics : []
+		    return {
+		      sourceId: source.sourceId,
+		      origin: source.origin,
+		      displayName: source.displayName,
+		      navigationAddress: source.navigationAddress || null,
+		      absolutePath: source.absolutePath || null,
+		      format: source.format || '',
+		      revision: source.revision,
+		      status: source.status,
+		      byteSize: source.byteSize,
+		      tripleCount: source.occurrenceCount,
+		      errorCount: Array.isArray(parsed.errors) ? parsed.errors.length : 0,
+		      warningCount: Array.isArray(parsed.warnings) ? parsed.warnings.length : 0,
+		      truncated: !!(parsed.stats && parsed.stats.truncated),
+		      stale: !!source.stale,
+		      base: parsed.base || '',
+		      truncation: parsed.stats && parsed.stats.truncation ? parsed.stats.truncation : null,
+		      diagnostics: diagnostics,
+		    }
+		  }
+
+		  function workspaceSummaries() {
+		    if (!workspaceState) return []
+		    return workspaceState.sources.map(sourceSummaryOf).filter(Boolean)
+		  }
+
+		  function workspaceTotalsState() {
+		    if (!workspaceState) return { files: 0, bytes: 0, occurrences: 0 }
+		    let bytes = 0
+		    let occurrences = 0
+		    for (const source of workspaceState.sources) {
+		      bytes += Number(source.byteSize) || 0
+		      occurrences += Number(source.occurrenceCount) || 0
+		    }
+		    return { files: workspaceState.sources.length, bytes: bytes, occurrences: occurrences }
+		  }
+
+		  /** Admit one parsed source into the local workspace and emit the summary. */
+		  function commitSource(id, request, parsed, byteSize) {
+		    const state = ensureWorkspace()
+		    if (!state) {
+		      emitWorkspaceEvent({ type: 'error', generation: id, message: 'workspace is unavailable' })
+		      return null
+		    }
+		    const input = {
+		      origin: request.origin,
+		      displayName: request.displayName,
+		      navigationAddress: request.navigationAddress,
+		      absolutePath: request.absolutePath,
+		      rdfBase: request.rdfBase,
+		      format: request.format,
+		      sourceId: request.sourceId,
+		      revision: request.revision,
+		      text: request.text,
+		      byteSize: byteSize,
+		      parsed: parsed,
+		      error: request.error,
+		    }
+		    let result
+		    if (request.replace === true && typeof impls.replaceSource === 'function' && request.sourceId) {
+		      result = impls.replaceSource(state, request.sourceId, input)
+		    } else if (typeof impls.addSource === 'function') {
+		      result = impls.addSource(state, input)
+		    } else {
+		      emitWorkspaceEvent({ type: 'error', generation: id, message: 'workspace helpers are unavailable' })
+		      return null
+		    }
+		    if (!result || result.status === 'rejected' || result.status === 'missing') {
+		      emitWorkspaceEvent({
+		        type: 'source',
+		        generation: id,
+		        sourceId: request.sourceId || null,
+		        revision: result && result.source ? result.source.revision : 0,
+		        status: 'rejected',
+		        reason: result ? result.reason : 'unavailable',
+		        summary: null,
+		      })
+		      return null
+		    }
+		    workspaceState = result.workspace
+		    const summary = sourceSummaryOf(result.source)
+		    emitWorkspaceEvent({
+		      type: 'source',
+		      generation: id,
+		      sourceId: result.source.sourceId,
+		      revision: result.source.revision,
+		      status: result.status,
+		      reason: null,
+		      summary: summary,
+		      sources: workspaceSummaries(),
+		      totals: workspaceTotalsState(),
+		    })
+		    return result
+		  }
+
+		  /** Parse on the main thread (degraded path or worker failure). */
+		  function parseSourceLocally(id, request, text, byteSize, admission) {
+		    if (typeof impls.parseOntology !== 'function') {
+		      emitWorkspaceEvent({ type: 'error', generation: id, message: 'parser is unavailable' })
+		      return
+		    }
+		    let parsed
+		    try {
+		      parsed = impls.parseOntology(text, {
+		        fileName: request.displayName,
+		        format: request.format,
+		        navigationAddress: request.navigationAddress,
+		        absolutePath: request.absolutePath,
+		        rdfBase: request.rdfBase,
+		        maxTriples: admission.maxTriples,
+		      })
+		    } catch (error) {
+		      emitWorkspaceEvent({ type: 'error', generation: id, message: ontologyJobErrorMessage(error) })
+		      return
+		    }
+		    commitSource(id, request, parsed, byteSize)
+		  }
+
+		  /**
+		   * Parse one source and admit it into the workspace. With a worker the parse
+		   * happens off the main thread; the parsed result still comes back so the
+		   * workspace keeps a recoverable L0 snapshot.
+		   */
+		  function parseSource(input) {
+		    if (disposed) return 0
+		    cancelWorkspaceRequest()
+		    generation += 1
+		    const id = generation
+		    const request = input && typeof input === 'object' ? input : {}
+		    const text = typeof request.text === 'string' ? request.text : ''
+		    const byteSize = typeof request.byteSize === 'number' && Number.isFinite(request.byteSize)
+		      ? Math.max(0, request.byteSize)
+		      : byteSizeOfText(text)
+		    const state = ensureWorkspace()
+		    if (!state) {
+		      emitWorkspaceEvent({ type: 'error', generation: id, message: 'workspace is unavailable' })
+		      return id
+		    }
+		    // Allocate identity on the controller, not independently from Worker map
+		    // size (removing a source otherwise reuses/overwrites a different cache id).
+		    if (!request.sourceId) request.sourceId = 'src' + state.nextSourceNumber
+		    if (request.replace === true) {
+		      const previous = state.sources.find(source => source.sourceId === request.sourceId)
+		      if (previous) request.revision = previous.revision + 1
+		    }
+		    const admission = typeof impls.workspaceAdmission === 'function'
+		      ? impls.workspaceAdmission(state, byteSize)
+		      : { allowed: true, maxTriples: 120000, reason: null }
+		    if (!admission.allowed) {
+		      emitWorkspaceEvent({
+		        type: 'source',
+		        generation: id,
+		        sourceId: request.sourceId || null,
+		        revision: 0,
+		        status: 'rejected',
+		        reason: admission.reason,
+		        summary: null,
+		      })
+		      return id
+		    }
+		    const useWorker = ontologyJobWorkerEnabled({
+		      workerFactory: workerFactory,
+		      workerSource: workerSource,
+		      forceMainThread: forceMainThread,
+		    })
+		    if (useWorker && !fallbackUsed) {
+		      let handle = null
+		      try {
+		        handle = ensureWorkspaceWorker()
+		      } catch (error) {
+		        fallbackUsed = true
+		        emitWorkspaceEvent({
+		          type: 'state', status: 'parsing', generation: id, degraded: true,
+		          message: 'Background parse unavailable: ' + ontologyJobErrorMessage(error),
+		        })
+		        parseSourceLocally(id, request, text, byteSize, admission)
+		        return id
+		      }
+		      const workerMessage = {
+		        type: 'parse-source',
+		        origin: request.origin,
+		        id: id,
+		        sourceId: typeof request.sourceId === 'string' ? request.sourceId : '',
+		        revision: Number.isFinite(request.revision) ? request.revision : 1,
+		        text: text,
+		        byteSize: byteSize,
+		        displayName: typeof request.displayName === 'string' ? request.displayName : '',
+		        format: typeof request.format === 'string' ? request.format : '',
+		        navigationAddress: typeof request.navigationAddress === 'string' ? request.navigationAddress : '',
+		        absolutePath: typeof request.absolutePath === 'string' ? request.absolutePath : '',
+		        rdfBase: typeof request.rdfBase === 'string' ? request.rdfBase : '',
+		        maxTriples: admission.maxTriples,
+		      }
+		      workspaceRequest = ontologyJobSendWorkerMessage(handle, workerMessage, {
+		        id: id,
+		        timeoutMs: timeoutMs,
+		        isCancelled: function () { return disposed },
+		        onMessage: function (data) {
+		          if (disposed) return true
+		          if (data.type === 'source') {
+		            const parsed = data.parsed && typeof data.parsed === 'object' ? data.parsed : null
+		            commitSource(id, request, parsed, byteSize)
+		            return true
+		          }
+		          if (data.type === 'error') {
+		            releaseWorkspaceWorker()
+		            fallbackUsed = true
+		            emitWorkspaceEvent({
+		              type: 'state', status: 'parsing', generation: id, degraded: true,
+		              message: 'Background parse unavailable: ' +
+		                (typeof data.message === 'string' ? data.message : 'worker error'),
+		            })
+		            parseSourceLocally(id, request, text, byteSize, admission)
+		            return true
+		          }
+		          return false
+		        },
+		        onFailure: function (reason) {
+		          if (disposed) return
+		          releaseWorkspaceWorker()
+		          fallbackUsed = true
+		          emitWorkspaceEvent({
+		            type: 'state', status: 'parsing', generation: id, degraded: true,
+		            message: 'Background parse unavailable: ' + reason,
+		          })
+		          parseSourceLocally(id, request, text, byteSize, admission)
+		        },
+		      })
+		      return id
+		    }
+		    parseSourceLocally(id, request, text, byteSize, admission)
+		    return id
+		  }
+
+		  /** Compose the selected sources into the L1 graph on the main thread. */
+		  function composeLocally(id, request) {
+		    const state = ensureWorkspace()
+		    if (!state || typeof impls.composeWorkspaceGraph !== 'function') {
+		      emitWorkspaceEvent({ type: 'error', generation: id, message: 'graph composition is unavailable' })
+		      return
+		    }
+		    const composed = impls.composeWorkspaceGraph(state, {
+		      sourceIds: request.sourceIds,
+		      maxNodes: request.maxNodes,
+		      maxEdges: request.maxEdges,
+		      maxLiteralsPerNode: request.maxLiteralsPerNode,
+		      maxLiteralLength: request.maxLiteralLength,
+		    })
+		    if (!composed || !composed.graph || composed.error) {
+		      emitWorkspaceEvent({
+		        type: 'error', generation: id,
+		        message: 'graph composition failed: ' + String(composed && composed.error ? composed.error : 'unknown'),
+		      })
+		      return
+		    }
+		    lastGraph = composed.graph
+		    lastMeta = { base: '', baseSource: 'none', prefixes: {}, diagnostics: [], stats: composed.graph.stats, truncation: null }
+		    emitWorkspaceEvent({ type: 'state', status: 'layout', generation: id, degraded: true })
+		    emitWorkspaceEvent({
+		      type: 'graph',
+		      generation: id,
+		      graph: composed.graph,
+		      statements: composed.statements,
+		      occurrences: composed.occurrences,
+		      sourceIds: composed.sourceIds,
+		      base: '',
+		      baseSource: 'none',
+		      prefixes: {},
+		      diagnostics: [],
+		      stats: composed.graph.stats,
+		      truncation: composed.graph.truncation || null,
+		      timing: {},
+		      degraded: true,
+		    })
+		    const layoutOptions = ontologyJobNormalizeLayout(request.layout)
+		    const settings = {
+		      impls: impls,
+		      scheduler: scheduler,
+		      isCancelled: function () { return disposed || id !== generation },
+		      onProgress: function () {
+		        // Workspace composition layout has no per-chunk status contract.
+		      },
+		    }
+		    ontologyJobSteppedLayout(composed.graph, layoutOptions, settings).then(function (outcome) {
+		      if (!outcome || outcome.cancelled || disposed || id !== generation) return
+		      emitWorkspaceEvent({
+		        type: 'layout',
+		        generation: id,
+		        positions: ontologyJobNormalizePositions(outcome.positions),
+		        timing: { layout: outcome.timing },
+		        degraded: true,
+		      })
+		      emitWorkspaceEvent({ type: 'state', status: 'ready', generation: id, degraded: true })
+		    }).catch(function (error) {
+		      if (disposed || id !== generation) return
+		      emitWorkspaceEvent({
+		        type: 'error', generation: id,
+		        message: 'layout failed: ' + ontologyJobErrorMessage(error),
+		      })
+		    })
+		  }
+
+		  /**
+		   * Compose the current workset into one graph. The worker path reuses the
+		   * parsed sources it cached during `parseSource`; the local path uses the L0
+		   * snapshot the runner keeps for recovery.
+		   */
+		  function compose(input) {
+		    if (disposed) return 0
+		    cancelWorkspaceRequest()
+		    generation += 1
+		    const id = generation
+		    const request = input && typeof input === 'object' ? input : {}
+		    const state = ensureWorkspace()
+		    if (!state) {
+		      emitWorkspaceEvent({ type: 'error', generation: id, message: 'workspace is unavailable' })
+		      return id
+		    }
+		    emitWorkspaceEvent({ type: 'state', status: 'modeling', generation: id, degraded: false })
+		    const layoutOptions = ontologyJobNormalizeLayout(request.layout)
+		    const useWorker = ontologyJobWorkerEnabled({
+		      workerFactory: workerFactory,
+		      workerSource: workerSource,
+		      forceMainThread: forceMainThread,
+		    })
+		    if (useWorker && !fallbackUsed) {
+		      let handle = null
+		      try {
+		        handle = ensureWorkspaceWorker()
+		      } catch (error) {
+		        fallbackUsed = true
+		        emitWorkspaceEvent({
+		          type: 'state', status: 'modeling', generation: id, degraded: true,
+		          message: 'Background composition unavailable: ' + ontologyJobErrorMessage(error),
+		        })
+		        composeLocally(id, request)
+		        return id
+		      }
+		      workspaceRequest = ontologyJobSendWorkerMessage(handle, {
+		        type: 'compose',
+		        id: id,
+		        sourceIds: Array.isArray(request.sourceIds) ? request.sourceIds : [],
+		        maxNodes: request.maxNodes,
+		        maxEdges: request.maxEdges,
+		        maxLiteralsPerNode: request.maxLiteralsPerNode,
+		        maxLiteralLength: request.maxLiteralLength,
+		        layout: layoutOptions,
+		      }, {
+		        id: id,
+		        timeoutMs: timeoutMs,
+		        isCancelled: function () { return disposed },
+		        onMessage: function (data) {
+		          if (disposed) return true
+		          if (data.type === 'graph') {
+		            lastGraph = data.graph || null
+		            lastMeta = {
+		              base: '',
+		              baseSource: 'none',
+		              prefixes: {},
+		              diagnostics: [],
+		              stats: data.graph && data.graph.stats ? data.graph.stats : {},
+		              truncation: data.graph && data.graph.truncation ? data.graph.truncation : null,
+		            }
+		            emitWorkspaceEvent({
+		              type: 'graph',
+		              generation: id,
+		              graph: data.graph || null,
+		              statements: data.statements,
+		              occurrences: data.occurrences,
+		              sourceIds: data.sourceIds,
+		              base: '',
+		              baseSource: 'none',
+		              prefixes: {},
+		              diagnostics: [],
+		              stats: data.graph && data.graph.stats ? data.graph.stats : {},
+		              truncation: data.graph && data.graph.truncation ? data.graph.truncation : null,
+		              timing: data.timing && typeof data.timing === 'object' ? data.timing : {},
+		              degraded: false,
+		            })
+		            return false
+		          }
+		          if (data.type === 'layout') {
+		            emitWorkspaceEvent({
+		              type: 'layout',
+		              generation: id,
+		              positions: ontologyJobDecodePositions(lastGraph, data.positions),
+		              timing: data.timing && typeof data.timing === 'object' ? data.timing : { layout: 0 },
+		              degraded: false,
+		            })
+		            emitWorkspaceEvent({ type: 'state', status: 'ready', generation: id, degraded: false })
+		            return true
+		          }
+		          if (data.type === 'error') {
+		            releaseWorkspaceWorker()
+		            fallbackUsed = true
+		            emitWorkspaceEvent({
+		              type: 'state', status: 'modeling', generation: id, degraded: true,
+		              message: 'Background composition unavailable: ' +
+		                (typeof data.message === 'string' ? data.message : 'worker error'),
+		            })
+		            composeLocally(id, request)
+		            return true
+		          }
+		          return false
+		        },
+		        onFailure: function (reason) {
+		          if (disposed) return
+		          releaseWorkspaceWorker()
+		          fallbackUsed = true
+		          emitWorkspaceEvent({
+		            type: 'state', status: 'modeling', generation: id, degraded: true,
+		            message: 'Background composition unavailable: ' + reason,
+		          })
+		          composeLocally(id, request)
+		        },
+		      })
+		      return id
+		    }
+		    composeLocally(id, request)
+		    return id
+		  }
+
+		  /** Drop one source from the local workspace and the worker cache. */
+		  function dropSource(sourceId) {
+		    if (disposed) return
+		    const state = ensureWorkspace()
+		    if (!state || typeof impls.removeSource !== 'function') return
+		    const result = impls.removeSource(state, sourceId)
+		    if (!result || !result.removed) return
+		    workspaceState = result.workspace
+		    const worker = workspaceWorker
+		    if (worker && worker.worker && typeof worker.worker.postMessage === 'function') {
+		      try {
+		        worker.worker.postMessage({ type: 'drop-source', id: -1, sourceId: sourceId })
+		      } catch (error) {
+		        // ignored: a missing cache entry is not an error
+		      }
+		    }
+		    emitWorkspaceEvent({
+		      type: 'sources',
+		      generation: generation,
+		      sources: workspaceSummaries(),
+		      totals: workspaceTotalsState(),
+		      removedSourceId: sourceId,
+		    })
+		  }
+
+		  function workspaceInfo() {
+		    return { sources: workspaceSummaries(), totals: workspaceTotalsState() }
+		  }
+
+		  // Shared workspaces exchange the already bounded L0 snapshots, never source
+		  // text or a reconstructed graph. Source records are immutable transactions.
+		  function sourceSnapshots() {
+		    return workspaceState ? workspaceState.sources.slice() : []
+		  }
+
+		  function importSource(input) {
+		    if (disposed || !input || !input.parsed || !Array.isArray(input.parsed.triples)) return 0
+		    cancelWorkspaceRequest()
+		    generation += 1
+		    // A subsequent compose hydrates this snapshot into the worker. Releasing
+		    // here also prevents an older worker cache from restoring removed sources.
+		    releaseWorkspaceWorker()
+		    const request = Object.assign({}, input, { text: undefined })
+		    commitSource(generation, request, input.parsed, Math.max(0, Number(input.byteSize) || 0))
+		    return generation
+		  }
+
+		  function disposeWorkspace() {
+		    cancelWorkspaceRequest()
+		    workspaceState = null
+		  }
+
+		  function releasedWorkspace() {
+		    disposeWorkspace()
 		  }
 
 		  function dispose() {
 		    cancelActiveJob()
+		    cancelWorkspaceRequest()
+		    releaseWorkspaceWorker()
+		    releasedWorkspace()
 		    disposed = true
 		    lastGraph = null
 		    lastMeta = null
@@ -6050,6 +9702,12 @@ window.__ModuleLoader__.load({
 		    submit: submit,
 		    relayout: relayout,
 		    cancel: cancel,
+		    parseSource: parseSource,
+		    compose: compose,
+		    dropSource: dropSource,
+		    workspaceInfo: workspaceInfo,
+		    sourceSnapshots: sourceSnapshots,
+		    importSource: importSource,
 		    dispose: dispose,
 		  }
 		}
@@ -7559,7 +11217,7 @@ window.__ModuleLoader__.load({
 		/** Default relations shown per predicate group before "show more". */
 		const DETAILS_GROUP_LIMIT = 10
 		/** Section order in the details panel; empty sections keep their slot. */
-		const DETAILS_SECTIONS = ['iri', 'types', 'literals', 'connections', 'structure', 'source']
+		const DETAILS_SECTIONS = ['iri', 'types', 'literals', 'connections', 'structure', 'provenance', 'source']
 		/** rdf:type IRI, used to put the type group first (no graph-model import here). */
 		const DETAILS_RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type'
 
@@ -7718,6 +11376,128 @@ window.__ModuleLoader__.load({
 		  return normalizeConnectionGroups({ out: toArray(outMap), in: toArray(inMap) }, options)
 		}
 
+		/** Resolve a source id to its display label from either a Map or a plain map. */
+		function sourceLabelFrom(labels, id) {
+		  if (labels && typeof labels.get === 'function') {
+		    const value = labels.get(id)
+		    if (typeof value === 'string' && value) return value
+		  }
+		  if (labels && typeof labels === 'object' && typeof labels[id] === 'string' && labels[id]) return labels[id]
+		  return String(id)
+		}
+
+		/**
+		 * Statement ids are tagged with NUL separators for collision safety. The UI must
+		 * never print those control characters, so map them to a readable separator and
+		 * keep the result bounded.
+		 */
+		function statementIdDisplay(id) {
+		  const text = typeof id === 'string' ? id : (id === undefined || id === null ? '' : String(id))
+		  return text.replace(/[\u0000-\u001f\u007f]+/g, ' \u00b7 ').trim().slice(0, 160)
+		}
+
+		/** One retained L1 edge per SPO, including its full accepted provenance. */
+		function incidentRelationDetails(graph, nodeId, labels) {
+		  const input = graph && typeof graph === 'object' ? graph : {}
+		  const edges = Array.isArray(input.edges) ? input.edges : []
+		  const sources = Array.isArray(input.sources) ? input.sources : []
+		  const sourceById = new Map(sources.filter((item) => item && typeof item.sourceId === 'string')
+		    .map((item) => [item.sourceId, item]))
+		  if (typeof nodeId !== 'string' || !nodeId) return []
+		  const records = []
+		  for (let index = 0; index < edges.length; index++) {
+		    const edge = edges[index]
+		    if (!edge || (edge.source !== nodeId && edge.target !== nodeId)) continue
+		    const ids = (items) => Array.isArray(items)
+		      ? Array.from(new Set(items.filter((id) => typeof id === 'string' && id))) : []
+		    const describe = (id) => {
+		      const source = sourceById.get(id)
+		      return {
+		        id,
+		        label: source && typeof source.displayName === 'string' && source.displayName
+		          ? source.displayName : sourceLabelFrom(labels, id),
+		        absolutePath: source && typeof source.absolutePath === 'string' ? source.absolutePath : null,
+		        navigationAddress: source && typeof source.navigationAddress === 'string' ? source.navigationAddress : null,
+		      }
+		    }
+		    const graphTerms = Array.isArray(edge.graphs) && edge.graphs.length
+		      ? edge.graphs
+		      : [{ kind: 'unknown', sourceIds: ids(edge.sourceIds) }]
+		    records.push({
+		      id: typeof edge.id === 'string' ? edge.id : String(index),
+		      subject: detailsString(edge.source), predicate: detailsString(edge.p), object: detailsString(edge.target),
+		      count: detailsNumber(edge.count, 1),
+		      sourceIds: ids(edge.sourceIds), sources: ids(edge.sourceIds).map(describe),
+		      statementIds: ids(edge.statementIds),
+		      graphs: graphTerms.map((term) => ({
+		        kind: term && ['default', 'iri', 'blank', 'unknown'].includes(term.kind) ? term.kind : 'unknown',
+		        value: term && typeof term.value === 'string' ? term.value : null,
+		        sourceIds: ids(term && term.sourceIds),
+		        sources: ids(term && term.sourceIds).map(describe),
+		      })),
+		      location: null,
+		    })
+		  }
+		  return records
+		}
+
+		/** Group every retained relation; pagination is performed by the DOM only. */
+		function incidentConnectionGroups(graph, nodeId, labels) {
+		  const input = graph && typeof graph === 'object' ? graph : {}
+		  const byId = new Map((Array.isArray(input.nodes) ? input.nodes : [])
+		    .filter((node) => node && typeof node.id === 'string').map((node) => [node.id, node]))
+		  const maps = { out: new Map(), in: new Map() }
+		  const summary = { outEdges: 0, inEdges: 0, degree: 0 }
+		  for (const relation of incidentRelationDetails(graph, nodeId, labels)) {
+		    for (const direction of ['out', 'in']) {
+		      if ((direction === 'out' ? relation.subject : relation.object) !== nodeId) continue
+		      const endpointId = direction === 'out' ? relation.object : relation.subject
+		      const endpoint = byId.get(endpointId)
+		      const map = maps[direction]
+		      let group = map.get(relation.predicate)
+		      if (!group) {
+		        group = { direction, predicate: relation.predicate,
+		          label: detailsLocalName(relation.predicate) || relation.predicate, count: 0, items: [] }
+		        map.set(relation.predicate, group)
+		      }
+		      group.count++
+		      group.items.push({ id: endpointId,
+		        label: endpoint && (endpoint.label || endpoint.local) || endpointId,
+		        kind: endpoint && endpoint.kind || 'individual', relation })
+		      if (direction === 'out') summary.outEdges++
+		      else summary.inEdges++
+		    }
+		  }
+		  summary.degree = summary.outEdges + summary.inEdges
+		  const sorted = (map) => Array.from(map.values()).sort(compareConnectionGroups)
+		  return { out: sorted(maps.out), in: sorted(maps.in), summary, maxPerGroup: DETAILS_GROUP_LIMIT }
+		}
+
+		/**
+		 * Aggregate the graph identity of one node from its incident edges. Nodes do
+		 * not carry graph terms themselves; edges do, so the counts are edges, not
+		 * statements, and the UI labels them as such.
+		 */
+		function nodeGraphKinds(graph, nodeId) {
+		  const counts = { default: 0, iri: 0, blank: 0, unknown: 0 }
+		  const edges = graph && Array.isArray(graph.edges) ? graph.edges : []
+		  for (const edge of edges) {
+		    if (!edge || typeof nodeId !== 'string') continue
+		    if (edge.source !== nodeId && edge.target !== nodeId) continue
+		    const list = Array.isArray(edge.graphs) ? edge.graphs : []
+		    if (list.length === 0) {
+		      counts.unknown += 1
+		      continue
+		    }
+		    for (const item of list) {
+		      const kind = item && typeof item.kind === 'string' ? item.kind : 'unknown'
+		      if (Object.prototype.hasOwnProperty.call(counts, kind)) counts[kind] += 1
+		      else counts.unknown += 1
+		    }
+		  }
+		  return counts
+		}
+
 		/** Section order with presence flags; empty sections keep their fixed slot. */
 		function detailsSections(node, groups) {
 		  const target = node && typeof node === 'object' ? node : {}
@@ -7732,6 +11512,10 @@ window.__ModuleLoader__.load({
 		    literals: literals.length > 0,
 		    connections: out.length > 0 || incoming.length > 0,
 		    structure: typeof target.id === 'string' && target.id.length > 0,
+		    provenance: Boolean(target.provenance && (
+		      (Array.isArray(target.provenance.sourceIds) && target.provenance.sourceIds.length > 0) ||
+		      (Array.isArray(target.provenance.statementIds) && target.provenance.statementIds.length > 0)
+		    )),
 		    source: DETAILS_SOURCE_ENABLED && Boolean(target.source),
 		  }
 		  return DETAILS_SECTIONS.map((key) => ({ key, present: present[key] === true }))
@@ -7741,7 +11525,9 @@ window.__ModuleLoader__.load({
 		function visibleGroupItems(group, expanded, limit) {
 		  const items = group && Array.isArray(group.items) ? group.items : []
 		  const capped = Math.max(0, Math.floor(detailsNumber(limit, DETAILS_GROUP_LIMIT)))
-		  const max = expanded === true ? items.length : Math.min(items.length, capped)
+		  const pageSize = typeof expanded === 'number' && Number.isFinite(expanded)
+		    ? Math.max(capped, Math.floor(expanded)) : expanded === true ? items.length : capped
+		  const max = Math.min(items.length, pageSize)
 		  return {
 		    items: items.slice(0, max),
 		    hiddenCount: Math.max(0, items.length - max),
@@ -7804,26 +11590,26 @@ window.__ModuleLoader__.load({
 		    const narrow = props.narrow === true
 		    const open = props.open !== false
 		    const [collapsedGroups, setCollapsedGroups] = React.useState({})
-		    const [expandedGroups, setExpandedGroups] = React.useState({})
-		    const [maxPerGroup, setMaxPerGroup] = React.useState(DETAILS_GROUP_LIMIT)
+		    const [expandedRelations, setExpandedRelations] = React.useState({})
+		    const [groupPages, setGroupPages] = React.useState({})
+		    const [sourceCopyError, setSourceCopyError] = React.useState(false)
 		    const panelRef = React.useRef(null)
 		    const previousFocusRef = React.useRef(null)
 
-		    const groups = React.useMemo(() => {
-		      if (!node) return null
-		      const limit = Math.max(DETAILS_GROUP_LIMIT, maxPerGroup)
-		      if (typeof connectionGroups === 'function') {
-		        try {
-		          return normalizeConnectionGroups(
-		            connectionGroups(props.graph, node.id, { maxPerGroup: limit }),
-		            { maxPerGroup: limit },
-		          )
-		        } catch (error) {
-		          return connectionGroupsFallback(props.graph, node.id, { maxPerGroup: limit })
-		        }
+		    const groups = React.useMemo(() => node
+		      ? incidentConnectionGroups(props.graph, node.id, props.sourceLabels) : null,
+		    [node, props.graph, props.sourceLabels])
+
+		    const copySourceId = (id) => {
+		      setSourceCopyError(false)
+		      try {
+		        if (typeof navigator === 'undefined' || !navigator.clipboard ||
+		            typeof navigator.clipboard.writeText !== 'function') throw new Error('clipboard unavailable')
+		        Promise.resolve(navigator.clipboard.writeText(String(id))).catch(() => setSourceCopyError(true))
+		      } catch (error) {
+		        setSourceCopyError(true)
 		      }
-		      return connectionGroupsFallback(props.graph, node.id, { maxPerGroup: limit })
-		    }, [node, props.graph, maxPerGroup])
+		    }
 
 		    // Modal drawer focus management: focus enters the panel, Tab cycles inside,
 		    // and closing restores focus to the element that opened it.
@@ -7889,6 +11675,23 @@ window.__ModuleLoader__.load({
 		    const onSelectNode = typeof props.onSelectNode === 'function' ? props.onSelectNode : () => {}
 		    const drawnEdgeKeys = props.drawnEdgeKeys
 		    const literalInfo = literalTruncation(node)
+		    const sourceNames = (ids) => (Array.isArray(ids) ? ids : []).map((id) => {
+		      const source = props.graph && Array.isArray(props.graph.sources)
+		        ? props.graph.sources.find((candidate) => candidate && candidate.sourceId === id) : null
+		      return { id, label: source && source.displayName || sourceLabelFrom(props.sourceLabels, id),
+		        absolutePath: source && source.absolutePath, navigationAddress: source && source.navigationAddress }
+		    })
+		    const sourceList = (sources) => sources.length
+		      ? h('ul', { className: 'dov-items' }, sources.map((source) => h('li', { key: source.id, className: 'dov-item' },
+		        h('span', { className: 'dov-item-label' }, source.label),
+		        h('code', { style: { userSelect: 'text', overflowWrap: 'anywhere' } }, source.id),
+		        source.absolutePath ? h('div', { className: 'dov-muted', style: { overflowWrap: 'anywhere' } }, source.absolutePath) : null,
+		        source.navigationAddress ? h('div', { className: 'dov-muted', style: { overflowWrap: 'anywhere' } }, source.navigationAddress) : null,
+		        h('button', { type: 'button', className: 'dov-btn',
+		          'aria-label': tr('viewer.copySourceId', '复制来源标识') + ' ' + source.label,
+		          onClick: () => copySourceId(source.id) }, tr('viewer.copySourceId', '复制来源标识')),
+		        sourceCopyError ? h('span', { className: 'dov-rel-hidden' }, tr('viewer.copyFailed', '复制失败')) : null)))
+		      : h('span', { className: 'dov-muted' }, tr('provenance.none', '没有保留的来源'))
 
 		    const connectionList = (direction) => {
 		      const list = direction === 'out' ? groups.out : groups.in
@@ -7899,10 +11702,32 @@ window.__ModuleLoader__.load({
 		      return list.map((group) => {
 		        const groupKey = direction + ':' + group.predicate
 		        const collapsed = collapsedGroups[groupKey] === true
-		        const expanded = expandedGroups[groupKey] === true
-		        const page = visibleGroupItems(group, expanded, DETAILS_GROUP_LIMIT)
-		        const hasMore = group.count > page.items.length
+		        const pageNumber = detailsNumber(groupPages[groupKey], 1)
+		        const page = visibleGroupItems(group, (pageNumber - 1) * DETAILS_GROUP_LIMIT + DETAILS_GROUP_LIMIT, DETAILS_GROUP_LIMIT)
+		        const hasMore = page.hasMore
 		        const itemNodes = page.items.map((item) => {
+		          const relation = item.relation
+		          const relationKey = node.id + ':' + direction + ':' + relation.id
+		          const isOpen = expandedRelations[relationKey] === true
+		          const field = (key, value) => h('div', { key, className: 'dov-muted',
+		            style: { overflowWrap: 'anywhere', userSelect: 'text' } },
+		          tr('provenance.' + key, key) + ': ', h('code', null, value))
+		          const provenanceContent = isOpen ? h('div', { className: 'dov-item' },
+		            field('subject', relation.subject), field('predicate', relation.predicate), field('object', relation.object),
+		            h('div', { className: 'dov-muted' }, '×' + String(relation.count)),
+		            h('div', null, tr('provenance.sources', '来源（{n}）')
+		              .replace('{n}', String(relation.sourceIds.length)), sourceList(relation.sources)),
+		            h('div', null, tr('provenance.graphs', '命名图') + ':',
+		              h('ul', { className: 'dov-items' }, relation.graphs.map((graphTerm, graphIndex) =>
+		                h('li', { key: String(graphIndex), className: 'dov-item' },
+		                  tr('provenance.graph.' + graphTerm.kind, graphTerm.kind),
+		                  graphTerm.value !== null ? h('code', { style: { overflowWrap: 'anywhere' } }, ' ' + graphTerm.value) : null,
+		                  sourceList(graphTerm.sources))))),
+		            h('div', { className: 'dov-muted', style: { overflowWrap: 'anywhere', userSelect: 'text' } },
+		              'statementIds: ', h('code', null, relation.statementIds.length
+		                ? relation.statementIds.map(statementIdDisplay).join(', ')
+		                : tr('viewer.graphIdentityNone', '无'))),
+		            h('div', { className: 'dov-muted' }, tr('viewer.locationUnavailable', '语句位置未记录（null）。'))) : null;
 		          const drawn = !drawnEdgeKeys || (typeof drawnEdgeKeys.has === 'function' &&
 		            drawnEdgeKeys.has(relationDrawnKey(direction, node.id, group.predicate, item.id)))
 		          const content = [
@@ -7912,15 +11737,17 @@ window.__ModuleLoader__.load({
 		            drawn ? null : h('span', { key: 'hidden', className: 'dov-rel-hidden' },
 		              tr('viewer.relationsHidden', '未在画布绘制')),
 		          ]
-		          if (canSelectNode(item.id)) {
-		            return h('li', { key: item.id },
-		              h('button', {
-		                type: 'button',
-		                className: 'dov-rel-item',
-		                onClick: () => onSelectNode(item.id),
-		              }, content))
-		          }
-		          return h('li', { key: item.id }, h('span', { className: 'dov-rel-item' }, content))
+		          return h('li', { key: relationKey },
+		            canSelectNode(item.id)
+		              ? h('button', { type: 'button', className: 'dov-rel-item',
+		                onClick: () => onSelectNode(item.id) }, content)
+		              : h('span', { className: 'dov-rel-item' }, content),
+		            h('button', { type: 'button', className: 'dov-rel-more',
+		              'aria-expanded': isOpen,
+		              'aria-label': tr('provenance.relations', '关系（{n}）').replace('{n}', '1') + ' ' + item.label,
+		              onClick: () => setExpandedRelations((previous) => ({ ...previous, [relationKey]: !isOpen })) },
+		            tr('viewer.provenance', '已接纳来源') + (isOpen ? ' ▾' : ' ▸')),
+		            provenanceContent)
 		        })
 		        const tail = []
 		        if (hasMore) {
@@ -7928,12 +11755,9 @@ window.__ModuleLoader__.load({
 		            h('button', {
 		              type: 'button',
 		              className: 'dov-rel-more',
-		              onClick: () => {
-		                setExpandedGroups((previous) => ({ ...previous, [groupKey]: true }))
-		                if (group.items.length < group.count) {
-		                  setMaxPerGroup((previous) => Math.max(previous + DETAILS_GROUP_LIMIT, group.items.length + 1))
-		                }
-		              },
+		              onClick: () => setGroupPages((previous) => ({
+		                ...previous, [groupKey]: pageNumber + 1,
+		              })),
 		            }, tr('viewer.showMore', '显示更多'))))
 		        }
 		        return h('div', { key: groupKey, className: 'dov-group' },
@@ -7993,19 +11817,22 @@ window.__ModuleLoader__.load({
 		              : null),
 		          literals.length === 0
 		            ? h('div', { className: 'dov-muted' }, tr('viewer.noLiterals', '没有字面量属性'))
-		            : h('table', { className: 'dov-literals' },
-		              h('tbody', null, literals.map((literal, index) => h('tr', { key: 'lit-' + String(index) },
-		                h('td', { className: 'dov-lit-p', title: literal.p || '' },
-		                  literal.pLabel || shortenIri(literal.p || '')),
-		                h('td', { className: 'dov-lit-v' },
-		                  typeof literal.value === 'string' ? literal.value : String(literal.value),
-		                  literal.lang ? h('span', { className: 'dov-lit-meta', key: 'lang' }, ' @' + literal.lang) : null,
-		                  literal.dt ? h('span', { className: 'dov-lit-meta', key: 'dt' },
-		                    ' ^^' + (detailsLocalName(literal.dt) || literal.dt)) : null,
-		                  literal.truncated
-		                    ? h('span', { className: 'dov-lit-meta', key: 'trunc' },
-		                      ' ' + tr('viewer.literalValueTruncated', '值已截断'))
-		                    : null)))))))
+		            : h('div', { className: 'dov-literals' }, literals.map((literal, index) => {
+		              const literalValue = [
+		                typeof literal.value === 'string' ? literal.value : String(literal.value),
+		                literal.lang ? h('span', { key: 'lang', className: 'dov-lit-meta' }, ' @' + literal.lang) : null,
+		                literal.dt ? h('span', { key: 'dt', className: 'dov-lit-meta' }, ' ^^' + (detailsLocalName(literal.dt) || literal.dt)) : null,
+		                literal.truncated ? h('span', { key: 'trunc', className: 'dov-lit-meta' }, ' ' + tr('viewer.literalValueTruncated', '值已截断')) : null,
+		              ]
+		              return h('div', { key: 'lit-' + String(index), className: 'dov-lit-row' },
+		                h('div', { className: 'dov-lit-p', title: literal.p || '' }, literal.pLabel || shortenIri(literal.p || '')),
+		                h('div', { className: 'dov-lit-v' }, literalValue),
+		                h('div', { className: 'dov-muted', style: { overflowWrap: 'anywhere' } },
+		                  sourceList(sourceNames(literal.sourceIds)),
+		                  h('code', { style: { userSelect: 'text' } },
+		                    (Array.isArray(literal.statementIds) ? literal.statementIds : [])
+		                      .map(statementIdDisplay).join(', ') || '—')))
+		            }))))
 		      } else if (section.key === 'connections') {
 		        const empty = groups.out.length === 0 && groups.in.length === 0
 		        const connectionsBody = empty
@@ -8030,6 +11857,57 @@ window.__ModuleLoader__.load({
 		            countCell('outEdges', '出边'),
 		            countCell('inEdges', '入边'),
 		            countCell('degree', '度数'))))
+		      } else if (section.key === 'provenance') {
+		        const provenance = node.provenance && typeof node.provenance === 'object' ? node.provenance : {}
+		        const sourceIds = Array.isArray(provenance.sourceIds) ? provenance.sourceIds : []
+		        const roles = Array.isArray(provenance.roles) ? provenance.roles : []
+		        const statementIds = Array.isArray(provenance.statementIds) ? provenance.statementIds : []
+		        const labels = props.sourceLabels
+		        const labelFor = (id) => sourceLabelFrom(labels, id)
+		        sectionElements.push(h('section', { key: 'provenance', className: 'dov-section' },
+		          h('div', { className: 'dov-section-title' },
+		            tr('viewer.provenance', '已接纳来源'),
+		            h('span', { className: 'dov-muted' },
+		              tr('viewer.provenanceStatements', '{n} statements')
+		                .replace('{n}', String(statementIds.length)))),
+		          sourceIds.length > 0
+		            ? h('div', { key: 'sources', className: 'dov-items' }, sourceIds.map((id) => h('div', {
+		              key: 'src-' + id,
+		              className: 'dov-item',
+		            }, h('span', { className: 'dov-item-label' }, labelFor(id)))))
+		            : h('div', { key: 'none', className: 'dov-muted' },
+		              tr('viewer.provenanceMissing', 'No accepted source recorded for this entity.')),
+		          sourceIds.length > 0
+		            ? h('div', { key: 'copy-ids', className: 'dov-muted' },
+		              tr('viewer.copySourceHint', 'Copy source identity'),
+		              sourceIds.map((id) => h('button', {
+		                key: 'copy-' + id,
+		                type: 'button',
+		                className: 'dov-btn',
+		                title: labelFor(id) + ' · ' + id,
+		                'aria-label': tr('viewer.copySourceId', 'Copy source id') + ' ' + labelFor(id),
+		                onClick: () => copySourceId(id),
+		              }, tr('viewer.copySourceId', 'Copy source id'))))
+		            : null,
+		          h('div', { key: 'roles', className: 'dov-muted' },
+		            tr('viewer.provenanceRoles', 'Roles: {roles}')
+		              .replace('{roles}', roles.length > 0 ? roles.join(', ') : '—')),
+		          h('div', { key: 'graphs', className: 'dov-muted' },
+		            tr('viewer.graphIdentity', 'Graph identity') + ': ' + (function () {
+		              const kinds = nodeGraphKinds(props.graph, node.id)
+		              const parts = []
+		              for (const kind of ['default', 'iri', 'blank', 'unknown']) {
+		                if (!kinds[kind]) continue
+		                parts.push(tr('provenance.graph.' + kind, kind) + ' \u00d7' + String(kinds[kind]))
+		              }
+		              return parts.length > 0 ? parts.join(' \u00b7 ') : tr('viewer.graphIdentityNone', 'none')
+		            })()),
+		          h('div', { key: 'location', className: 'dov-muted' },
+		            tr('viewer.locationUnavailable', 'Statement location is not recorded (null).')),
+		          sourceCopyError ? h('div', { key: 'copy-error', className: 'dov-rel-hidden' },
+		            tr('viewer.copyFailed', '复制失败') + ' · ' + tr('viewer.copySourceHint', '复制来源标识') + ': ' + sourceIds.join(', ')) : null,
+		          h('div', { key: 'hint', className: 'dov-muted' },
+		            tr('viewer.provenanceHint', 'Accepted sources are not proof that the input is complete.'))))
 		      } else if (section.key === 'source') {
 		        const graphSource = props.graph && typeof props.graph.source === 'object' && props.graph.source
 		          ? props.graph.source
@@ -8251,18 +12129,31 @@ window.__ModuleLoader__.load({
 
 		    // --- presentation state -------------------------------------------------
 		    const [size, setSize] = useState(GRAPH_DEFAULT_SIZE)
-		    const [zoom, setZoom] = useState(1)
-		    const [pan, setPan] = useState({ x: 0, y: 0 })
+		    const initialCameraRef = useRef(props.cameraRef && props.cameraRef.current && props.cameraRef.current.saved
+		      ? Object.assign({}, props.cameraRef.current) : null)
+		    const [zoom, setZoom] = useState(() => initialCameraRef.current ? initialCameraRef.current.zoom : 1)
+		    const [pan, setPan] = useState(() => initialCameraRef.current
+		      ? { x: initialCameraRef.current.panX, y: initialCameraRef.current.panY } : { x: 0, y: 0 })
 		    const [selectedId, setSelectedId] = useState(null)
 		    const [hoverId, setHoverId] = useState(null)
-		    const [query, setQuery] = useState('')
+		    const [internalQuery, setInternalQuery] = useState('')
+		    const controlledQuery = typeof props.searchQuery === 'string'
+		    const query = controlledQuery ? props.searchQuery : internalQuery
+		    const setQuery = useCallback((value) => {
+		      if (typeof props.onSearchQuery === 'function') props.onSearchQuery(value)
+		      else setInternalQuery(value)
+		    }, [props.onSearchQuery])
 		    const [searchIndex, setSearchIndex] = useState(0)
 		    const [searchFocused, setSearchFocused] = useState(false)
 		    const [labelsOn, setLabelsOn] = useState(true)
 		    const [panelOpen, setPanelOpen] = useState(true)
 		    const [activePanel, setActivePanel] = useState('none')
-		    const [filterState, setFilterState] = useState(() => emptyFilterState())
-		    const [exploreState, setExploreState] = useState(() => createExploreState())
+		    const [internalFilterState, setInternalFilterState] = useState(() => emptyFilterState())
+		    const [internalExploreState, setInternalExploreState] = useState(() => createExploreState())
+		    const filterState = props.filterState || internalFilterState
+		    const exploreState = props.exploreState || internalExploreState
+		    const setFilterState = props.onFilterState || setInternalFilterState
+		    const setExploreState = props.onExploreState || setInternalExploreState
 		    const [notice, setNotice] = useState(null)
 		    const [issuesOpen, setIssuesOpen] = useState(false)
 		    const [copyState, setCopyState] = useState('idle')
@@ -8423,6 +12314,19 @@ window.__ModuleLoader__.load({
 		        edge && typeof edge.source === 'string' && typeof edge.target === 'string' &&
 		        renderableIds.has(edge.source) && renderableIds.has(edge.target))
 		    }, [drawnResult, renderableIds])
+		    useEffect(() => {
+		      if (!props.displaySceneRef) return
+		      props.displaySceneRef.current = {
+		        // The raw prop identity is what the workspace compares against: the
+		        // normalized graph is a new object whenever any array is re-created.
+		        graph: graph,
+		        nodes: renderableNodes,
+		        edges: renderedEdges,
+		        positions: renderableNodes.map(node => Object.assign({ id: node.id }, positionById.get(node.id))),
+		        labels: labelsOn,
+		        ready: !['parsing', 'modeling', 'layout'].includes(layoutStatus) && hasPositions,
+		      }
+		    }, [safeGraph, renderableNodes, renderedEdges, positionById, labelsOn, layoutStatus, hasPositions, props.displaySceneRef])
 		    const drawnEdgeKeys = useMemo(() => {
 		      const set = new Set()
 		      for (const edge of drawnResult.edges) {
@@ -8502,6 +12406,22 @@ window.__ModuleLoader__.load({
 		    useEffect(() => { panRef.current = pan }, [pan])
 		    useEffect(() => { hoverRef.current = hoverId }, [hoverId])
 
+		    // Report the current camera so the workspace shell can export exactly what
+		    // is on screen (the view never serializes its own DOM).
+		    useEffect(() => {
+		      const cameraRef = props.cameraRef
+		      if (cameraRef && typeof cameraRef === 'object') {
+		        cameraRef.current = {
+		          saved: true,
+		          zoom: zoom,
+		          panX: pan.x,
+		          panY: pan.y,
+		          width: size.width,
+		          height: size.height,
+		        }
+		      }
+		    }, [zoom, pan, size, props.cameraRef])
+
 		    // --- measure the canvas (ResizeObserver + debounce) ---------------------
 		    useLayoutEffect(() => {
 		      const element = canvasRef.current
@@ -8531,14 +12451,16 @@ window.__ModuleLoader__.load({
 		    useEffect(() => {
 		      if (graphIdentityRef.current === safeGraph) return
 		      graphIdentityRef.current = safeGraph
-		      setSelectedId(null)
+		      if (!props.workspaceManaged) setSelectedId(null)
 		      setHoverId(null)
-		      setQuery('')
+		      if (!props.workspaceManaged) setQuery('')
 		      setSearchIndex(0)
 		      setSearchFocused(false)
 		      setActivePanel('none')
-		      setFilterState(emptyFilterState())
-		      setExploreState(createExploreState())
+		      if (!props.workspaceManaged) {
+		        setFilterState(emptyFilterState())
+		        setExploreState(createExploreState())
+		      }
 		      setNotice(null)
 		      setOverrides({})
 		      setRovingId(null)
@@ -8654,6 +12576,12 @@ window.__ModuleLoader__.load({
 		      fitted.graph = safeGraph
 		      fitted.positions = positionsProp
 		      fitted.measured = measured
+		      if (initialCameraRef.current) {
+		        const restored = initialCameraRef.current
+		        if (measured) initialCameraRef.current = null
+		        applyView(restored.zoom, { x: restored.panX, y: restored.panY })
+		        return
+		      }
 		      const view = fitView(fitPointsList, size.width, size.height, GRAPH_FIT_PADDING)
 		      applyView(view.zoom, view.pan)
 		    }, [fitPointsList, safeGraph, positionsProp, size.width, size.height, applyView])
@@ -8716,6 +12644,7 @@ window.__ModuleLoader__.load({
 		      return node ? (node.label || node.local || node.id) : String(id)
 		    }, [nodesById])
 
+		    const onSelectNode = typeof props.onSelectNode === 'function' ? props.onSelectNode : null
 		    const selectNode = useCallback((id, options) => {
 		      const target = typeof id === 'string' && nodesById.has(id) ? id : null
 		      if (target && (!options || options.focusGraph !== false)) focusGraphCanvas()
@@ -8723,6 +12652,7 @@ window.__ModuleLoader__.load({
 		      setPanelOpen(Boolean(target))
 		      if (target) setRovingId(target)
 		      setNotice(null)
+		      if (target && onSelectNode) onSelectNode(target)
 		      if (target && exploreState.on && target !== selectedId) {
 		        setExploreState((previous) => resetExploreCursor(previous))
 		        setNotice({ kind: 'explore-root-switched', nodeLabel: labelOf(target) })
@@ -8733,7 +12663,18 @@ window.__ModuleLoader__.load({
 		          setNotice({ kind: 'selection-hidden', nodeLabel: labelOf(target) })
 		        }
 		      }
-		    }, [nodesById, exploreState.on, selectedId, filterActive, filterState, safeGraph, labelOf, focusGraphCanvas])
+		    }, [nodesById, exploreState.on, selectedId, filterActive, filterState, safeGraph, labelOf, focusGraphCanvas, onSelectNode])
+
+		    // Controlled selection: the workspace shell keeps one selected entity across
+		    // views, so an external selection is adopted when it exists in this graph.
+		    const externalSelection = typeof props.selectedId === 'string' ? props.selectedId : null
+		    useEffect(() => {
+		      if (!externalSelection) return
+		      if (!nodesById.has(externalSelection)) return
+		      if (externalSelection === selectedId) return
+		      setSelectedId(externalSelection)
+		      setPanelOpen(true)
+		    }, [externalSelection, nodesById, selectedId])
 
 		    const selectAndCenter = useCallback((id) => {
 		      if (!nodesById.has(id)) return
@@ -9405,6 +13346,7 @@ window.__ModuleLoader__.load({
 		      kindLabel,
 		      shortenIri: shortIri,
 		      drawnEdgeKeys,
+		      sourceLabels: props.sourceLabels,
 		      canSelectNode: (id) => nodesById.has(id),
 		      onSelectNode: selectAndCenter,
 		      copyState,
@@ -9439,6 +13381,2165 @@ window.__ModuleLoader__.load({
 		  }
 
 		  return { OntologyGraphView }
+		}
+
+		// ==== src/graph-view-multiview.js ====
+		/**
+		 * Workspace-level UI: view switcher, source panel, class tree, layered relation
+		 * view, provenance details and the export dialog.
+		 *
+		 * Kept as a separate module so the network view (`graph-view.js`) keeps its
+		 * established interaction contract. Every component is plain
+		 * React.createElement; colors come from host theme tokens with literal
+		 * fallbacks; all text goes through the plugin `tr()` dictionary.
+		 *
+		 * The tree and layered components never create RDF entities: they render the
+		 * projections produced by `ontology-views.js` (display references and SCC
+		 * groups) and report the selected *entity* id upward.
+		 */
+
+		/** Small pure helper: toggle one entity id in an expansion list. */
+		function toggleExpandedList(expandedIds, entityId) {
+		  const list = Array.isArray(expandedIds) ? expandedIds : []
+		  if (typeof entityId !== 'string' || !entityId) return list
+		  if (list.indexOf(entityId) >= 0) return list.filter((id) => id !== entityId)
+		  return list.concat([entityId])
+		}
+
+		/** Map a source status to its localization key family. */
+		function sourceStatusKey(status) {
+		  if (status === 'ready') return 'source.status.ready'
+		  if (status === 'partial') return 'source.status.partial'
+		  if (status === 'empty') return 'source.status.empty'
+		  if (status === 'rejected') return 'source.status.rejected'
+		  return 'source.status.error'
+		}
+
+		/**
+		 * Compute the next explicit workset when one source checkbox is toggled.
+		 *
+		 * An empty workset means "every source is selected" (no filter), so the first
+		 * deselect must materialize the other ids instead of keeping only the clicked
+		 * one. Returning an empty list restores the unfiltered state.
+		 */
+		function nextWorksetSelection(allSourceIds, worksetIds, sourceId) {
+		  const all = Array.isArray(allSourceIds)
+		    ? allSourceIds.filter((id) => typeof id === 'string' && id)
+		    : []
+		  if (typeof sourceId !== 'string' || !sourceId || all.indexOf(sourceId) < 0) {
+		    return Array.isArray(worksetIds) ? worksetIds.slice() : []
+		  }
+		  const explicit = Array.isArray(worksetIds)
+		    ? worksetIds.filter((id) => typeof id === 'string' && all.indexOf(id) >= 0)
+		    : []
+		  const selected = explicit.length > 0 ? explicit : all.slice()
+		  const has = selected.indexOf(sourceId) >= 0
+		  const next = has ? selected.filter((id) => id !== sourceId) : selected.concat([sourceId])
+		  return next.length === all.length || next.length === 0 ? [] : next
+		}
+
+		/**
+		 * Resolve a class-tree search query against the whole hierarchy (not only the
+		 * expanded rows): the first match plus the ancestor path that reveals it.
+		 */
+		function treeSearchPlan(hierarchy, query) {
+		  const text = typeof query === 'string' ? query.trim().toLowerCase() : ''
+		  const empty = { query: '', count: 0, entityId: null, ancestors: [] }
+		  if (!text) return empty
+		  const entities = hierarchy && hierarchy.entities
+		  if (!entities || typeof entities.forEach !== 'function') return empty
+		  const ids = []
+		  entities.forEach((entity, id) => {
+		    const label = entity && typeof entity.label === 'string' && entity.label
+		      ? entity.label.toLowerCase()
+		      : String(id).toLowerCase()
+		    if (label.indexOf(text) >= 0 || String(id).toLowerCase().indexOf(text) >= 0) ids.push(id)
+		  })
+		  if (ids.length === 0) return { query: text, count: 0, entityId: null, ancestors: [] }
+		  ids.sort()
+		  const first = ids[0]
+		  const ancestors = []
+		  const seen = new Set([first])
+		  let cursor = first
+		  for (;;) {
+		    const entity = entities.get(cursor)
+		    if (!entity || !Array.isArray(entity.parents)) break
+		    const parent = entity.parents
+		      .map((relation) => relation && relation.parentId)
+		      .filter((id) => typeof id === 'string' && entities.has(id) && !seen.has(id))
+		      .sort()[0]
+		    if (!parent) break
+		    ancestors.unshift(parent)
+		    seen.add(parent)
+		    cursor = parent
+		  }
+		  return { query: text, count: ids.length, entityId: first, ancestors: ancestors }
+		}
+
+		/**
+		 * Keep search matches plus their ancestor rows so the tree shows context
+		 * instead of a flat list of detached hits.
+		 */
+		function filterTreeRows(refs, hierarchy, plan) {
+		  const list = Array.isArray(refs) ? refs : []
+		  if (!plan || !plan.query) return list
+		  const entities = hierarchy && hierarchy.entities
+		  if (!entities || typeof entities.get !== 'function') return []
+		  const byRef = new Map()
+		  for (const ref of list) if (ref && typeof ref.refId === 'string') byRef.set(ref.refId, ref)
+		  const keep = new Set()
+		  for (const ref of list) {
+		    if (!ref || typeof ref.refId !== 'string') continue
+		    const entity = entities.get(ref.entityId)
+		    const label = entity && typeof entity.label === 'string' && entity.label
+		      ? entity.label.toLowerCase()
+		      : String(ref.entityId).toLowerCase()
+		    if (label.indexOf(plan.query) < 0 && String(ref.entityId).toLowerCase().indexOf(plan.query) < 0) continue
+		    keep.add(ref.refId)
+		    let parent = ref.parentRefId
+		    while (typeof parent === 'string' && byRef.has(parent) && !keep.has(parent)) {
+		      keep.add(parent)
+		      parent = byRef.get(parent).parentRefId
+		    }
+		  }
+		  return list.filter((ref) => ref && keep.has(ref.refId))
+		}
+
+		/**
+		 * Focus set for the layered view: the selected node (or expanded cycle group)
+		 * plus its direct neighbours and their edges. Null means "no focus", so the
+		 * whole diagram renders at full strength.
+		 */
+		function layeredFocus(layout, selectedId) {
+		  if (!layout || typeof selectedId !== 'string' || !selectedId) return null
+		  const nodes = Array.isArray(layout.nodes) ? layout.nodes : []
+		  const edges = Array.isArray(layout.edges) ? layout.edges : []
+		  const seed = new Set()
+		  for (const node of nodes) {
+		    if (!node || typeof node.id !== 'string') continue
+		    const owner = node.kind === 'group' ? (node.groupId || node.id) : node.id
+		    if (owner === selectedId || node.id === selectedId) seed.add(node.id)
+		  }
+		  if (seed.size === 0) return null
+		  const focusedNodes = new Set(seed)
+		  const focusedEdges = new Set()
+		  for (const edge of edges) {
+		    if (!edge) continue
+		    if (seed.has(edge.source) || seed.has(edge.target)) {
+		      if (typeof edge.id === 'string') focusedEdges.add(edge.id)
+		      focusedNodes.add(edge.source)
+		      focusedNodes.add(edge.target)
+		    }
+		  }
+		  return { nodes: focusedNodes, edges: focusedEdges }
+		}
+
+		/** Toggle one Host file path in the workspace-file picker selection. */
+		function togglePickerSelection(selected, path, checked) {
+		  const list = Array.isArray(selected) ? selected.filter((item) => typeof item === 'string') : []
+		  if (typeof path !== 'string' || !path) return list
+		  const has = list.indexOf(path) >= 0
+		  const want = checked !== undefined ? checked : !has
+		  if (want && !has) return list.concat([path])
+		  if (!want && has) return list.filter((item) => item !== path)
+		  return list
+		}
+
+		/**
+		 * Badge model for one source row: origin, status, format and the per-file
+		 * warning flags. Kept pure so the read/error/truncated/empty matrix is testable
+		 * without React.
+		 */
+		function sourcePanelBadges(source) {
+		  const item = source && typeof source === 'object' ? source : {}
+		  const badges = []
+		  const browser = item.origin === 'browser'
+		  badges.push({
+		    key: 'origin',
+		    textKey: browser ? 'source.origin.browser' : 'source.origin.host',
+		    fallback: browser ? 'Local file' : 'DSH file',
+		    tone: null,
+		  })
+		  badges.push({
+		    key: 'status',
+		    textKey: sourceStatusKey(item.status),
+		    fallback: typeof item.status === 'string' ? item.status : 'error',
+		    tone: item.status === 'error' ? 'error' : item.status === 'partial' ? 'warning' : null,
+		  })
+		  if (item.format) badges.push({ key: 'format', text: String(item.format).toUpperCase(), tone: null })
+		  if (item.errorCount) {
+		    badges.push({ key: 'errors', textKey: 'workspace.sourceErrors', count: item.errorCount, tone: 'error' })
+		  }
+		  if (item.warningCount) {
+		    badges.push({ key: 'warnings', textKey: 'workspace.sourceWarnings', count: item.warningCount, tone: 'warning' })
+		  }
+		  if (item.truncated) {
+		    badges.push({ key: 'truncated', textKey: 'workspace.truncated', fallback: 'Truncated', tone: 'warning' })
+		  }
+		  if (item.stale) {
+		    badges.push({ key: 'stale', textKey: 'workspace.stale', fallback: 'Changed on disk', tone: 'warning' })
+		  }
+		  return badges
+		}
+
+		/**
+		 * True when a shared exploration root cannot scope the class tree because the
+		 * root is not a class (the tree explains this instead of silently ignoring it).
+		 */
+		function exploreRootNotClass(graph, anchorId, exploring) {
+		  if (!exploring || typeof anchorId !== 'string' || !anchorId) return false
+		  const nodes = graph && Array.isArray(graph.nodes) ? graph.nodes : []
+		  const anchor = nodes.find((node) => node && node.id === anchorId)
+		  return Boolean(anchor && anchor.kind !== 'class')
+		}
+
+		/**
+		 * Readable label for a display node: tagged identities (NUL separators) must
+		 * never reach the DOM or an accessible name, and bare markers such as "group"
+		 * are dropped in favour of the meaningful last segment.
+		 */
+		function readableNodeLabel(node) {
+		  const source = node && typeof node === 'object'
+		    ? (typeof node.label === 'string' && node.label ? node.label
+		      : (typeof node.id === 'string' ? node.id : ''))
+		    : ''
+		  const parts = String(source).split(/[\u0000-\u001f\u007f]+/).filter(Boolean)
+		  const meaningful = parts.filter((part) => part !== 'group' && part !== 'statement' && part !== 'entity')
+		  const chosen = meaningful.length > 0 ? meaningful[meaningful.length - 1] : (parts[0] || '')
+		  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(chosen)) {
+		    const tail = chosen.replace(/[#/]+$/, '').split(/[#/]/).pop()
+		    return tail || chosen
+		  }
+		  return chosen
+		}
+
+		/**
+		 * Roving-focus step for the class tree. Rows are the visible (filtered and
+		 * expanded) list, so arrow keys move through what the user actually sees.
+		 */
+		function nextTreeFocusIndex(rows, currentId, key) {
+		  const list = Array.isArray(rows) ? rows : []
+		  if (list.length === 0) return -1
+		  const current = list.findIndex((row) => row && row.entityId === currentId)
+		  if (key === 'Home') return 0
+		  if (key === 'End') return list.length - 1
+		  const step = key === 'ArrowUp' ? -1 : key === 'ArrowDown' ? 1 : 0
+		  if (step === 0) return current < 0 ? 0 : current
+		  if (current < 0) return 0
+		  const next = current + step
+		  if (next < 0) return 0
+		  if (next >= list.length) return list.length - 1
+		  return next
+		}
+
+		/** Predicate options for the layered view, taken from the current graph. */
+		function collectPredicateOptions(graph) {
+		  const edges = graph && Array.isArray(graph.edges) ? graph.edges : []
+		  const byIri = new Map()
+		  for (const edge of edges) {
+		    if (!edge || typeof edge.p !== 'string') continue
+		    if (!byIri.has(edge.p)) {
+		      byIri.set(edge.p, typeof edge.label === 'string' && edge.label ? edge.label : edge.p)
+		    }
+		  }
+		  const options = []
+		  for (const [iri, label] of byIri) options.push({ iri: iri, label: label })
+		  options.sort((a, b) => (a.label < b.label ? -1 : a.label > b.label ? 1 : 0))
+		  return options
+		}
+
+		/** The default layered predicates: the class hierarchy. */
+		const RDFS_SUBCLASSOF_IRI = 'http://www.w3.org/2000/01/rdf-schema#subClassOf'
+
+		/**
+		 * @param {any} React host React 18 module
+		 */
+		function createMultiview(React, deps) {
+		  const h = React.createElement
+		  const { useMemo, useState, useEffect, useRef } = React
+		  // The bundle defines layoutLayeredGraph globally; tests inject it explicitly.
+		  const layoutLayeredGraphFn = deps && typeof deps.layoutLayeredGraph === 'function'
+		    ? deps.layoutLayeredGraph
+		    : (typeof layoutLayeredGraph === 'function' ? layoutLayeredGraph : null)
+
+		  const THEME = {
+		    panel: 'var(--dsw-alias-bg-layer-1, #ffffff)',
+		    panelAlt: 'var(--dsw-alias-bg-layer-2, #f4f4f6)',
+		    border: 'var(--dsw-alias-border-l1, #e3e3e8)',
+		    text: 'var(--dsw-alias-label-primary, #1f2430)',
+		    textSecondary: 'var(--dsw-alias-label-secondary, #6b6b76)',
+		    brand: 'var(--dsw-alias-brand-primary, #4f6bed)',
+		    danger: 'var(--dsw-alias-state-error-primary, #c0392b)',
+		    warning: 'var(--dsw-alias-state-warn-primary, #b7791f)',
+		    hover: 'var(--dsw-alias-interactive-bg-hover, #eceefd)',
+		  }
+
+		  const BUTTON = {
+		    border: '1px solid ' + THEME.border,
+		    background: 'transparent',
+		    color: THEME.text,
+		    borderRadius: 6,
+		    padding: '3px 8px',
+		    fontSize: 12,
+		    cursor: 'pointer',
+		    fontFamily: 'inherit',
+		  }
+
+		  function iconButton(style, props, children) {
+		    return h('button', Object.assign({
+		      type: 'button',
+		      style: Object.assign({}, BUTTON, style),
+		    }, props || {}), children)
+		  }
+
+		  function badge(text, tone) {
+		    return h('span', {
+		      key: 'badge-' + text,
+		      style: {
+		        display: 'inline-block',
+		        padding: '0 5px',
+		        borderRadius: 4,
+		        fontSize: 10,
+		        lineHeight: '16px',
+		        color: tone === 'error' ? THEME.danger : tone === 'warning' ? THEME.warning : THEME.textSecondary,
+		        background: THEME.panelAlt,
+		        border: '1px solid ' + THEME.border,
+		      },
+		    }, text)
+		  }
+
+		  /* ------------------------------ toolbar ------------------------------ */
+
+		  /**
+		   * Compact main row: view switch, source toggle, export toggle, status text.
+		   */
+		  function WorkspaceToolbar(props) {
+		    const tr = props.tr
+		    const views = [
+		      { id: 'network', label: tr('view.network', 'Network') },
+		      { id: 'tree', label: tr('view.tree', 'Class tree') },
+		      { id: 'layered', label: tr('view.layered', 'Layered') },
+		    ]
+		    return h('div', {
+		      style: {
+		        display: 'flex',
+		        alignItems: 'center',
+		        gap: 6,
+		        padding: '6px 8px',
+		        borderBottom: '1px solid ' + THEME.border,
+		        background: THEME.panel,
+		        flexWrap: 'nowrap',
+		        overflowX: 'auto',
+		        flex: 'none',
+		      },
+		      role: 'toolbar',
+		      'aria-label': tr('workspace.toolbar', 'Workspace toolbar'),
+		    },
+		    h('div', {
+		      role: 'tablist',
+		      'aria-label': tr('view.switch', 'View'),
+		      style: { display: 'flex', gap: 2, flex: 'none' },
+		    }, views.map((view) => iconButton({
+		      padding: '3px 9px',
+		      fontWeight: props.viewType === view.id ? 600 : 400,
+		      background: props.viewType === view.id ? THEME.hover : 'transparent',
+		      borderColor: props.viewType === view.id ? THEME.brand : THEME.border,
+		    }, {
+		      key: view.id,
+		      role: 'tab',
+		      'aria-selected': props.viewType === view.id,
+		      'aria-label': view.label,
+		      onClick: () => props.onViewType(view.id),
+		    }, view.label))),
+		    h('span', { style: { flex: '1 1 auto' } }),
+		    props.selectedLabel ? h('span', {
+		      style: {
+		        color: THEME.textSecondary, fontSize: 11, maxWidth: 140,
+		        overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 'none',
+		      },
+		      title: props.selectedLabel,
+		    }, props.selectedLabel) : null,
+		    iconButton({}, {
+		      key: 'sources',
+		      'aria-expanded': !!props.sourcesOpen,
+		      'aria-label': tr('workspace.sources', 'Sources') + (props.sourceCount ? ' (' + props.sourceCount + ')' : ''),
+		      onClick: props.onToggleSources,
+		    }, tr('workspace.sources', 'Sources') + (props.sourceCount ? ' ' + props.sourceCount : '')),
+		    iconButton({}, {
+		      key: 'export',
+		      'aria-expanded': !!props.exportOpen,
+		      'aria-label': tr('export.title', 'Export'),
+		      onClick: props.onToggleExport,
+		    }, tr('export.title', 'Export')))
+		  }
+
+		  /* ---------------------------- source panel --------------------------- */
+
+		  function SourcePanel(props) {
+		    const tr = props.tr
+		    const sources = Array.isArray(props.sources) ? props.sources.filter(item => item && typeof item === 'object') : []
+		    const workset = Array.isArray(props.worksetIds) ? props.worksetIds : []
+		    const fileInput = React.useRef(null)
+		    const allSelected = workset.length === 0
+		    return h('div', {
+		      style: {
+		        borderBottom: '1px solid ' + THEME.border,
+		        background: THEME.panel,
+		        padding: '8px 10px',
+		        maxHeight: '42%',
+		        overflow: 'auto',
+		        flex: 'none',
+		      },
+		      role: 'region',
+		      'aria-label': tr('workspace.sources', 'Sources'),
+		    },
+		    h('div', { style: { display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 } },
+		      h('strong', { style: { fontSize: 12, color: THEME.text } }, tr('workspace.sources', 'Sources')),
+		      h('span', {
+		        style: { fontSize: 11, color: THEME.textSecondary },
+		      }, tr('workspace.totals', '{files} files · {triples} triples')
+		        .replace('{files}', String(props.totals ? props.totals.files : sources.length))
+		        .replace('{triples}', String(props.totals ? props.totals.occurrences : 0))),
+		      h('span', { style: { flex: '1 1 auto' } }),
+		      props.workspaceFilesAvailable ? iconButton({ padding: '2px 7px' }, {
+		        'aria-label': tr('workspace.pickWorkspaceFiles', 'Workspace files'),
+		        onClick: props.onPickWorkspaceFiles,
+		      }, tr('workspace.pickWorkspaceFiles', 'Workspace files')) : null,
+		      typeof props.onToggleSharing === 'function' ? iconButton({
+		        padding: '2px 7px',
+		        borderColor: props.sharing ? THEME.brand : THEME.border,
+		      }, {
+		        'aria-pressed': !!props.sharing,
+		        'aria-label': tr(props.sharing ? 'workspace.sharing' : 'workspace.share', props.sharing ? 'Sharing' : 'Share'),
+		        title: tr('workspace.shareHint', 'Sharing stays in this page.'),
+		        onClick: props.onToggleSharing,
+		        disabled: props.sharingAvailable === false,
+		      }, tr(props.sharing ? 'workspace.sharing' : 'workspace.share', props.sharing ? 'Sharing' : 'Share')) : null,
+		      h('input', {
+		        ref: fileInput,
+		        type: 'file',
+		        multiple: true,
+		        accept: '.ttl,.turtle,.owl,.rdf,.rdfxml,.jsonld,.nt,.n3,.nq,.trig,.xml',
+		        style: { display: 'none' },
+		        onChange: (event) => {
+		          const files = event.target.files ? Array.from(event.target.files) : []
+		          event.target.value = ''
+		          if (files.length > 0) props.onAddFiles(files)
+		        },
+		      }),
+		      iconButton({}, {
+		        'aria-label': tr('workspace.addFiles', 'Add files'),
+		        onClick: () => { if (fileInput.current) fileInput.current.click() },
+		      }, tr('workspace.addFiles', 'Add files')),
+		      iconButton({}, {
+		        'aria-pressed': allSelected,
+		        'aria-label': tr('workspace.allSources', 'All sources'),
+		        onClick: () => props.onSetWorkset([]),
+		      }, tr('workspace.union', 'Union')),
+		      iconButton({}, {
+		        'aria-label': tr('workspace.close', 'Close'),
+		        onClick: props.onClose,
+		      }, '\u00d7')),
+		    h('ul', { style: { listStyle: 'none', margin: 0, padding: 0 } },
+		      sources.length === 0
+		        ? h('li', { style: { fontSize: 12, color: THEME.textSecondary } }, tr('workspace.empty', 'No sources loaded.'))
+		        : sources.map((source) => {
+		          const checked = allSelected || workset.indexOf(source.sourceId) >= 0
+		          return h('li', {
+		            key: source.sourceId,
+		            style: {
+		              display: 'flex', alignItems: 'center', gap: 6, padding: '3px 0',
+		              borderBottom: '1px solid ' + THEME.border, flexWrap: 'wrap',
+		            },
+		          },
+		          h('input', {
+		            type: 'checkbox',
+		            checked: checked,
+		            'aria-label': tr('workspace.includeSource', 'Include source') + ' ' + source.displayName,
+		            onChange: () => {
+		              props.onSetWorkset(nextWorksetSelection(
+		                sources.map((item) => item.sourceId),
+		                workset,
+		                source.sourceId,
+		              ))
+		            },
+		          }),
+		          h('span', {
+		            style: {
+		              fontSize: 12, color: THEME.text, flex: '1 1 140px', minWidth: 0,
+		              overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+		            },
+		            title: source.absolutePath || source.displayName,
+		          }, source.displayName || source.sourceId),
+		          sourcePanelBadges(source).map((entry) => {
+		            if (entry.text !== undefined) return badge(entry.text, entry.tone)
+		            let text = tr(entry.textKey, entry.fallback)
+		            if (typeof text !== 'string') text = entry.fallback || (entry.key === 'errors' ? 'Errors' : entry.key === 'warnings' ? 'Warnings' : entry.key)
+		            if (entry.count !== undefined) text = text.replace('{n}', String(entry.count))
+		            return badge(text, entry.tone)
+		          }),
+		          h('span', { style: { fontSize: 10, color: THEME.textSecondary } },
+		            tr('workspace.sourceTriples', '{n} triples').replace('{n}', String(source.tripleCount || 0))),
+		          source.origin === 'browser' ? iconButton({ padding: '1px 6px', fontSize: 11 }, {
+		            'aria-label': tr('workspace.reload', 'Reload') + ' ' + source.displayName,
+		            onClick: () => props.onRequestReload(source.sourceId),
+		          }, tr('workspace.reload', 'Reload')) : null,
+		          iconButton({ padding: '1px 6px', fontSize: 11 }, {
+		            'aria-label': tr('workspace.remove', 'Remove') + ' ' + source.displayName,
+		            onClick: () => props.onRemove(source.sourceId),
+		          }, tr('workspace.remove', 'Remove')))
+		        })),
+		    h('div', { style: { fontSize: 10, color: THEME.textSecondary, marginTop: 6 } },
+		      tr('workspace.addHint', 'Files stay in this page only; reloading a local file asks you to pick it again.')),
+		    props.sharing ? h('div', { style: { fontSize: 10, color: THEME.textSecondary, marginTop: 4 }, role: 'status' },
+		      tr('workspace.shareHint', 'Sharing stays in this page and clears when the last panel closes.')) : null,
+		    props.sharingAvailable === false ? h('div', { role: 'status', style: { fontSize: 10, color: THEME.textSecondary } },
+		      tr('workspace.shareUnavailable', 'Session identity unavailable; this workspace stays panel-local.')) : null)
+		  }
+
+		  /* --------------------- workspace file picker (A) --------------------- */
+
+		  function WorkspaceFilePicker(props) {
+		    const tr = props.tr
+		    const state = props.state || {}
+		    const entries = Array.isArray(state.entries) ? state.entries : []
+		    const selected = Array.isArray(state.selected) ? state.selected : []
+		    const busy = props.busy === true
+		    return h('div', {
+		      role: 'dialog',
+		      'aria-modal': 'true',
+		      'aria-label': tr('workspace.pickWorkspaceFiles', 'Workspace files'),
+		      style: {
+		        position: 'absolute', inset: 0, zIndex: 20,
+		        background: 'rgba(0,0,0,0.45)', display: 'flex', alignItems: 'center', justifyContent: 'center',
+		        padding: 8,
+		      },
+		    },
+		    h('div', {
+		      style: {
+		        background: THEME.panel, border: '1px solid ' + THEME.border, borderRadius: 8,
+		        padding: 10, width: '100%', maxWidth: 520, maxHeight: '100%', display: 'flex',
+		        flexDirection: 'column', gap: 6, color: THEME.text,
+		      },
+		    },
+		    h('div', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
+		      h('strong', { style: { fontSize: 12 } }, tr('workspace.pickWorkspaceFiles', 'Workspace files')),
+		      h('span', { style: { flex: '1 1 auto' } }),
+		      iconButton({ padding: '1px 7px' }, {
+		        'aria-label': tr('workspace.cancel', 'Cancel'),
+		        onClick: props.onClose,
+		      }, '×')),
+		    h('div', { style: { fontSize: 10, color: THEME.textSecondary, wordBreak: 'break-all' } },
+		      state.directory || '.',
+		      state.loading ? ' · ' + tr('workspace.loadingDir', 'Loading…') : ''),
+		    state.error ? h('div', { role: 'status', style: { fontSize: 11, color: THEME.danger } }, state.error) : null,
+		    h('div', {
+		      style: { overflow: 'auto', flex: '1 1 auto', borderTop: '1px solid ' + THEME.border, borderBottom: '1px solid ' + THEME.border },
+		      role: 'listbox',
+		      'aria-label': tr('workspace.pickWorkspaceFiles', 'Workspace files'),
+		    },
+		    entries.length === 0
+		      ? h('div', { style: { fontSize: 11, color: THEME.textSecondary, padding: 10 } },
+		        state.loading ? tr('workspace.loadingDir', 'Loading…') : tr('workspace.noFiles', 'No files in this directory.'))
+		      : entries.map((entry) => h('div', {
+		        key: 'wf-' + entry.path,
+		        style: { display: 'flex', alignItems: 'center', gap: 6, padding: '3px 8px', borderBottom: '1px solid ' + THEME.border },
+		      },
+		      entry.isDirectory
+		        ? iconButton({ padding: '1px 7px', fontSize: 11 }, {
+		          'aria-label': tr('workspace.openDir', 'Open folder') + ' ' + entry.name,
+		          onClick: () => props.onNavigate(entry.path),
+		        }, tr('workspace.openDir', 'Open'))
+		        : h('input', {
+		          type: 'checkbox',
+		          checked: selected.indexOf(entry.path) >= 0,
+		          'aria-label': tr('workspace.selectFile', 'Select file') + ' ' + entry.name,
+		          onChange: (event) => props.onToggle(entry.path, event.target.checked),
+		        }),
+		      h('span', { style: { fontSize: 11, flex: '1 1 auto', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
+		        entry.isDirectory ? entry.name + '/' : entry.name),
+		      h('span', { style: { fontSize: 10, color: THEME.textSecondary } },
+		        entry.isDirectory ? '' : String(entry.size || 0)))),
+		    state.truncated ? h('div', { style: { fontSize: 10, color: THEME.warning } },
+		      tr('workspace.dirTruncated', 'Directory listing truncated.')) : null,
+		    h('div', { style: { display: 'flex', gap: 6, justifyContent: 'flex-end' } },
+		      h('button', {
+		        type: 'button',
+		        style: Object.assign({}, BUTTON, { fontSize: 11 }),
+		        onClick: props.onUp,
+		      }, tr('workspace.parentDir', 'Up')),
+		      h('button', {
+		        type: 'button',
+		        style: Object.assign({}, BUTTON, { fontSize: 11, background: THEME.brand, color: THEME.text }),
+		        disabled: busy || selected.length === 0,
+		        'aria-label': tr('workspace.readSelected', 'Read selected files'),
+		        onClick: props.onConfirm,
+		      }, tr('workspace.readSelected', 'Read selected') + ' (' + String(selected.length) + ')')))))
+		  }
+
+		  /* ----------------------------- export menu --------------------------- */
+
+		  function ExportMenu(props) {
+		    const tr = props.tr
+		    return h('div', {
+		      style: {
+		        borderBottom: '1px solid ' + THEME.border,
+		        background: THEME.panelAlt,
+		        padding: '8px 10px',
+		        display: 'flex',
+		        flexWrap: 'wrap',
+		        gap: 6,
+		        alignItems: 'center',
+		        flex: 'none',
+		      },
+		      role: 'region',
+		      'aria-label': tr('export.title', 'Export'),
+		    },
+		    h('strong', { style: { fontSize: 12, color: THEME.text } }, tr('export.title', 'Export')),
+		    h('label', { style: { fontSize: 11, color: THEME.textSecondary } },
+		      tr('export.range', 'Range'),
+		      h('select', {
+		        value: props.range,
+		        'aria-label': tr('export.range', 'Range'),
+		        onChange: (event) => props.onRange(event.target.value),
+		        style: { marginLeft: 4, fontSize: 11 },
+		      },
+		      h('option', { value: 'viewport' }, tr('export.range.viewport', 'Current viewport')),
+		      h('option', { value: 'layout' }, tr('export.range.layout', 'Whole displayed layout')))),
+		    h('label', { style: { fontSize: 11, color: THEME.textSecondary } },
+		      tr('export.scale', 'Scale'),
+		      h('select', {
+		        value: String(props.scale),
+		        'aria-label': tr('export.scale', 'Scale'),
+		        onChange: (event) => props.onScale(Number(event.target.value)),
+		        style: { marginLeft: 4, fontSize: 11 },
+		      },
+		      h('option', { value: '1' }, '1x'),
+		      h('option', { value: '2' }, '2x'))),
+		    iconButton({}, {
+		      'aria-label': tr('export.svg', 'SVG'),
+		      onClick: () => props.onExport('svg'),
+		      disabled: !!props.busy,
+		    }, tr('export.svg', 'SVG')),
+		    iconButton({}, {
+		      'aria-label': tr('export.png', 'PNG'),
+		      onClick: () => props.onExport('png'),
+		      disabled: !!props.busy,
+		    }, tr('export.png', 'PNG')),
+		    iconButton({}, {
+		      'aria-label': tr('export.copySvg', 'Copy SVG'),
+		      title: tr('export.copySvgHint', 'Use this when the browser blocks the download.'),
+		      onClick: props.onCopySvg,
+		      disabled: !!props.busy,
+		    }, tr('export.copySvg', 'Copy SVG')),
+		    props.message ? h('span', {
+		      role: 'status',
+		      style: { fontSize: 11, color: THEME.textSecondary, flex: '1 1 100%' },
+		    }, props.message) : null,
+		    (typeof props.svgText === 'string' && props.svgText !== '')
+		      ? h('div', { style: { flex: '1 1 100%', display: 'flex', flexDirection: 'column', gap: 4 } },
+		        h('span', { style: { fontSize: 10, color: THEME.textSecondary } },
+		          tr('export.manualHint', 'Clipboard unavailable; select and copy the SVG text below.')),
+		        h('textarea', {
+		          readOnly: true,
+		          value: props.svgText,
+		          'aria-label': tr('export.svgText', 'SVG text'),
+		          rows: 4,
+		          onFocus: (event) => { if (event.target.select) event.target.select() },
+		          style: {
+		            width: '100%', fontSize: 10, fontFamily: 'monospace',
+		            border: '1px solid ' + THEME.border, borderRadius: 4, background: THEME.panel,
+		            color: THEME.text, resize: 'vertical',
+		          },
+		        })) : null)
+		  }
+
+		  /* ---------------------------- class tree ----------------------------- */
+
+		  function ClassTreeView(props) {
+		    const tr = props.tr
+		    const graph = props.graph
+		    const mode = props.mode === 'property' ? 'property' : 'class'
+		    const hierarchy = useMemo(() => buildHierarchy(graph, { mode: mode }), [graph, mode])
+		    const expandedIds = Array.isArray(props.expandedIds) ? props.expandedIds : []
+		    const expanded = useMemo(() => expandHierarchy(hierarchy, {
+		      expandedIds: expandedIds,
+		      maxRefs: 1200,
+		      maxDepth: 12,
+		    }), [hierarchy, expandedIds])
+		    const plan = useMemo(() => treeSearchPlan(hierarchy, props.query), [hierarchy, props.query])
+		    const rows = useMemo(() => filterTreeRows(expanded.refs, hierarchy, plan), [expanded.refs, hierarchy, plan])
+		    const revealedRef = useRef('')
+		    useEffect(() => {
+		      if (!plan.entityId) {
+		        revealedRef.current = ''
+		        return
+		      }
+		      if (revealedRef.current === plan.entityId) return
+		      revealedRef.current = plan.entityId
+		      for (const id of plan.ancestors) {
+		        if (expandedIds.indexOf(id) < 0) props.onToggle(id)
+		      }
+		      props.onSelect(plan.entityId)
+		    }, [plan, expandedIds, props])
+		    const entityCount = hierarchy.stats.entities
+		    const noHierarchy = entityCount === 0
+		    return h('div', {
+		      style: { display: 'flex', flexDirection: 'column', minHeight: 0, flex: '1 1 auto', background: THEME.panel },
+		    },
+		    h('div', {
+		      style: { display: 'flex', gap: 6, alignItems: 'center', padding: '6px 8px', flexWrap: 'wrap', flex: 'none' },
+		    },
+		    h('label', { style: { fontSize: 11, color: THEME.textSecondary } },
+		      tr('view.mode', 'Mode'),
+		      h('select', {
+		        value: mode,
+		        'aria-label': tr('view.mode', 'Mode'),
+		        onChange: (event) => props.onMode(event.target.value),
+		        style: { marginLeft: 4, fontSize: 11 },
+		      },
+		      h('option', { value: 'class' }, tr('view.mode.class', 'Classes')),
+		      h('option', { value: 'property' }, tr('view.mode.property', 'Properties')))),
+		    h('input', {
+		      type: 'search',
+		      value: props.query || '',
+		      placeholder: tr('view.search', 'Search'),
+		      'aria-label': tr('view.search', 'Search'),
+		      onChange: (event) => props.onQuery(event.target.value),
+		      style: {
+		        flex: '1 1 120px', minWidth: 80, fontSize: 11, padding: '2px 6px',
+		        border: '1px solid ' + THEME.border, borderRadius: 5, background: THEME.panel, color: THEME.text,
+		      },
+		    }),
+		    h('span', { style: { fontSize: 10, color: THEME.textSecondary } },
+		      tr('view.entityCount', '{n} entities').replace('{n}', String(entityCount))),
+		    (hierarchy.stats.truncated > 0 || expanded.stats.truncated > 0)
+		      ? badge(tr('view.treeBudget', 'Tree budget reached: {n}').replace('{n}',
+		        String(hierarchy.stats.truncated + expanded.stats.truncated)), 'warning')
+		      : null,
+		    hierarchy.cycles.length > 0
+		      ? badge(tr('view.cycleCount', '{n} cycles').replace('{n}', String(hierarchy.cycles.length)), 'warning')
+		      : null,
+		    props.exploreRootNotClass ? badge(tr('view.exploreRootNotClass',
+		      'The exploration root is not a class, so the tree does not show exploration scope.'), 'warning') : null),
+		    h('div', {
+		      style: { overflow: 'auto', flex: '1 1 auto', padding: '2px 8px 12px 8px' },
+		      role: 'tree',
+		      'aria-label': tr('view.tree', 'Class tree'),
+		    },
+		    noHierarchy
+		      ? h('div', { style: { fontSize: 12, color: THEME.textSecondary, padding: 12 } },
+		        tr('view.noHierarchy', 'This document has no explicit class hierarchy.'))
+		      : (plan.query && rows.length === 0) ? h('div', {
+		        style: { fontSize: 12, color: THEME.textSecondary, padding: 12 },
+		        role: 'status',
+		      }, tr('view.noMatches', 'No entity matches "{query}".').replace('{query}', plan.query))
+		      : rows.map((ref) => {
+		        const entity = hierarchy.entities.get(ref.entityId)
+		        const label = ref.label || (entity && entity.label) || ref.entityId
+		        const hasChildren = ref.childCount > 0 && !ref.cycle
+		        const isExpanded = ref.expanded
+		        return h('div', {
+		          key: ref.refId,
+		          role: 'treeitem',
+		          tabIndex: props.selectedId === ref.entityId || (props.selectedId === null && ref === rows[0]) ? 0 : -1,
+		          'aria-level': ref.depth + 1,
+		          'aria-expanded': hasChildren ? isExpanded : undefined,
+		          'aria-selected': props.selectedId === ref.entityId,
+		          'aria-label': label + (ref.cycle ? ' (' + tr('view.cycle', 'cycle') + ')' : ''),
+		          onKeyDown: (event) => {
+		            if (!event || typeof event.key !== 'string') return
+		            const target = nextTreeFocusIndex(rows, ref.entityId, event.key)
+		            if (event.key === 'Enter' || event.key === ' ') {
+		              event.preventDefault()
+		              props.onSelect(ref.entityId)
+		              return
+		            }
+		            if (target < 0) return
+		            if (event.key === 'ArrowUp' || event.key === 'ArrowDown' || event.key === 'Home' || event.key === 'End') {
+		              event.preventDefault()
+		              const nextRef = rows[target]
+		              if (!nextRef) return
+		              props.onSelect(nextRef.entityId)
+		              setTimeout(() => {
+		                const items = document.querySelectorAll('[role=treeitem]')
+		                for (const node of items) {
+		                  if (node.getAttribute('aria-selected') === 'true') {
+		                    node.focus()
+		                    break
+		                  }
+		                }
+		              }, 0)
+		            }
+		          },
+		          style: {
+		            display: 'flex', alignItems: 'center', gap: 4,
+		            paddingLeft: 2 + ref.depth * 14,
+		            minHeight: 22, cursor: 'pointer', borderRadius: 4,
+		            background: props.selectedId === ref.entityId ? THEME.hover : 'transparent',
+		          },
+		          onClick: () => props.onSelect(ref.entityId),
+		        },
+		        h('button', {
+		          type: 'button',
+		          style: {
+		            width: 16, height: 16, padding: 0, border: 'none', background: 'transparent',
+		            color: THEME.textSecondary, cursor: hasChildren ? 'pointer' : 'default', fontSize: 10,
+		          },
+		          'aria-label': tr(isExpanded ? 'view.collapse' : 'view.expand', isExpanded ? 'Collapse' : 'Expand') +
+		            ' ' + label,
+		          onClick: (event) => {
+		            event.stopPropagation()
+		            if (hasChildren) props.onToggle(ref.entityId)
+		          },
+		          tabIndex: -1,
+		        }, hasChildren ? (isExpanded ? '\u25be' : '\u25b8') : ''),
+		        h('span', {
+		          style: {
+		            fontSize: 12, color: THEME.text, overflow: 'hidden',
+		            textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+		          },
+		          title: ref.entityId,
+		        }, label),
+		        ref.cycle ? badge(tr('view.cycle', 'cycle'), 'warning') : null,
+		        ref.orphan ? badge(tr('view.orphan', 'orphan')) : null,
+		        ref.inCycle && !ref.cycle ? badge(tr('view.inCycle', 'in cycle'), 'warning') : null,
+		        ref.cycleGroup ? badge(tr('view.groupOf', 'group of {n}').replace('{n}', String(ref.cycleGroup.length)), 'warning') : null)
+		      })))
+		  }
+
+		  /* --------------------------- layered view ---------------------------- */
+
+		  function LayeredView(props) {
+		    const tr = props.tr
+		    const orientation = props.orientation === 'right' ? 'right' : 'down'
+		    const predicates = Array.isArray(props.predicates) && props.predicates.length > 0
+		      ? props.predicates
+		      : [RDFS_SUBCLASSOF_IRI]
+		    const options = useMemo(() => collectPredicateOptions(props.graph), [props.graph])
+		    const layout = useMemo(() => (layoutLayeredGraphFn ? layoutLayeredGraphFn(props.graph, {
+		      predicates: predicates,
+		      orientation: orientation,
+		      width: props.width || 900,
+		      height: props.height || 560,
+		    }) : {
+		      nodes: [], edges: [], internalEdges: [], groups: [],
+		      stats: { nodes: 0, layers: 0, groups: 0 },
+		      bounds: { minX: 0, minY: 0, width: 1, height: 1 },
+		    }), [props.graph, predicates.join('\u0001'), orientation, props.width, props.height])
+		    const [zoom, setZoom] = useState(1)
+		    const [pan, setPan] = useState({ x: 0, y: 0 })
+		    const [openGroupId, setOpenGroupId] = useState(null)
+		    const dragRef = React.useRef(null)
+		    const byId = useMemo(() => new Map(layout.nodes.map((node) => [node.id, node])), [layout])
+		    const focus = useMemo(() => layeredFocus(layout, props.selectedId), [layout, props.selectedId])
+		    const empty = layout.nodes.length === 0
+		    const bounds = layout.bounds
+		    return h('div', {
+		      style: { display: 'flex', flexDirection: 'column', minHeight: 0, flex: '1 1 auto', background: THEME.panel },
+		    },
+		    h('div', {
+		      style: { display: 'flex', gap: 6, alignItems: 'center', padding: '6px 8px', flexWrap: 'wrap', flex: 'none' },
+		    },
+		    h('label', { style: { fontSize: 11, color: THEME.textSecondary } },
+		      tr('view.orientation', 'Direction'),
+		      h('select', {
+		        value: orientation,
+		        'aria-label': tr('view.orientation', 'Direction'),
+		        onChange: (event) => props.onOrientation(event.target.value),
+		        style: { marginLeft: 4, fontSize: 11 },
+		      },
+		      h('option', { value: 'down' }, tr('view.orientation.down', 'Top to bottom')),
+		      h('option', { value: 'right' }, tr('view.orientation.right', 'Left to right')))),
+		    h('span', { style: { fontSize: 11, color: THEME.textSecondary } }, tr('view.predicates', 'Relations')),
+		    h('span', { style: { display: 'flex', gap: 4, flexWrap: 'wrap', maxWidth: '100%' } },
+		      (options.length > 0 ? options : [{ iri: RDFS_SUBCLASSOF_IRI, label: 'rdfs:subClassOf' }]).map((option) => {
+		        const checked = predicates.indexOf(option.iri) >= 0
+		        return h('label', {
+		          key: option.iri,
+		          style: { fontSize: 10, color: THEME.textSecondary, display: 'inline-flex', gap: 2, alignItems: 'center' },
+		          title: option.iri,
+		        },
+		        h('input', {
+		          type: 'checkbox',
+		          checked: checked,
+		          'aria-label': option.label,
+		          onChange: () => {
+		            const next = checked
+		              ? predicates.filter((iri) => iri !== option.iri)
+		              : predicates.concat([option.iri])
+		            props.onPredicates(next)
+		          },
+		        }), option.label)
+		      })),
+		    h('span', { style: { flex: '1 1 auto' } }),
+		    (props.selectedId && !layeredFocus(layout, props.selectedId))
+		      ? h('span', { role: 'status', style: { fontSize: 10, color: THEME.textSecondary } },
+		        tr('view.selectionHidden', 'Selected entity is not shown with these relation types.'))
+		      : null,
+		    h('span', { style: { fontSize: 10, color: THEME.textSecondary } },
+		      tr('view.layerStats', '{nodes} nodes · {layers} layers · {groups} cycles')
+		        .replace('{nodes}', String(layout.stats.nodes))
+		        .replace('{layers}', String(layout.stats.layers))
+		        .replace('{groups}', String(layout.stats.groups))),
+		    iconButton({ padding: '2px 7px' }, {
+		      'aria-label': tr('view.fit', 'Fit'),
+		      onClick: () => { setZoom(1); setPan({ x: 0, y: 0 }) },
+		    }, tr('view.fit', 'Fit'))),
+		    h('div', {
+		      style: { position: 'relative', flex: '1 1 auto', minHeight: 120, overflow: 'hidden' },
+		      onWheel: (event) => {
+		        event.preventDefault()
+		        const factor = Math.exp(-event.deltaY * 0.0015)
+		        setZoom((previous) => Math.min(4, Math.max(0.15, previous * factor)))
+		      },
+		      onPointerDown: (event) => {
+		        if (event.button !== 0) return
+		        dragRef.current = { x: event.clientX, y: event.clientY, panX: pan.x, panY: pan.y }
+		        if (event.currentTarget.setPointerCapture) event.currentTarget.setPointerCapture(event.pointerId)
+		      },
+		      onPointerMove: (event) => {
+		        const drag = dragRef.current
+		        if (!drag) return
+		        setPan({ x: drag.panX + (event.clientX - drag.x), y: drag.panY + (event.clientY - drag.y) })
+		      },
+		      onPointerUp: () => { dragRef.current = null },
+		      onPointerCancel: () => { dragRef.current = null },
+		    },
+		    empty
+		      ? h('div', {
+		        style: { position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 12, color: THEME.textSecondary, textAlign: 'center', padding: 16 },
+		      }, tr('view.noRelations', 'No relations match the selected relation types.'))
+		      : h('svg', {
+		        width: '100%',
+		        height: '100%',
+		        viewBox: bounds.minX + ' ' + bounds.minY + ' ' + Math.max(1, bounds.width + 48) + ' ' + Math.max(1, bounds.height + 48),
+		        role: 'img',
+		        'aria-label': tr('view.layered', 'Layered relation view'),
+		        style: { display: 'block', touchAction: 'none' },
+		      }, h('g', { transform: 'translate(' + (pan.x / zoom) + ' ' + (pan.y / zoom) + ') scale(' + (1 / zoom) + ')' },
+		      layout.edges.map((edge) => {
+		        const from = byId.get(edge.source)
+		        const to = byId.get(edge.target)
+		        if (!from || !to) return null
+		        return h('line', {
+		          key: 'pe-' + edge.id,
+		          x1: from.x, y1: from.y, x2: to.x, y2: to.y,
+		          stroke: THEME.border, strokeWidth: 1.2,
+		          strokeOpacity: focus ? (focus.edges.has(edge.id) ? 0.95 : 0.12) : 0.9,
+		        })
+		      }),
+		      layout.internalEdges.map((edge) => {
+		        const node = byId.get(edge.source)
+		        if (!node) return null
+		        return h('circle', {
+		          key: 'ie-' + edge.id + '-' + edge.target,
+		          cx: node.x, cy: node.y, r: 13,
+		          fill: 'none', stroke: THEME.warning, strokeWidth: 1.5, strokeDasharray: '3 2',
+		        })
+		      }),
+		      layout.nodes.map((node) => {
+		        const radius = node.kind === 'group' ? 9 + Math.min(5, node.memberCount) : 6
+		        const selected = props.selectedId === (node.kind === 'group' ? node.groupId : node.id)
+		        const dimmed = focus ? !focus.nodes.has(node.id) : false
+		        return h('g', {
+		          key: 'pn-' + node.id,
+		          opacity: dimmed ? 0.3 : 1,
+		          tabIndex: 0,
+		          role: 'button',
+		          'aria-label': readableNodeLabel(node) + (node.kind === 'group'
+		            ? ' (' + tr('view.groupOf', 'group of {n}').replace('{n}', String(node.memberCount)) + ')'
+		            : ''),
+		          style: { cursor: 'pointer' },
+		          onClick: () => {
+		            const group = layout.groups.find((item) => item.id === node.id)
+		            if (group) setOpenGroupId(group.id)
+		            props.onSelect(group ? group.anchor : node.id)
+		          },
+		          onKeyDown: (event) => {
+		            if (event.key !== 'Enter' && event.key !== ' ') return
+		            event.preventDefault()
+		            const group = layout.groups.find((item) => item.id === node.id)
+		            if (group) setOpenGroupId(group.id)
+		            props.onSelect(group ? group.anchor : node.id)
+		          },
+		        },
+		        h('circle', {
+		          cx: node.x, cy: node.y, r: radius,
+		          fill: node.kind === 'group' ? THEME.warning : THEME.brand,
+		          stroke: selected ? THEME.text : THEME.panel,
+		          strokeWidth: selected ? 2 : 1,
+		        }),
+		        h('text', {
+		          x: node.x,
+		          y: node.y + (node.kind === 'group' ? 3 : 3),
+		          textAnchor: 'middle',
+		          fontSize: 9,
+		          fill: THEME.panel,
+		        }, node.kind === 'group' ? String(node.memberCount) : ''),
+		        h('text', {
+		          x: node.x + radius + 3,
+		          y: node.y + 3,
+		          fontSize: 9,
+		          fill: THEME.text,
+		        }, readableNodeLabel(node).slice(0, 40)))
+		      }))),
+		    (function () {
+		      const group = openGroupId
+		        ? layout.groups.find((item) => item.id === openGroupId) : null
+		      if (!group) return null
+		      return h('div', {
+		        role: 'dialog',
+		        'aria-modal': false,
+		        'aria-label': tr('view.cycleMembers', 'Cycle group members'),
+		        style: {
+		          position: 'absolute', right: 8, bottom: 26, width: 240, maxHeight: '55%',
+		          overflow: 'auto', background: THEME.panel, border: '1px solid ' + THEME.border,
+		          borderRadius: 8, padding: 8, boxShadow: '0 4px 18px rgba(0,0,0,0.18)', zIndex: 4,
+		        },
+		      },
+		      h('div', { style: { display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 } },
+		        h('strong', { style: { fontSize: 11, color: THEME.text, flex: '1 1 auto' } },
+		          tr('view.cycleMembers', 'Cycle group members') + ' (' + String(group.members.length) + ')'),
+		        iconButton({ padding: '1px 6px', fontSize: 11 }, {
+		          'aria-label': tr('workspace.close', 'Close'),
+		          onClick: () => setOpenGroupId(null),
+		        }, '\u00d7')),
+		      h('ul', { style: { listStyle: 'none', margin: 0, padding: 0 } },
+		        group.members.map((memberId) => h('li', { key: memberId, style: { padding: '2px 0' } },
+		          h('button', {
+		            type: 'button',
+		            style: {
+		              border: 'none', background: 'transparent', color: THEME.text, cursor: 'pointer',
+		              fontSize: 11, padding: 0, textAlign: 'left', width: '100%',
+		              overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+		            },
+		            title: memberId,
+		            'aria-label': readableNodeLabel({ id: memberId }),
+		            onClick: () => {
+		              props.onSelect(memberId)
+		              setOpenGroupId(null)
+		            },
+		          }, readableNodeLabel({ id: memberId })))))
+		      )
+		    })(),
+		    h('div', {
+		      style: { position: 'absolute', right: 8, bottom: 6, fontSize: 10, color: THEME.textSecondary },
+		    }, Math.round(zoom * 100) + '%')))
+		  }
+
+		  /* --------------------------- provenance ------------------------------ */
+
+		  function ProvenancePanel(props) {
+		    const tr = props.tr
+		    const node = props.node
+		    const graph = props.graph
+		    if (!node) return null
+		    const sourceLabels = props.sourceLabels || {}
+		    const labelOf = (id) => sourceLabels[id] || id
+		    const edges = graph && Array.isArray(graph.edges) ? graph.edges : []
+		    const incident = edges.filter((edge) => edge.source === node.id || edge.target === node.id)
+		    const provenance = node.provenance && typeof node.provenance === 'object' ? node.provenance : null
+		    const [openEdge, setOpenEdge] = useState(null)
+		    const [relationLimit, setRelationLimit] = useState(40)
+		    return h('div', {
+		      role: 'dialog',
+		      'aria-modal': false,
+		      'aria-label': tr('provenance.title', 'Sources'),
+		      style: {
+		        position: 'absolute', right: 8, bottom: 8, width: 300, maxHeight: '60%',
+		        overflow: 'auto', background: THEME.panel,
+		        border: '1px solid ' + THEME.border, borderRadius: 8, padding: 10,
+		        boxShadow: '0 4px 18px rgba(0,0,0,0.18)', zIndex: 4,
+		      },
+		    },
+		    h('div', { style: { display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 } },
+		      h('strong', { style: { fontSize: 12, color: THEME.text, flex: '1 1 auto', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
+		        node.label || node.local || node.id),
+		      iconButton({ padding: '1px 6px', fontSize: 11 }, {
+		        'aria-label': tr('workspace.close', 'Close'),
+		        onClick: props.onClose,
+		      }, '\u00d7')),
+		    h('div', { style: { fontSize: 10, color: THEME.textSecondary, wordBreak: 'break-all', marginBottom: 6 } }, node.iri || node.id),
+		    provenance
+		      ? h('div', { style: { marginBottom: 6 } },
+		        h('div', { style: { fontSize: 11, fontWeight: 600, color: THEME.text, marginBottom: 3 } },
+		          tr('provenance.sources', 'Sources ({n})').replace('{n}', String(provenance.sourceIds.length))),
+		        provenance.sourceIds.length === 0
+		          ? h('div', { style: { fontSize: 11, color: THEME.textSecondary } }, tr('provenance.none', 'No retained source'))
+		          : h('ul', { style: { listStyle: 'none', margin: 0, padding: 0 } },
+		            provenance.sourceIds.map((sourceId) => h('li', {
+		              key: sourceId,
+		              style: { fontSize: 11, color: THEME.text, padding: '2px 0' },
+		            },
+		            labelOf(sourceId),
+		            h('span', { style: { color: THEME.textSecondary } },
+		              ' · ' + tr('provenance.roles', 'roles') + ': ' +
+		              ((provenance.bySource || []).find(item => item.sourceId === sourceId)?.roles || []).join(', '))))),
+		        h('div', { style: { fontSize: 10, color: THEME.textSecondary, marginTop: 3 } },
+		          tr('provenance.statements', '{n} statements').replace('{n}', String((provenance.statementIds || []).length))))
+		      : null,
+		    h('div', { style: { fontSize: 11, fontWeight: 600, color: THEME.text, marginBottom: 3 } },
+		      tr('provenance.relations', 'Relations ({n})').replace('{n}', String(incident.length))),
+		    h('ul', { style: { listStyle: 'none', margin: 0, padding: 0 } },
+		      incident.slice(0, relationLimit).map((edge) => {
+		        const open = openEdge === edge.id
+		        const outgoing = edge.source === node.id
+		        const other = outgoing ? edge.target : edge.source
+		        return h('li', { key: edge.id, style: { borderTop: '1px solid ' + THEME.border, padding: '3px 0' } },
+		          h('button', {
+		            type: 'button',
+		            'aria-expanded': open,
+		            style: {
+		              border: 'none', background: 'transparent', color: THEME.text, cursor: 'pointer',
+		              fontSize: 11, textAlign: 'left', padding: 0, width: '100%',
+		            },
+		            onClick: () => setOpenEdge(open ? null : edge.id),
+		          },
+		          (outgoing ? '\u2192 ' : '\u2190 ') + edge.label + ' · ' + labelOf(edge.sourceIds && edge.sourceIds[0] ? edge.sourceIds[0] : '') +
+		            (edge.count > 1 ? ' ×' + edge.count : '')),
+		          open
+		            ? h('div', { style: { fontSize: 10, color: THEME.textSecondary, paddingLeft: 10, marginTop: 2 } },
+		              h('div', null, tr('provenance.subject', 'Subject') + ': ' + edge.source),
+		              h('div', null, tr('provenance.predicate', 'Predicate') + ': ' + edge.p),
+		              h('div', null, tr('provenance.object', 'Object') + ': ' + edge.target),
+		              h('div', null, tr('provenance.sources', 'Sources ({n})').replace('{n}', String((edge.sourceIds || []).length)) +
+		                ': ' + (edge.sourceIds || []).map(labelOf).join(', ')),
+		              h('div', null, tr('provenance.graphs', 'Graphs') + ': ' +
+		                (edge.graphs || []).map((graphItem) => graphItem.kind === 'iri'
+		                  ? graphItem.value
+		                  : tr('provenance.graph.' + graphItem.kind, graphItem.kind)).join(', ')),
+		              h('div', null, tr('provenance.otherEnd', 'Other end') + ': ' + other))
+		            : null)
+		      })),
+		    relationLimit < incident.length ? iconButton({}, {
+		      onClick: () => setRelationLimit(previous => previous + 40),
+		    }, tr('viewer.showMore', 'Show more')) : null)
+		  }
+
+		  return {
+		    WorkspaceToolbar: WorkspaceToolbar,
+		    SourcePanel: SourcePanel,
+		    WorkspaceFilePicker: WorkspaceFilePicker,
+		    ExportMenu: ExportMenu,
+		    ClassTreeView: ClassTreeView,
+		    LayeredView: LayeredView,
+		    ProvenancePanel: ProvenancePanel,
+		  }
+		}
+
+		// ==== src/graph-view-workspace.js ====
+		/**
+		 * Workspace surface: one controller for the primary file, additional files,
+		 * the three semantic views, provenance details and static export.
+		 *
+		 * It owns the workspace runner (`createOntologyRunner`) and keeps L0 in the
+		 * runner, the L1 graph in state, and per-view preferences here. Views never
+		 * re-parse: the tree and layered projections consume the same L1 graph, and a
+		 * source change only re-runs composition.
+		 *
+		 * Plain React.createElement; no imports (the Client build concatenates the
+		 * modules inside one closure).
+		 */
+
+		/** Monotonic revision used to reject stale export snapshots. */
+		let workspaceRevisionSequence = 0
+
+		/**
+		 * Translate a stored message descriptor at render time so a locale switch
+		 * re-renders existing status text instead of leaving the previous language.
+		 * `message` is `{ key, fallback?, values? }`; placeholders come from `values`.
+		 */
+		function formatI18nMessage(translate, message) {
+		  if (!message || typeof message !== 'object' || typeof message.key !== 'string') return ''
+		  const fn = typeof translate === 'function' ? translate : null
+		  const text = fn ? fn(message.key, message.fallback || message.key) : (message.fallback || message.key)
+		  if (!message.values || typeof text !== 'string') return String(text)
+		  return text.replace(/\{(\w+)\}/g, (match, name) => (
+		    Object.prototype.hasOwnProperty.call(message.values, name) ? String(message.values[name]) : match
+		  ))
+		}
+
+		/**
+		 * @param {any} React host React 18 module
+		 */
+		function createOntologyWorkspace(React) {
+		  const h = React.createElement
+		  const { useCallback, useEffect, useMemo, useRef, useState } = React
+		  const { OntologyGraphView } = createOntologyGraphView(React)
+		  const Multiview = createMultiview(React)
+
+		  const PANEL_LIMITS = {
+		    maxTriples: 120000,
+		    maxNodes: 1500,
+		    maxEdges: 6000,
+		    maxLiteralsPerNode: 60,
+		    maxLiteralLength: 16384,
+		  }
+		  const LAYOUT_ITERATIONS = 320
+
+		  /** Read one host theme token for the export theme. */
+		  function readThemeToken(name, fallback) {
+		    return readHostThemeToken(name, fallback)
+		  }
+
+		  const SESSION_REGISTRY = typeof createSessionRegistry === 'function' ? createSessionRegistry() : null
+		  function clearSharedWorkspaces() { if (SESSION_REGISTRY) registryClear(SESSION_REGISTRY) }
+
+		  function downloadBlob(blob, fileName) {
+		    try {
+		      if (typeof URL === 'undefined' || typeof URL.createObjectURL !== 'function') {
+		        return { ok: false, reason: 'unavailable' }
+		      }
+		      const url = URL.createObjectURL(blob)
+		      const link = document.createElement('a')
+		      link.href = url
+		      link.download = fileName
+		      link.rel = 'noopener'
+		      link.style.display = 'none'
+		      document.body.appendChild(link)
+		      link.click()
+		      document.body.removeChild(link)
+		      setTimeout(() => {
+		        try { URL.revokeObjectURL(url) } catch (error) { /* ignored */ }
+		      }, 4000)
+		      return { ok: true, reason: null }
+		    } catch (error) {
+		      return { ok: false, reason: error && error.message ? String(error.message) : 'download-failed' }
+		    }
+		  }
+
+		  function aggregateDiagnostics(sources) {
+		    const list = []
+		    for (const source of sources) {
+		      const diagnostics = source && Array.isArray(source.diagnostics) ? source.diagnostics : []
+		      for (const entry of diagnostics) {
+		        if (entry && typeof entry.code === 'string') list.push(entry)
+		      }
+		    }
+		    return list
+		  }
+
+		  function budgetsFrom(sources, graph) {
+		    let parse = null
+		    for (const source of sources) {
+		      if (source && source.truncation) parse = source.truncation
+		    }
+		    const truncation = graph && graph.truncation ? graph.truncation : {}
+		    return {
+		      parse: parse,
+		      nodes: truncation.nodes || null,
+		      literals: truncation.literals || null,
+		      edges: truncation.edges || null,
+		    }
+		  }
+
+		  function sourceLabelMap(sources) {
+		    const map = {}
+		    for (const source of sources) map[source.sourceId] = source.displayName || source.sourceId
+		    return map
+		  }
+
+		  /**
+		   * The workspace panel. Owner props mirror the previous single-file panel so
+		   * both host entries keep their existing state semantics.
+		   */
+		  function OntologyWorkspacePanel(props) {
+		    const t = props.t
+		    const messageText = useCallback((message) => formatI18nMessage(t, message), [t])
+		    const text = typeof props.text === 'string' ? props.text : ''
+		    const source = props.source || { address: '', displayName: '', surface: 'preview' }
+		    const absolutePath = typeof props.absolutePath === 'string' ? props.absolutePath : ''
+		    const loading = !!props.loading
+		    const skipReason = props.skipReason || null
+		    const sizeBytes = Number(props.sizeBytes) || 0
+		    const limitBytes = Number(props.limitBytes) || 12 * 1024 * 1024
+
+		    const [status, setStatus] = useState('idle')
+		    const [errorMessage, setErrorMessage] = useState('')
+		    const [graph, setGraph] = useState(null)
+		    const [positions, setPositions] = useState(null)
+		    const [sources, setSources] = useState([])
+		    const [totals, setTotals] = useState({ files: 0, bytes: 0, occurrences: 0 })
+		    const [workset, setWorkset] = useState([])
+		    const [degraded, setDegraded] = useState(false)
+		    const [viewType, setViewType] = useState('network')
+		    const [selectedId, setSelectedId] = useState(null)
+		    const [expandedIds, setExpandedIds] = useState([])
+		    const [treeMode, setTreeMode] = useState('class')
+		    const [treeQuery, setTreeQuery] = useState('')
+		    const [sharedFilter, setSharedFilter] = useState(() => emptyFilterState())
+		    const [sharedExplore, setSharedExplore] = useState(() => createExploreState())
+		    const [sharedAnchorId, setSharedAnchorId] = useState(null)
+		    const [orientation, setOrientation] = useState('down')
+		    const [predicates, setPredicates] = useState([])
+		    const [sourcesOpen, setSourcesOpen] = useState(false)
+		    const [exportOpen, setExportOpen] = useState(false)
+		    const [exportRange, setExportRange] = useState('viewport')
+		    const [exportScale, setExportScale] = useState(1)
+		    const [exportMessage, setExportMessage] = useState('')
+		    const [manualSvg, setManualSvg] = useState('')
+		    const [exportBusy, setExportBusy] = useState(false)
+		    const [picker, setPicker] = useState(null)
+		    const pickerTokenRef = useRef(0)
+		    const viewStoreRef = useRef(createViewStateStore())
+		    const [sharing, setSharing] = useState(false)
+		    const shareHandleRef = useRef(null)
+		    const shareUnsubscribeRef = useRef(null)
+		    const importedSharedRef = useRef(new Map())
+		    const syncingSharedRef = useRef(false)
+
+		    const runnerRef = useRef(null)
+		    const cameraRef = useRef({ zoom: 1, panX: 0, panY: 0, width: 900, height: 600 })
+		    const displaySceneRef = useRef(null)
+		    const revisionRef = useRef(0)
+		    const sourcesRef = useRef([])
+		    const worksetRef = useRef([])
+		    const statusRef = useRef('idle')
+		    const pendingReloadRef = useRef(null)
+		    const addInputRef = useRef(null)
+		    const composeTimerRef = useRef(0)
+		    const fileQueueRef = useRef(null)
+		    const sourceAcceptedRef = useRef(null)
+
+		    const primaryName = source.displayName || t('viewer.untitled', 'Untitled')
+		    const sourceLabels = useMemo(() => sourceLabelMap(sources), [sources])
+		    const sessionId = useMemo(() => {
+		      const target = workspaceFilesTarget(source.address)
+		      return typeof props.sessionId === 'string' && props.sessionId
+		        ? props.sessionId : (target ? target.sessionId : null)
+		    }, [source.address, props.sessionId])
+		    const filesApi = useMemo(() => workspaceFilesApi(props.ctx), [props.ctx])
+		    const filesTarget = useMemo(() => workspaceFilesTarget(source.address), [source.address])
+
+		    const publishSharedSources = useCallback(() => {
+		      const handle = shareHandleRef.current
+		      const runner = runnerRef.current
+		      if (!handle || !runner || syncingSharedRef.current) return
+		      const importedIds = new Set(Array.from(importedSharedRef.current.values()).map((item) => item.localId))
+		      const result = handle.replaceSources(runner.sourceSnapshots().filter((item) => !importedIds.has(item.sourceId)))
+		      if (!result.ok) setErrorMessage({
+		        key: 'workspace.rejected', fallback: 'Source not added: {reason}',
+		        values: { reason: String(result.reason) },
+		      })
+		    }, [t])
+
+		    const toggleSharing = useCallback(() => {
+		      if (sharing) {
+		        if (shareUnsubscribeRef.current) {
+		          shareUnsubscribeRef.current()
+		          shareUnsubscribeRef.current = null
+		        }
+		        if (shareHandleRef.current) {
+		          shareHandleRef.current.release()
+		          shareHandleRef.current = null
+		        }
+		        setSharing(false)
+		        return
+		      }
+		      if (!SESSION_REGISTRY || !sessionId) return
+		      const handle = registryAcquire(SESSION_REGISTRY, sessionId)
+		      shareHandleRef.current = handle
+		      if (!handle) return
+		      shareUnsubscribeRef.current = handle.subscribe((records) => {
+		        const runner = runnerRef.current
+		        if (!runner) return
+		        syncingSharedRef.current = true
+		        try {
+		          const remote = records.filter((record) => record.ownerId !== handle.ownerId)
+		          const wanted = new Set(remote.map((record) => record.sharedId))
+		          for (const [key, previous] of importedSharedRef.current) {
+		            if (!wanted.has(key)) {
+		              runner.dropSource(previous.localId)
+		              importedSharedRef.current.delete(key)
+		            }
+		          }
+		          for (const record of remote) {
+		            const previous = importedSharedRef.current.get(record.sharedId)
+		            if (previous && previous.snapshot === record) continue
+		            const localId = '\u0000shared:' + record.sharedId
+		            importedSharedRef.current.set(record.sharedId, { localId: localId, snapshot: record })
+		            runner.importSource(Object.assign({}, record, {
+		              sourceId: localId, replace: Boolean(previous),
+		            }))
+		            if (!runner.workspaceInfo().sources.some(item => item.sourceId === localId)) {
+		              importedSharedRef.current.delete(record.sharedId)
+		            }
+		          }
+		        } finally { syncingSharedRef.current = false }
+		      })
+		      setSharing(true)
+		      publishSharedSources()
+		    }, [sharing, sessionId, publishSharedSources])
+
+		    const loadPickerDirectory = useCallback((directory) => {
+		      const api = filesApi
+		      const target = filesTarget
+		      if (!api || !target) return
+		      pickerTokenRef.current += 1
+		      const token = pickerTokenRef.current
+		      setPicker((previous) => Object.assign({}, previous || { selected: [], entries: [] }, {
+		        directory: directory, loading: true, error: '',
+		      }))
+		      listWorkspaceDirectory(api, target.sessionId, directory, undefined).then((result) => {
+		        if (token !== pickerTokenRef.current) return
+		        setPicker((previous) => Object.assign({}, previous || { selected: [] }, {
+		          directory: directory, loading: false,
+		          entries: result.ok ? result.entries : [],
+		          truncated: result.ok ? result.truncated : false,
+		          error: result.ok ? '' : t('workspace.dirError', 'Cannot read this folder: {reason}')
+		            .replace('{reason}', String(result.reason)),
+		        }))
+		      })
+		    }, [filesApi, filesTarget, t])
+
+		    const openWorkspacePicker = useCallback(() => {
+		      const target = filesTarget
+		      if (!target) return
+		      const parts = String(target.path).split('/').filter(Boolean)
+		      parts.pop()
+		      const directory = parts.length > 0 ? parts.join('/') : '.'
+		      setPicker({ directory: directory, entries: [], truncated: false, loading: true, error: '', selected: [] })
+		      loadPickerDirectory(directory)
+		    }, [filesTarget, loadPickerDirectory])
+
+		    const pickerNavigate = useCallback((directory) => { loadPickerDirectory(directory) }, [loadPickerDirectory])
+		    const pickerUp = useCallback(() => {
+		      const current = picker && picker.directory ? picker.directory : '.'
+		      const parts = current.split('/').filter(Boolean)
+		      parts.pop()
+		      loadPickerDirectory(parts.length > 0 ? parts.join('/') : '.')
+		    }, [picker, loadPickerDirectory])
+		    const pickerToggle = useCallback((path, checked) => {
+		      setPicker((previous) => Object.assign({}, previous || {}, {
+		        selected: togglePickerSelection(previous ? previous.selected : [], path, checked),
+		      }))
+		    }, [])
+
+		    const pickerConfirm = useCallback(() => {
+		      const api = filesApi
+		      const target = filesTarget
+		      const runner = runnerRef.current
+		      const selected = picker && Array.isArray(picker.selected) ? picker.selected.slice() : []
+		      if (!api || !target || !runner || selected.length === 0) return
+		      setPicker((previous) => Object.assign({}, previous || {}, { loading: true, error: '' }))
+		      let index = 0
+		      const next = () => {
+		        if (index >= selected.length) {
+		          setPicker(null)
+		          return
+		        }
+		        const path = selected[index]
+		        index += 1
+		        readWorkspaceSource(api, target.sessionId, path, undefined).then((result) => {
+		          if (!result.ok) {
+		            setPicker((previous) => Object.assign({}, previous || {}, {
+		              loading: false,
+		              error: t('workspace.readError', 'Cannot read {name}: {reason}')
+		                .replace('{name}', String(path.split('/').pop()))
+		                .replace('{reason}', String(result.reason)),
+		            }))
+		            return
+		          }
+		          const name = path.split('/').filter(Boolean).pop() || path
+		          runner.parseSource({
+		            origin: 'host',
+		            displayName: name,
+		            navigationAddress: 'dsh-resource://file/session/' + target.sessionId + '/' + path,
+		            absolutePath: result.absolutePath || undefined,
+		            text: result.text,
+		            byteSize: result.byteSize,
+		          })
+		          setPicker((previous) => Object.assign({}, previous || {}, { selected: [] }))
+		          next()
+		        })
+		      }
+		      next()
+		    }, [filesApi, filesTarget, picker, t])
+		    const selectedNode = useMemo(() => {
+		      if (!graph || !selectedId) return null
+		      const nodes = Array.isArray(graph.nodes) ? graph.nodes : []
+		      return nodes.find((node) => node && node.id === selectedId) || null
+		    }, [graph, selectedId])
+		    const predicateOptions = useMemo(() => (graph ? collectPredicateOptions(graph) : []), [graph])
+		    useEffect(() => {
+		      if (!graph) return
+		      const reconciled = reconcileWorkspaceState({
+		        query: treeQuery, selectedId: selectedId, anchorId: sharedAnchorId,
+		        filter: sharedFilter, explore: sharedExplore,
+		      }, graph, sources.map(source => source.sourceId))
+		      if (reconciled.selectedId !== selectedId) setSelectedId(reconciled.selectedId)
+		      if (reconciled.anchorId !== sharedAnchorId) setSharedAnchorId(reconciled.anchorId)
+		      if (JSON.stringify(reconciled.explore) !== JSON.stringify(sharedExplore)) setSharedExplore(reconciled.explore)
+		      if (JSON.stringify(reconciled.filter) !== JSON.stringify(sharedFilter)) setSharedFilter(reconciled.filter)
+		    }, [graph])
+
+		    const projectedGraph = useMemo(() => {
+		      if (!graph) return graph
+		      const anchor = selectedId || sharedAnchorId
+		      const criteria = filterCriteria(sharedFilter, anchor)
+		      if (sharedExplore.on) delete criteria.direction
+		      let result = normalizeProjectionResult(filterGraph(graph, criteria), graph)
+		      if (sharedExplore.on && anchor) {
+		        result = normalizeExploreResult(exploreNeighborhood(result,
+		          exploreCriteria(sharedExplore, anchor, sharedFilter)), result).graph
+		      }
+		      return result
+		    }, [graph, sharedFilter, sharedExplore, selectedId, sharedAnchorId])
+
+		    const scheduleCompose = useCallback(() => {
+		      if (composeTimerRef.current) clearTimeout(composeTimerRef.current)
+		      composeTimerRef.current = setTimeout(() => {
+		        composeTimerRef.current = 0
+		        const runner = runnerRef.current
+		        if (!runner || (fileQueueRef.current && fileQueueRef.current.pending > 0)) return
+		        runner.compose({
+		          sourceIds: worksetRef.current.length > 0 ? worksetRef.current : undefined,
+		          maxNodes: PANEL_LIMITS.maxNodes,
+		          maxEdges: PANEL_LIMITS.maxEdges,
+		          maxLiteralsPerNode: PANEL_LIMITS.maxLiteralsPerNode,
+		          maxLiteralLength: PANEL_LIMITS.maxLiteralLength,
+		          layout: {
+		            width: cameraRef.current.width,
+		            height: cameraRef.current.height,
+		            seed: 1,
+		            iterations: LAYOUT_ITERATIONS,
+		          },
+		        })
+		      }, 0)
+		    }, [])
+
+		    const handleEvent = useCallback((event) => {
+		      if (!event || typeof event !== 'object') return
+		      if (event.scope === 'workspace') {
+		        if (event.type === 'source' && sourceAcceptedRef.current) {
+		          const resolve = sourceAcceptedRef.current
+		          sourceAcceptedRef.current = null
+		          resolve(event)
+		        }
+		        if (event.type === 'state') {
+		          statusRef.current = event.status
+		          setStatus(event.status)
+		          if (event.degraded) setDegraded(true)
+		          return
+		        }
+		        if (event.type === 'source') {
+		          if (event.status === 'rejected') {
+		            setExportMessage('')
+		            setErrorMessage({
+		              key: 'workspace.rejected', fallback: 'Source not added: {reason}',
+		              values: { reason: String(event.reason || 'budget') },
+		            })
+		            return
+		          }
+		          const summary = event.summary
+		          if (summary) {
+		            sourcesRef.current = Array.isArray(event.sources) ? event.sources : sourcesRef.current
+		            setSources(sourcesRef.current)
+		            setTotals(event.totals || { files: 0, bytes: 0, occurrences: 0 })
+		            statusRef.current = 'modeling'
+		            setStatus('modeling')
+		            scheduleCompose()
+		            publishSharedSources()
+		          }
+		          return
+		        }
+		        if (event.type === 'sources') {
+		          sourcesRef.current = Array.isArray(event.sources) ? event.sources : []
+		          setSources(sourcesRef.current)
+		          setTotals(event.totals || { files: 0, bytes: 0, occurrences: 0 })
+		          scheduleCompose()
+		          publishSharedSources()
+		          return
+		        }
+		        if (event.type === 'graph') {
+		          revisionRef.current += 1
+		          markLayoutRevision(viewStoreRef.current, revisionRef.current)
+		          setGraph(event.graph || null)
+		          setErrorMessage('')
+		          if (event.graph && event.graph.stats && event.graph.stats.truncation) {
+		            // structured truncation is rendered through the view budgets
+		          }
+		          return
+		        }
+		        if (event.type === 'layout') {
+		          revisionRef.current += 1
+		          setPositions(Array.isArray(event.positions) ? event.positions : null)
+		          statusRef.current = 'ready'
+		          setStatus('ready')
+		          return
+		        }
+		        if (event.type === 'error') {
+		          if (sourceAcceptedRef.current) {
+		            const resolve = sourceAcceptedRef.current
+		            sourceAcceptedRef.current = null
+		            resolve(event)
+		          }
+		          setErrorMessage(typeof event.message === 'string' ? event.message : 'error')
+		          statusRef.current = 'error'
+		          setStatus('error')
+		          return
+		        }
+		        return
+		      }
+		      // Non-workspace events (relayout of the composed graph).
+		      if (event.type === 'state') {
+		        statusRef.current = event.status
+		        setStatus(event.status)
+		        return
+		      }
+		      if (event.type === 'layout') {
+		        revisionRef.current += 1
+		        setPositions(Array.isArray(event.positions) ? event.positions : null)
+		        statusRef.current = 'ready'
+		        setStatus('ready')
+		        return
+		      }
+		      if (event.type === 'error') {
+		        setErrorMessage(typeof event.message === 'string' ? event.message : 'error')
+		        statusRef.current = 'error'
+		        setStatus('error')
+		      }
+		    }, [scheduleCompose, t, publishSharedSources])
+
+		    const handlerRef = useRef(handleEvent)
+		    handlerRef.current = handleEvent
+
+		    // One runner per input document: changing the file starts a new workspace.
+		    // The owner translates re-render on language change and its identity is not
+		    // stable, so the effect must not depend on the callback identity.
+		    useEffect(() => {
+		      if (loading || skipReason) return undefined
+		      if (!text || text.trim() === '') {
+		        statusRef.current = 'empty'
+		        setStatus('empty')
+		        return undefined
+		      }
+		      let runner = null
+		      try {
+		        runner = createOntologyRunner({
+		          forceMainThread: false,
+		          onEvent: (event) => {
+		            if (handlerRef.current) handlerRef.current(event)
+		          },
+		        })
+		        runnerRef.current = runner
+		        sourcesRef.current = []
+		        setSources([])
+		        setGraph(null)
+		        setPositions(null)
+		        setSelectedId(null)
+		        setExpandedIds([])
+		        setWorkset([])
+		        worksetRef.current = []
+		        setTotals({ files: 0, bytes: 0, occurrences: 0 })
+		        statusRef.current = 'parsing'
+		        setStatus('parsing')
+		        setDegraded(false)
+		        setErrorMessage('')
+		        revisionRef.current = 0
+		        runner.parseSource({
+		          origin: 'host',
+		          displayName: primaryName,
+		          navigationAddress: source.address || '',
+		          absolutePath: absolutePath,
+		          text: text,
+		          byteSize: sizeBytes,
+		        })
+		      } catch (error) {
+		        // A synchronous failure must be visible instead of an endless spinner.
+		        statusRef.current = 'error'
+		        setStatus('error')
+		        setErrorMessage('workspace start failed: ' +
+		          (error && error.message ? String(error.message) : String(error)))
+		      }
+		      return () => {
+		        if (composeTimerRef.current) {
+		          clearTimeout(composeTimerRef.current)
+		          composeTimerRef.current = 0
+		        }
+		        if (fileQueueRef.current) fileQueueRef.current.invalidate()
+		        if (sourceAcceptedRef.current) { sourceAcceptedRef.current(); sourceAcceptedRef.current = null }
+		        if (runner) runner.dispose()
+		        runnerRef.current = null
+		      }
+		    }, [text, source.address, absolutePath, loading, skipReason, primaryName, sizeBytes])
+
+		    if (!fileQueueRef.current) {
+		      fileQueueRef.current = createFileReadQueue({
+		        maxBytes: 12 * 1024 * 1024,
+		        accept: ({ file, text: fileText, byteSize, replacementId }) => new Promise((resolve) => {
+		          const runner = runnerRef.current
+		          if (!runner) { resolve(); return }
+		          sourceAcceptedRef.current = resolve
+		          runner.parseSource({
+		            origin: 'browser', displayName: typeof file.name === 'string' ? file.name : 'file',
+		            sourceId: replacementId, replace: Boolean(replacementId),
+		            text: fileText, byteSize: byteSize,
+		          })
+		        }),
+		        onError: (file, reason) => {
+		          if (handlerRef.current) handlerRef.current({ scope: 'workspace', type: 'source', status: 'rejected',
+		            reason: String(file && file.name || 'file') + ': ' + reason })
+		        },
+		        onIdle: scheduleCompose,
+		      })
+		    }
+		    const addFiles = useCallback((files) => {
+		      if (runnerRef.current && fileQueueRef.current) fileQueueRef.current.enqueue(files)
+		    }, [])
+
+		    useEffect(() => () => {
+		      if (shareUnsubscribeRef.current) {
+		        shareUnsubscribeRef.current()
+		        shareUnsubscribeRef.current = null
+		      }
+		      if (shareHandleRef.current) {
+		        shareHandleRef.current.release()
+		        shareHandleRef.current = null
+		      }
+		      importedSharedRef.current.clear()
+		      setSharing(false)
+		    }, [sessionId])
+
+		    const handleAddInput = useCallback((event) => {
+		      const files = event.target.files ? Array.from(event.target.files) : []
+		      event.target.value = ''
+		      const pending = pendingReloadRef.current
+		      pendingReloadRef.current = null
+		      if (pending && files.length > 0) {
+		        if (fileQueueRef.current) fileQueueRef.current.enqueue([files[0]], pending)
+		        return
+		      }
+		      addFiles(files)
+		    }, [addFiles])
+
+		    const requestReload = useCallback((sourceId) => {
+		      pendingReloadRef.current = sourceId
+		      if (addInputRef.current) addInputRef.current.click()
+		    }, [])
+
+		    const removeSource = useCallback((sourceId) => {
+		      if (runnerRef.current) runnerRef.current.dropSource(sourceId)
+		      setSelectedId(null)
+		      setExpandedIds([])
+		    }, [])
+
+		    const setWorksetIds = useCallback((next) => {
+		      const list = Array.isArray(next) ? next : []
+		      worksetRef.current = list
+		      setWorkset(list)
+		      scheduleCompose()
+		    }, [scheduleCompose])
+
+		    const setWorkspaceSelection = useCallback((id) => {
+		      setSelectedId(id)
+		      setSharedAnchorId(id)
+		    }, [])
+
+		    const setWorkspaceFilter = useCallback((next) => {
+		      setSharedFilter(normalizeFilterState(next))
+		    }, [])
+
+		    const setWorkspaceExplore = useCallback((next) => {
+		      setSharedExplore(createExploreState(next))
+		    }, [])
+
+		    const switchView = useCallback((next) => {
+		      const store = viewStoreRef.current
+		      snapshotView(store, viewType, {
+		        expandedIds: expandedIds,
+		        orientation: orientation,
+		        predicates: predicates,
+		        camera: Object.assign({}, cameraRef.current),
+		      })
+		      setViewType(next)
+		      const saved = viewSnapshot(store, next)
+		      if (Array.isArray(saved.expandedIds)) setExpandedIds(saved.expandedIds)
+		      if (saved.orientation === 'down' || saved.orientation === 'right') setOrientation(saved.orientation)
+		      if (Array.isArray(saved.predicates)) setPredicates(saved.predicates)
+		      if (saved.camera && typeof saved.camera === 'object') {
+		        cameraRef.current = Object.assign({}, cameraRef.current, saved.camera)
+		      }
+		    }, [viewType, treeQuery, expandedIds, orientation, predicates])
+
+		    const onRelayout = useCallback((seed) => {
+		      const runner = runnerRef.current
+		      if (!runner) return
+		      runner.relayout({
+		        width: cameraRef.current.width,
+		        height: cameraRef.current.height,
+		        seed: typeof seed === 'number' && seed > 0 ? seed : revisionRef.current + 1,
+		        iterations: LAYOUT_ITERATIONS,
+		      })
+		    }, [])
+
+		    const themeForExport = useCallback(() => ({
+		      background: readThemeToken('--dsw-alias-bg-layer-1', '#ffffff'),
+		      node: readThemeToken('--dsw-alias-brand-primary', '#4f6bed'),
+		      nodeText: readThemeToken('--dsw-alias-label-primary', '#1f2430'),
+		      edge: readThemeToken('--dsw-alias-border-l1', '#9aa3b2'),
+		      edgeText: readThemeToken('--dsw-alias-label-secondary', '#6b6b76'),
+		      group: readThemeToken('--dsw-alias-brand-primary', '#7c5cd6'),
+		    }), [])
+
+		    const buildScene = useCallback((range) => {
+		      if (!graph || statusRef.current !== 'ready') return { ok: false, reason: 'no-graph' }
+		      if (viewType === 'tree') {
+		        const hierarchy = buildHierarchy(projectedGraph, { mode: treeMode })
+		        const expanded = expandHierarchy(hierarchy, {
+		          expandedIds: expandedIds,
+		          maxRefs: 1200,
+		          maxDepth: 12,
+		        })
+		        const rows = filterTreeRows(expanded.refs, hierarchy, treeSearchPlan(hierarchy, treeQuery))
+		        return { ok: true, scene: buildTreeScene(rows, {
+		          revision: revisionRef.current,
+		          theme: themeForExport(),
+		          meta: { sources: sourcesRef.current.length },
+		        }) }
+		      }
+		      if (viewType === 'layered') {
+		        const layout = layoutLayeredGraph(projectedGraph, {
+		          predicates: predicates.length > 0 ? predicates : undefined,
+		          orientation: orientation,
+		          width: cameraRef.current.width || 900,
+		          height: cameraRef.current.height || 560,
+		        })
+		        return { ok: true, scene: buildLayeredScene(layout, {
+		          revision: revisionRef.current,
+		          theme: themeForExport(),
+		          meta: { sources: sourcesRef.current.length },
+		        }) }
+		      }
+		      if (!Array.isArray(positions) || positions.length === 0) return { ok: false, reason: 'no-layout' }
+		      const camera = cameraRef.current
+		      const displayed = displaySceneRef.current
+		      if (!displayedSceneReady(displayed, graph)) return { ok: false, reason: 'stale-layout' }
+		      return {
+		        ok: true,
+		        scene: buildNetworkScene({
+		          nodes: displayed.nodes,
+		          edges: displayed.edges,
+		          positions: displayed.positions,
+		          labels: displayed.labels,
+		          camera: camera,
+		          viewport: { width: camera.width, height: camera.height },
+		          range: range,
+		          revision: revisionRef.current,
+		          theme: themeForExport(),
+		          meta: { sources: sourcesRef.current.length },
+		        }),
+		      }
+		    }, [graph, projectedGraph, positions, viewType, treeMode, treeQuery, expandedIds, predicates, orientation, themeForExport])
+
+		    const handleCopySvg = useCallback(() => {
+		      const built = buildScene(exportRange)
+		      if (!built.ok) {
+		        setExportMessage({ key: 'export.blocked', fallback: 'Nothing to export yet: wait for the layout to finish.' })
+		        return
+		      }
+		      const ready = exportSceneReady(built.scene, revisionRef.current)
+		      if (!ready.ok) {
+		        setExportMessage({ key: 'export.blocked', fallback: 'Nothing to export yet: wait for the layout to finish.' })
+		        return
+		      }
+		      const svg = renderSceneSvg(built.scene)
+		      try {
+		        if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+		          setManualSvg('')
+		          Promise.resolve(navigator.clipboard.writeText(svg)).then(() => {
+		            setExportMessage({ key: 'export.copied', fallback: 'SVG copied to the clipboard.' })
+		          }, () => {
+		            setExportMessage({ key: 'export.copyFailed', fallback: 'Clipboard unavailable; export the SVG file instead.' })
+		            setManualSvg(svg)
+		          })
+		          return
+		        }
+		      } catch (error) {
+		        // fall through to the failure message
+		      }
+		      setExportMessage({ key: 'export.copyFailed', fallback: 'Clipboard unavailable; export the SVG file instead.' })
+		      setManualSvg(svg)
+		    }, [buildScene, exportRange, t])
+
+		    const handleExport = useCallback((format) => {
+		      const built = buildScene(exportRange)
+		      if (!built.ok) {
+		        setExportMessage({ key: 'export.blocked', fallback: 'Nothing to export yet: wait for the layout to finish.' })
+		        return
+		      }
+		      const ready = exportSceneReady(built.scene, revisionRef.current)
+		      if (!ready.ok) {
+		        setExportMessage({ key: 'export.blocked', fallback: 'Nothing to export yet: wait for the layout to finish.' })
+		        return
+		      }
+		      const svg = renderSceneSvg(built.scene)
+		      const baseName = (primaryName || 'ontology').replace(/[^\w.-]+/g, '_')
+		      if (format === 'svg') {
+		        const result = downloadBlob(new Blob([svg], { type: 'image/svg+xml;charset=utf-8' }), baseName + '.svg')
+		        setExportMessage(result.ok
+		          ? { key: 'export.started', fallback: 'Download started. Browsers do not report whether the file was saved.' }
+		          : { key: 'export.failed', fallback: 'Download failed: {reason}', values: { reason: String(result.reason) } })
+		        return
+		      }
+		      const plan = planPngExport(built.scene, { scale: exportScale })
+		      if (!plan.ok) {
+		        setExportMessage(plan.reason === 'max-side' || plan.reason === 'max-pixels'
+		          ? { key: 'export.tooLarge', fallback: 'This view is too large for PNG at that scale; lower the scale or export SVG.' }
+		          : { key: 'export.failed', fallback: 'Download failed: {reason}', values: { reason: String(plan.reason) } })
+		        return
+		      }
+		      setExportBusy(true)
+		      rasterizePng(svg, plan, null).then((result) => {
+		        setExportBusy(false)
+		        if (!result.ok) {
+		          setExportMessage({
+		            key: 'export.pngFallback', fallback: 'PNG failed ({reason}); exported SVG instead.',
+		            values: { reason: String(result.reason) },
+		          })
+		          const fallback = downloadBlob(new Blob([svg], { type: 'image/svg+xml;charset=utf-8' }), baseName + '.svg')
+		          if (!fallback.ok) {
+		            setExportMessage({ key: 'export.failed', fallback: 'Download failed: {reason}', values: { reason: String(fallback.reason) } })
+		          }
+		          return
+		        }
+		        const download = downloadBlob(result.blob, baseName + '.png')
+		        setExportMessage(download.ok
+		          ? { key: 'export.started', fallback: 'Download started. Browsers do not report whether the file was saved.' }
+		          : { key: 'export.failed', fallback: 'Download failed: {reason}', values: { reason: String(download.reason) } })
+		      }).catch((error) => {
+		        setExportBusy(false)
+		        setExportMessage({
+		          key: 'export.failed', fallback: 'Download failed: {reason}',
+		          values: { reason: error && error.message ? String(error.message) : 'png' },
+		        })
+		      })
+		    }, [buildScene, exportRange, exportScale, primaryName, t])
+
+		    // --- status screens (kept identical to the single-file contract) --------
+		    const styleHost = {
+		      height: '100%', minHeight: 0, display: 'flex', flexDirection: 'column',
+		      background: 'var(--dsw-alias-bg-layer-1, #ffffff)',
+		    }
+		    function centerScreen(state, message, hint) {
+		      return h('div', {
+		        style: {
+		          display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+		          gap: 8, height: '100%', minHeight: 160, padding: 24,
+		          color: 'var(--dsw-alias-label-secondary, #6b6b76)', fontSize: 13,
+		          fontFamily: 'var(--dsw-font-family, system-ui, sans-serif)', textAlign: 'center',
+		          boxSizing: 'border-box',
+		        },
+		        'data-ontology-state': state,
+		      },
+		      h('div', { style: { lineHeight: 1.6, maxWidth: 420 } }, message),
+		      hint ? h('div', { style: { fontSize: 12, color: 'var(--dsw-alias-label-tertiary, #8a8a94)', maxWidth: 420 } }, hint) : null)
+		    }
+
+		    if (skipReason === 'tooLarge') {
+		      const surface = source.surface || 'preview'
+		      return centerScreen('too-large',
+		        surface === 'sidebar'
+		          ? t('state.tooLargeSidebar', '')
+		          : t('state.tooLargePreview', ''),
+		        fillTemplate(t('state.tooLarge', ''), { size: limitBytes > 0 ? Math.round(limitBytes / (1024 * 1024)) + ' MiB' : '12 MiB' }))
+		    }
+		    if (loading || status === 'idle') {
+		      return centerScreen('loading', t('state.loading', 'Loading…'))
+		    }
+		    if (status === 'empty') {
+		      return centerScreen('empty', t('state.empty', 'No drawable triples.'))
+		    }
+		    if (status === 'error') {
+		      return h('div', {
+		        style: {
+		          display: 'flex', flexDirection: 'column', gap: 8, height: '100%', padding: 16,
+		          color: 'var(--dsw-alias-label-secondary, #6b6b76)', fontSize: 13,
+		          fontFamily: 'var(--dsw-font-family, system-ui, sans-serif)',
+		          boxSizing: 'border-box',
+		        },
+		        'data-ontology-state': 'error',
+		      },
+		      h('div', { style: { lineHeight: 1.6 } }, t('state.error', 'Parse failed')),
+		      h('pre', {
+		        style: {
+		          maxWidth: '100%', maxHeight: 180, overflow: 'auto', margin: 0, padding: 8, borderRadius: 6,
+		          fontSize: 12, background: 'var(--dsw-alias-bg-layer-2, #f4f4f6)',
+		          color: 'var(--dsw-alias-label-secondary, #6b6b76)', whiteSpace: 'pre-wrap',
+		        },
+		      }, messageText(errorMessage)))
+		    }
+		    const busy = status === 'parsing' || status === 'modeling' || status === 'layout'
+		    if (busy && !graph) {
+		      const label = status === 'layout' ? t('state.layout', 'Computing layout…')
+		        : status === 'modeling' ? t('state.modeling', 'Building the graph…')
+		          : t('state.parsing', 'Parsing RDF…')
+		      return centerScreen(status, label)
+		    }
+		    if (!graph) return centerScreen('empty', t('state.empty', 'No drawable triples.'))
+
+		    const surfaceLimit = source.surface === 'sidebar'
+		      ? { kind: 'surface', bytes: limitBytes, surface: 'sidebar' }
+		      : { kind: 'plugin', bytes: limitBytes, surface: 'preview' }
+		    const issues = Array.isArray(graph.warnings) ? graph.warnings : []
+		    const diagnostics = aggregateDiagnostics(sources)
+		    const budgets = budgetsFrom(sources, graph)
+
+		    let content = null
+		    if (viewType === 'tree') {
+		      content = h(Multiview.ClassTreeView, {
+		        tr: t,
+		        graph: projectedGraph,
+		        mode: treeMode,
+		        onMode: setTreeMode,
+		        query: treeQuery,
+		        onQuery: setTreeQuery,
+		        selectedId: selectedId,
+		        onSelect: setWorkspaceSelection,
+		        expandedIds: expandedIds,
+		        onToggle: (entityId) => setExpandedIds((previous) => toggleExpandedList(previous, entityId)),
+		        exploreRootNotClass: exploreRootNotClass(graph, sharedAnchorId, sharedExplore.on),
+		        narrow: false,
+		      })
+		    } else if (viewType === 'layered') {
+		      content = h(Multiview.LayeredView, {
+		        tr: t,
+		        graph: projectedGraph,
+		        orientation: orientation,
+		        onOrientation: setOrientation,
+		        predicates: predicates,
+		        predicateOptions: predicateOptions,
+		        onPredicates: setPredicates,
+		        selectedId: selectedId,
+		        onSelect: setWorkspaceSelection,
+		        width: cameraRef.current.width,
+		        height: cameraRef.current.height,
+		        narrow: false,
+		      })
+		    } else {
+		      content = h(OntologyGraphView, {
+		        graph: graph,
+		        t: t,
+		        sourceName: sources.length > 1
+		          ? t('workspace.unionName', '{n} sources').replace('{n}', String(sources.length))
+		          : primaryName,
+		        issues: issues,
+		        diagnostics: diagnostics,
+		        budgets: budgets,
+		        positions: positions,
+		        layoutStatus: status,
+		        degraded: degraded,
+		        surfaceLimit: surfaceLimit,
+		        onRelayout: onRelayout,
+		        cameraRef: cameraRef,
+		        displaySceneRef: displaySceneRef,
+		        selectedId: selectedId,
+		        onSelectNode: setWorkspaceSelection,
+		        sourceLabels: sourceLabels,
+		        searchQuery: treeQuery,
+		        onSearchQuery: setTreeQuery,
+		        filterState: sharedFilter,
+		        onFilterState: setWorkspaceFilter,
+		        exploreState: sharedExplore,
+		        onExploreState: setWorkspaceExplore,
+		        workspaceManaged: true,
+		      })
+		    }
+
+		    return h('div', Object.assign({}, props.hostProps || {}, {
+		      style: styleHost,
+		      'data-ontology-state': 'ready',
+		      'data-ontology-view': viewType,
+		      onDragOver: (event) => {
+		        if (event.dataTransfer && Array.from(event.dataTransfer.types || []).includes('Files')) event.preventDefault()
+		      },
+		      onDrop: (event) => {
+		        const files = event.dataTransfer && event.dataTransfer.files
+		        if (!files || files.length === 0) return
+		        event.preventDefault()
+		        addFiles(Array.from(files))
+		      },
+		    }),
+		    h('input', {
+		      ref: addInputRef,
+		      type: 'file',
+		      multiple: false,
+		      style: { display: 'none' },
+		      onChange: handleAddInput,
+		    }),
+		    h(Multiview.WorkspaceToolbar, {
+		      tr: t,
+		      viewType: viewType,
+		      onViewType: switchView,
+		      selectedLabel: selectedNode ? (selectedNode.label || selectedNode.local || selectedNode.id) : '',
+		      sourceCount: sources.length,
+		      sourcesOpen: sourcesOpen,
+		      onToggleSources: () => setSourcesOpen((previous) => !previous),
+		      exportOpen: exportOpen,
+		      onToggleExport: () => setExportOpen((previous) => !previous),
+		    }),
+		    sourcesOpen ? h(Multiview.SourcePanel, {
+		      tr: t,
+		      sources: sources,
+		      totals: totals,
+		      worksetIds: workset,
+		      onSetWorkset: setWorksetIds,
+		      onAddFiles: addFiles,
+		      onRequestReload: requestReload,
+		      onRemove: removeSource,
+		      onClose: () => setSourcesOpen(false),
+		      workspaceFilesAvailable: Boolean(filesApi && filesTarget),
+		      onPickWorkspaceFiles: openWorkspacePicker,
+		      sharing: sharing,
+		      sharingAvailable: Boolean(sessionId),
+		      onToggleSharing: toggleSharing,
+		    }) : null,
+		    exportOpen ? h(Multiview.ExportMenu, {
+		      tr: t,
+		      range: exportRange,
+		      onRange: setExportRange,
+		      scale: exportScale,
+		      onScale: setExportScale,
+		      onExport: handleExport,
+		      onCopySvg: handleCopySvg,
+		      message: exportMessage ? messageText(exportMessage) : '',
+		      svgText: manualSvg,
+		      busy: exportBusy,
+		    }) : null,
+		    h('div', {
+		      style: { position: 'relative', flex: '1 1 auto', minHeight: 0, display: 'flex' },
+		    },
+		    content,
+		    (viewType !== 'network' && selectedNode) ? h(Multiview.ProvenancePanel, {
+		      tr: t,
+		      node: selectedNode,
+		      graph: graph,
+		      sourceLabels: sourceLabels,
+		      onSelect: setSelectedId,
+		      onClose: () => setSelectedId(null),
+		    }) : null,
+		    picker ? h(Multiview.WorkspaceFilePicker, {
+		      tr: t,
+		      state: picker,
+		      busy: Boolean(picker.loading),
+		      onNavigate: pickerNavigate,
+		      onUp: pickerUp,
+		      onToggle: pickerToggle,
+		      onConfirm: pickerConfirm,
+		      onClose: () => setPicker(null),
+		    }) : null),
+		    busy ? h('div', {
+		      role: 'status',
+		      'aria-live': 'polite',
+		      style: {
+		        position: 'absolute', right: 10, bottom: 8, fontSize: 11,
+		        color: 'var(--dsw-alias-label-secondary, #6b6b76)',
+		      },
+		    }, t('state.layout', 'Computing layout…')) : null)
+		  }
+
+		  return { OntologyWorkspacePanel: OntologyWorkspacePanel, clearSharedWorkspaces: clearSharedWorkspaces }
 		}
 
 		// ==== src/main.js ====
@@ -9486,6 +15587,9 @@ window.__ModuleLoader__.load({
 
 		/** Built once per Client module load; the component identity must stay stable. */
 		const GRAPH_VIEW = createOntologyGraphView(React).OntologyGraphView
+		/** Workspace surface: primary file + additional sources + three views. */
+		const WORKSPACE_COMPONENTS = createOntologyWorkspace(React)
+		const ONTOLOGY_WORKSPACE = WORKSPACE_COMPONENTS.OntologyWorkspacePanel
 
 		const ZH = {
 		  // surfaces / titles
@@ -9608,6 +15712,16 @@ window.__ModuleLoader__.load({
 		  'viewer.relationsHidden': '未在画布绘制',
 		  'viewer.showMore': '显示更多',
 		  'viewer.sourceReserved': '源文件定位（预留）',
+		  'viewer.copySourceHint': '复制来源标识',
+		  'viewer.copySourceId': '复制来源标识',
+		  'viewer.graphIdentity': '图身份',
+		  'viewer.graphIdentityNone': '无',
+		  'viewer.locationUnavailable': '语句位置未记录（null）。',
+		  'viewer.provenance': '已接纳来源',
+		  'viewer.provenanceStatements': '{n} 条语句',
+		  'viewer.provenanceMissing': '该实体没有记录已接纳来源。',
+		  'viewer.provenanceRoles': '角色：{roles}',
+		  'viewer.provenanceHint': '已接纳来源不代表输入完整。',
 		  // kind group labels
 		  'viewer.group.type': '类型',
 		  'viewer.group.literals': '字面量',
@@ -9630,6 +15744,114 @@ window.__ModuleLoader__.load({
 		  'diag.literal-limit': '字面量超过长度上限',
 		  'diag.triple-limit': '三元组达到上限',
 		  'diag.diagnostics-truncated': '诊断条数超过上限',
+		  // workspace (multi-file) chrome
+		  'workspace.toolbar': '工作区工具栏',
+		  'workspace.sources': '来源',
+		  'workspace.totals': '{files} 个文件 · {triples} 条三元组',
+		  'workspace.addFiles': '添加文件',
+		  'workspace.allSources': '全部来源',
+		  'workspace.union': '联合',
+		  'workspace.close': '关闭',
+		  'workspace.pickWorkspaceFiles': '工作区文件',
+		  'workspace.cancel': '取消',
+		  'workspace.loadingDir': '正在读取目录…',
+		  'workspace.noFiles': '该目录没有文件。',
+		  'workspace.openDir': '打开文件夹',
+		  'workspace.selectFile': '选择文件',
+		  'workspace.dirTruncated': '目录列表已截断。',
+		  'workspace.parentDir': '上一级',
+		  'workspace.readSelected': '读取所选',
+		  'workspace.dirError': '无法读取该目录：{reason}',
+		  'workspace.readError': '无法读取 {name}：{reason}',
+		  'workspace.shareUnavailable': '无法确认会话身份；工作区仅在本面板内使用。',
+		  'workspace.share': '共享',
+		  'workspace.sharing': '已共享',
+		  'workspace.shareHint': '共享仅在本页面内，最后一个面板关闭即清空。',
+		  'workspace.empty': '尚未载入来源。',
+		  'workspace.includeSource': '纳入来源',
+		  'workspace.sourceTriples': '{n} 条三元组',
+		  'workspace.sourceErrors': '{n} 个错误',
+		  'workspace.sourceWarnings': '{n} 个警告',
+		  'workspace.truncated': '已截断',
+		  'workspace.stale': '磁盘已变化',
+		  'workspace.reload': '重载',
+		  'workspace.remove': '移除',
+		  'workspace.addHint': '文件只保留在当前页面；本地文件重载需要重新选择。',
+		  'workspace.rejected': '未能添加来源：{reason}',
+		  'workspace.unionName': '{n} 个来源',
+		  'source.status.ready': '就绪',
+		  'source.status.partial': '部分',
+		  'source.status.empty': '空',
+		  'source.status.error': '错误',
+		  'source.status.rejected': '已拒绝',
+		  'source.origin.host': 'DSH 文件',
+		  'source.origin.browser': '本地文件',
+		  // multiview
+		  'view.network': '关系网络',
+		  'view.tree': '类层级',
+		  'view.layered': '分层关系',
+		  'view.switch': '视图',
+		  'view.mode': '模式',
+		  'view.mode.class': '类',
+		  'view.mode.property': '属性',
+		  'view.search': '搜索',
+		  'view.entityCount': '{n} 个实体',
+		  'view.treeBudget': '层级已限制：{n} 项',
+		  'view.cycleCount': '{n} 个循环',
+		  'view.noMatches': '没有实体匹配“{query}”。',
+		  'view.exploreRootNotClass': '探索根不是类，类树不展示探索范围。',
+		  'view.cycleMembers': '循环组成员',
+		  'view.selectionHidden': '当前关系类型下不显示所选实体。',
+		  'view.noHierarchy': '这份文档没有显式类层级关系。',
+		  'view.cycle': '循环',
+		  'view.orphan': '孤立',
+		  'view.inCycle': '处于循环',
+		  'view.groupOf': '循环组（{n} 个成员）',
+		  'view.expand': '展开',
+		  'view.collapse': '折叠',
+		  'view.orientation': '方向',
+		  'view.orientation.down': '从上到下',
+		  'view.orientation.right': '从左到右',
+		  'view.predicates': '关系类型',
+		  'view.layerStats': '{nodes} 个节点 · {layers} 层 · {groups} 个循环组',
+		  'view.fit': '适配',
+		  'view.noRelations': '所选关系类型下没有可显示的关系。',
+		  'view.layered': '分层语义关系图',
+		  // export
+		  'export.title': '导出',
+		  'export.range': '范围',
+		  'export.range.viewport': '当前视口',
+		  'export.range.layout': '当前显示集合完整布局',
+		  'export.copySvg': '复制 SVG',
+		  'export.copySvgHint': '浏览器阻止下载时可用。',
+		  'export.copied': 'SVG 已复制到剪贴板。',
+		  'export.copyFailed': '剪贴板不可用，请改用 SVG 文件导出。',
+		  'export.manualHint': '剪贴板不可用，可在下方文本框中全选手动复制。',
+		  'export.svgText': 'SVG 文本',
+		  'export.scale': '倍率',
+		  'export.svg': 'SVG',
+		  'export.png': 'PNG',
+		  'export.blocked': '暂无可导出内容：请等待布局完成。',
+		  'export.started': '已发起下载。浏览器不会报告文件是否保存成功。',
+		  'export.failed': '下载失败：{reason}',
+		  'export.tooLarge': '该视图在当前倍率下超出 PNG 像素上限，请降低倍率或导出 SVG。',
+		  'export.pngFallback': 'PNG 生成失败（{reason}），已改为导出 SVG。',
+		  // provenance
+		  'provenance.title': '来源',
+		  'provenance.sources': '来源（{n}）',
+		  'provenance.none': '没有保留的来源',
+		  'provenance.roles': '角色',
+		  'provenance.statements': '{n} 条语句',
+		  'provenance.relations': '关系（{n}）',
+		  'provenance.subject': '主体',
+		  'provenance.predicate': '谓词',
+		  'provenance.object': '客体',
+		  'provenance.graphs': '命名图',
+		  'provenance.graph.default': '默认图',
+		  'provenance.graph.unknown': '图身份未知',
+		  'provenance.graph.blank': '匿名图',
+		  'provenance.graph.iri': '命名图',
+		  'provenance.otherEnd': '对端',
 		}
 
 		const EN = {
@@ -9747,6 +15969,16 @@ window.__ModuleLoader__.load({
 		  'viewer.relationsHidden': 'not drawn',
 		  'viewer.showMore': 'Show more',
 		  'viewer.sourceReserved': 'Source location (reserved)',
+		  'viewer.copySourceHint': 'Copy source identity',
+		  'viewer.copySourceId': 'Copy source id',
+		  'viewer.graphIdentity': 'Graph identity',
+		  'viewer.graphIdentityNone': 'none',
+		  'viewer.locationUnavailable': 'Statement location is not recorded (null).',
+		  'viewer.provenance': 'Accepted sources',
+		  'viewer.provenanceStatements': '{n} statements',
+		  'viewer.provenanceMissing': 'No accepted source recorded for this entity.',
+		  'viewer.provenanceRoles': 'Roles: {roles}',
+		  'viewer.provenanceHint': 'Accepted sources are not proof that the input is complete.',
 		  'viewer.group.type': 'Types',
 		  'viewer.group.literals': 'Literals',
 		  'viewer.group.out': 'Outgoing',
@@ -9767,6 +15999,114 @@ window.__ModuleLoader__.load({
 		  'diag.literal-limit': 'Literal exceeds the length limit',
 		  'diag.triple-limit': 'Triple limit reached',
 		  'diag.diagnostics-truncated': 'Too many diagnostics',
+		  // workspace (multi-file) chrome
+		  'workspace.toolbar': 'Workspace toolbar',
+		  'workspace.sources': 'Sources',
+		  'workspace.totals': '{files} files · {triples} triples',
+		  'workspace.addFiles': 'Add files',
+		  'workspace.allSources': 'All sources',
+		  'workspace.union': 'Union',
+		  'workspace.close': 'Close',
+		  'workspace.pickWorkspaceFiles': 'Workspace files',
+		  'workspace.cancel': 'Cancel',
+		  'workspace.loadingDir': 'Reading folder…',
+		  'workspace.noFiles': 'No files in this folder.',
+		  'workspace.openDir': 'Open folder',
+		  'workspace.selectFile': 'Select file',
+		  'workspace.dirTruncated': 'Folder listing truncated.',
+		  'workspace.parentDir': 'Up',
+		  'workspace.readSelected': 'Read selected',
+		  'workspace.dirError': 'Cannot read this folder: {reason}',
+		  'workspace.readError': 'Cannot read {name}: {reason}',
+		  'workspace.shareUnavailable': 'Session identity unavailable; this workspace stays panel-local.',
+		  'workspace.share': 'Share',
+		  'workspace.sharing': 'Sharing',
+		  'workspace.shareHint': 'Sharing stays in this page and clears when the last panel closes.',
+		  'workspace.empty': 'No sources loaded yet.',
+		  'workspace.includeSource': 'Include source',
+		  'workspace.sourceTriples': '{n} triples',
+		  'workspace.sourceErrors': '{n} errors',
+		  'workspace.sourceWarnings': '{n} warnings',
+		  'workspace.truncated': 'Truncated',
+		  'workspace.stale': 'Changed on disk',
+		  'workspace.reload': 'Reload',
+		  'workspace.remove': 'Remove',
+		  'workspace.addHint': 'Files stay in this page only; reloading a local file asks you to pick it again.',
+		  'workspace.rejected': 'Source not added: {reason}',
+		  'workspace.unionName': '{n} sources',
+		  'source.status.ready': 'Ready',
+		  'source.status.partial': 'Partial',
+		  'source.status.empty': 'Empty',
+		  'source.status.error': 'Error',
+		  'source.status.rejected': 'Rejected',
+		  'source.origin.host': 'DSH file',
+		  'source.origin.browser': 'Local file',
+		  // multiview
+		  'view.network': 'Network',
+		  'view.tree': 'Class tree',
+		  'view.layered': 'Layered',
+		  'view.switch': 'View',
+		  'view.mode': 'Mode',
+		  'view.mode.class': 'Classes',
+		  'view.mode.property': 'Properties',
+		  'view.search': 'Search',
+		  'view.entityCount': '{n} entities',
+		  'view.treeBudget': 'Tree budget reached: {n}',
+		  'view.cycleCount': '{n} cycles',
+		  'view.noMatches': 'No entity matches "{query}".',
+		  'view.exploreRootNotClass': 'The exploration root is not a class, so the tree does not show exploration scope.',
+		  'view.cycleMembers': 'Cycle group members',
+		  'view.selectionHidden': 'Selected entity is not shown with these relation types.',
+		  'view.noHierarchy': 'This document has no explicit class hierarchy.',
+		  'view.cycle': 'cycle',
+		  'view.orphan': 'orphan',
+		  'view.inCycle': 'in cycle',
+		  'view.groupOf': 'group of {n}',
+		  'view.expand': 'Expand',
+		  'view.collapse': 'Collapse',
+		  'view.orientation': 'Direction',
+		  'view.orientation.down': 'Top to bottom',
+		  'view.orientation.right': 'Left to right',
+		  'view.predicates': 'Relations',
+		  'view.layerStats': '{nodes} nodes · {layers} layers · {groups} cycles',
+		  'view.fit': 'Fit',
+		  'view.noRelations': 'No relations match the selected relation types.',
+		  'view.layered': 'Layered relation view',
+		  // export
+		  'export.title': 'Export',
+		  'export.range': 'Range',
+		  'export.range.viewport': 'Current viewport',
+		  'export.range.layout': 'Whole displayed layout',
+		  'export.copySvg': 'Copy SVG',
+		  'export.copySvgHint': 'Use this when the browser blocks the download.',
+		  'export.copied': 'SVG copied to the clipboard.',
+		  'export.copyFailed': 'Clipboard unavailable; export the SVG file instead.',
+		  'export.manualHint': 'Clipboard unavailable; select and copy the SVG text below.',
+		  'export.svgText': 'SVG text',
+		  'export.scale': 'Scale',
+		  'export.svg': 'SVG',
+		  'export.png': 'PNG',
+		  'export.blocked': 'Nothing to export yet: wait for the layout to finish.',
+		  'export.started': 'Download started. Browsers do not report whether the file was saved.',
+		  'export.failed': 'Download failed: {reason}',
+		  'export.tooLarge': 'This view is too large for PNG at that scale; lower the scale or export SVG.',
+		  'export.pngFallback': 'PNG failed ({reason}); exported SVG instead.',
+		  // provenance
+		  'provenance.title': 'Sources',
+		  'provenance.sources': 'Sources ({n})',
+		  'provenance.none': 'No retained source',
+		  'provenance.roles': 'roles',
+		  'provenance.statements': '{n} statements',
+		  'provenance.relations': 'Relations ({n})',
+		  'provenance.subject': 'Subject',
+		  'provenance.predicate': 'Predicate',
+		  'provenance.object': 'Object',
+		  'provenance.graphs': 'Graphs',
+		  'provenance.graph.default': 'default graph',
+		  'provenance.graph.unknown': 'unknown graph',
+		  'provenance.graph.blank': 'anonymous graph',
+		  'provenance.graph.iri': 'named graph',
+		  'provenance.otherEnd': 'Other end',
 		}
 
 		/**
@@ -10140,6 +16480,10 @@ window.__ModuleLoader__.load({
 		  const ready = text !== null
 		  const address = props && typeof props.resourceAddress === 'string' ? props.resourceAddress : ''
 		  const fileName = fileNameOf(address)
+		  // The route is navigation/authorization only. The real file identity comes
+		  // from the host's resource metadata; when it is unavailable the workspace
+		  // keeps relative IRIs source-scoped and reports it instead of guessing.
+		  const absolutePath = nativeAbsolutePath(props)
 		  return h('div', {
 		    style: {
 		      position: 'absolute',
@@ -10151,15 +16495,39 @@ window.__ModuleLoader__.load({
 		      background: 'var(--dsw-alias-bg-layer-1, #ffffff)',
 		    },
 		    'data-ontology-source': fileName,
-		  }, h(OntologyPanel, {
+		  }, h(ONTOLOGY_WORKSPACE, {
 		    text: ready ? text : '',
 		    source: { address, displayName: fileName, surface: 'preview' },
+		    absolutePath: absolutePath,
 		    sizeBytes: rawBytes !== null ? rawBytes : byteLengthOf(text || ''),
 		    limitBytes: MAX_SOURCE_BYTES,
 		    loading: !ready && !overLimit,
 		    skipReason: overLimit ? 'tooLarge' : undefined,
 		    t,
+		    ctx: pluginContext,
 		  }))
+		}
+
+		/**
+		 * Resolve the host-confirmed absolute path for the current preview tab.
+		 * The standard slot props expose `useTabInfo` / `useResource`; the resource
+		 * value is the host's WorkspaceFileStat, whose `absolutePath` is the only
+		 * identity we trust. Missing metadata stays empty (never inferred).
+		 */
+		function nativeAbsolutePath(props) {
+		  try {
+		    const useTabInfo = props && props.useTabInfo
+		    const useResource = props && props.useResource
+		    if (typeof useTabInfo !== 'function' || typeof useResource !== 'function') return ''
+		    const tabInfo = useTabInfo()
+		    const tab = tabInfo && tabInfo.tab ? tabInfo.tab : null
+		    if (!tab || typeof tab.contentId !== 'string' || !tab.contentId) return ''
+		    const resource = useResource(tab.contentId)
+		    const value = resource && resource.value ? resource.value : null
+		    return value && typeof value.absolutePath === 'string' ? value.absolutePath : ''
+		  } catch (error) {
+		    return ''
+		  }
 		}
 
 		/**
@@ -10209,15 +16577,24 @@ window.__ModuleLoader__.load({
 		      background: 'var(--dsw-alias-bg-layer-1, #ffffff)',
 		    },
 		    'data-ontology-source': fileName,
-		  }, h(OntologyPanel, {
+		  }, h(ONTOLOGY_WORKSPACE, {
 		    text: content,
 		    source: { address: path, displayName: fileName, surface: 'sidebar' },
+		    sessionId: props && props.scope && typeof props.scope.sessionId === 'string' ? props.scope.sessionId : null,
+		    absolutePath: isAbsolutePath(path) ? path : '',
 		    sizeBytes,
 		    limitBytes: SURFACE_SIDEBAR_BYTES,
 		    loading,
 		    skipReason: largeFile ? 'tooLarge' : undefined,
 		    t,
+		    ctx: owner,
 		  }))
+		}
+
+		/** True when the value looks like a host-absolute filesystem path. */
+		function isAbsolutePath(value) {
+		  if (typeof value !== 'string' || value === '') return false
+		  return /^[A-Za-z]:[\\/]/.test(value) || value.slice(0, 2) === '\\\\' || value.charAt(0) === '/'
 		}
 
 		/** Monochrome file-tree icon for ontology extensions (better-sidebar fileIcon contract). */
@@ -10251,6 +16628,7 @@ window.__ModuleLoader__.load({
 		 */
 		function apply(ctx) {
 		  pluginContext = ctx
+		  ctx.effect(() => () => WORKSPACE_COMPONENTS.clearSharedWorkspaces(), 'dsh-ontology: shared workspaces')
 
 		  ctx.effect(() => ctx.locale.register(LOCALE_NS, { zh: ZH, en: EN }), 'dsh-ontology: dictionaries')
 

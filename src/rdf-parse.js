@@ -126,19 +126,14 @@ function ontoRdfFileExtension(fileName) {
   return leaf.slice(dot + 1).toLowerCase()
 }
 
-function ontoRdfEncodeFilePath(path) {
-  return path
-    .replace(/%/g, '%25')
-    .replace(/ /g, '%20')
-    .replace(/#/g, '%23')
-    .replace(/\?/g, '%3F')
-}
-
 /* ------------------------------------------------------------------ */
 /* Resource address mapping (display name is never an identity)        */
 /* ------------------------------------------------------------------ */
 
 const ONTO_WINDOWS_DRIVE_PATH = /^[A-Za-z]:[\\/]/
+const ONTO_URI_PATH_CHAR = /[A-Za-z0-9\-._~!$&'()*+,;=:@]/
+const ONTO_SHARED_DEFAULT_GRAPH = Object.freeze({ kind: 'default' })
+const ONTO_SHARED_UNKNOWN_GRAPH = Object.freeze({ kind: 'unknown' })
 
 function ontoRdfStripFragment(value) {
   const hash = value.indexOf('#')
@@ -146,25 +141,114 @@ function ontoRdfStripFragment(value) {
 }
 
 /**
+ * DSH session file routes carry authorization and navigation only. They are
+ * never used as an RDF base IRI, so the two host entries can agree on the
+ * real file identity behind the route.
+ */
+function ontoRdfIsDshResourceAddress(value) {
+  return typeof value === 'string' && /^dsh-resource:/i.test(value.trim())
+}
+
+/**
+ * Split a DSH session file route into its authorizing session and requested
+ * path. The path is a request hint only: the Host still resolves it.
+ */
+function ontoRdfParseDshResourceAddress(value) {
+  if (!ontoRdfIsDshResourceAddress(value)) return null
+  const match = /^dsh-resource:\/\/([^/]*)\/session\/([^/]+)\/([\s\S]*)$/i.exec(value.trim())
+  if (!match) return null
+  return { authority: match[1], sessionId: match[2], path: match[3] }
+}
+
+/** Percent-encode one Unicode code point as UTF-8. */
+function ontoRdfEncodeCodePoint(code) {
+  let bytes
+  if (code < 0x80) bytes = [code]
+  else if (code < 0x800) bytes = [0xc0 | (code >> 6), 0x80 | (code & 0x3f)]
+  else if (code < 0x10000) {
+    bytes = [0xe0 | (code >> 12), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f)]
+  } else {
+    bytes = [0xf0 | (code >> 18), 0x80 | ((code >> 12) & 0x3f),
+      0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f)]
+  }
+  let output = ''
+  for (let index = 0; index < bytes.length; index++) {
+    const hex = bytes[index].toString(16).toUpperCase()
+    output += '%' + (hex.length < 2 ? '0' + hex : hex)
+  }
+  return output
+}
+
+/**
+ * Encode one filesystem path segment for a file URI. URI path characters are
+ * kept; everything else (including `%`, spaces, `#`, `?` and non-ASCII) is
+ * percent-encoded, so a literal `%20` in a raw path becomes `%2520` while an
+ * already-encoded URI is never decoded and re-encoded.
+ */
+function ontoRdfEncodePathSegment(segment) {
+  let output = ''
+  for (let index = 0; index < segment.length; index++) {
+    const code = segment.codePointAt(index)
+    if (code > 0xffff) index++
+    const character = String.fromCodePoint(code)
+    if (ONTO_URI_PATH_CHAR.test(character)) output += character
+    else output += ontoRdfEncodeCodePoint(code)
+  }
+  return output
+}
+
+function ontoRdfEncodePathSegments(path) {
+  const segments = path.split('/')
+  for (let index = 0; index < segments.length; index++) {
+    segments[index] = ontoRdfEncodePathSegment(segments[index])
+  }
+  return segments.join('/')
+}
+
+/**
+ * Map a host-confirmed absolute filesystem path to a file URI. Relative
+ * paths, display names and non-path values return null: a real identity is
+ * never guessed. Windows drive letters keep their case folded to upper case,
+ * both separators are accepted, UNC keeps its share as the URI authority,
+ * POSIX paths keep their case.
+ */
+function ontoRdfFileUriFromPath(value) {
+  if (typeof value !== 'string') return null
+  const raw = value.trim()
+  if (raw === '') return null
+  if (ONTO_WINDOWS_DRIVE_PATH.test(raw)) {
+    const normalized = raw.replace(/\\/g, '/')
+    const drive = normalized.slice(0, 1).toUpperCase() + ':'
+    const rest = normalized.slice(2)
+    return 'file:///' + drive + ontoRdfEncodePathSegments(rest)
+  }
+  if (raw.slice(0, 2) === '\\\\') {
+    const normalized = raw.replace(/\\/g, '/').slice(2)
+    const slash = normalized.indexOf('/')
+    const host = slash < 0 ? normalized : normalized.slice(0, slash)
+    const rest = slash < 0 ? '' : normalized.slice(slash)
+    if (!host) return null
+    return 'file://' + ontoRdfEncodePathSegment(host) + ontoRdfEncodePathSegments(rest)
+  }
+  if (raw.charAt(0) === '/') {
+    return 'file://' + ontoRdfEncodePathSegments(raw)
+  }
+  return null
+}
+
+/**
  * Map a real resource address to an RDF base IRI, or null when it cannot be
- * mapped reliably. `resourceAddress` is not guaranteed to be a file URI: the
- * host may hand us an http(s) URL, a custom-scheme address, or a plain file
- * path from a different integration. A display file name is a relative path
- * and is therefore never mapped.
+ * mapped reliably. A DSH session route is explicitly excluded; every other
+ * absolute hierarchical URI keeps its RDF meaning. A display file name is a
+ * relative path and is therefore never mapped.
  */
 function ontoRdfMapResourceAddress(address) {
   if (typeof address !== 'string') return null
   const value = address.trim()
   if (value === '') return null
-  if (ONTO_WINDOWS_DRIVE_PATH.test(value)) {
-    return 'file:///' + ontoRdfEncodeFilePath(value.replace(/\\/g, '/'))
-  }
-  if (value.slice(0, 2) === '\\\\') {
-    return 'file://' + ontoRdfEncodeFilePath(value.replace(/\\/g, '/'))
-  }
-  if (value.charAt(0) === '/') {
-    return 'file://' + ontoRdfEncodeFilePath(value)
-  }
+  if (ontoRdfIsDshResourceAddress(value)) return null
+  const mappedPath = ontoRdfFileUriFromPath(value)
+  if (mappedPath) return mappedPath
   if (!ontoRdfIsAbsoluteIri(value)) return null
   const parts = ontoRdfParseIri(value)
   const scheme = typeof parts.scheme === 'string' ? parts.scheme.toLowerCase() : ''
@@ -181,10 +265,28 @@ function ontoRdfMapResourceAddress(address) {
 
 /**
  * Initial base for one parse: document declarations may override it later.
+ * Precedence: explicit trusted `rdfBase`, then the host-confirmed
+ * `absolutePath`, then legacy `resourceAddress` for library callers. A
+ * `navigationAddress` (the DSH route) never contributes a base.
  * @returns {{ base: string, source: 'document'|'resource'|'none' }}
  */
 function ontoRdfInitialBase(options) {
   const opts = options || {}
+  if (opts.rdfBase !== undefined && opts.rdfBase !== null) {
+    if (ontoRdfIsDshResourceAddress(opts.rdfBase)) return { base: '', source: 'none' }
+    const mapped = ontoRdfMapResourceAddress(opts.rdfBase)
+    if (mapped) return { base: mapped, source: 'resource' }
+    return { base: '', source: 'none' }
+  }
+  if (opts.absolutePath !== undefined && opts.absolutePath !== null) {
+    const mapped = ontoRdfFileUriFromPath(opts.absolutePath)
+    if (mapped) return { base: mapped, source: 'resource' }
+    return { base: '', source: 'none' }
+  }
+  if (opts.navigationAddress !== undefined && opts.navigationAddress !== null) {
+    // The route is the only address here; it is not an RDF identity.
+    return { base: '', source: 'none' }
+  }
   if (opts.resourceAddress !== undefined && opts.resourceAddress !== null) {
     const mapped = ontoRdfMapResourceAddress(opts.resourceAddress)
     if (mapped) return { base: mapped, source: 'resource' }
@@ -226,6 +328,13 @@ class OntoRdfBuilder {
     this.blankCounter = 0
     this.usedBlankLabels = Object.create(null)
     this.lineIndex = null
+    /**
+     * Graph context for statements appended next. TriG/TriG-style blocks and
+     * JSON-LD named graphs set this; every other serialization keeps the
+     * shared default-graph marker. The object is shared so 100k statements do
+     * not allocate 100k identical graph objects.
+     */
+    this.currentGraph = ONTO_SHARED_DEFAULT_GRAPH
     if (typeof text !== 'string') this.error('input is not a string')
   }
 
@@ -276,7 +385,7 @@ class OntoRdfBuilder {
     return entry
   }
 
-  add(subject, predicate, object, objectKind, datatype, language) {
+  add(subject, predicate, object, objectKind, datatype, language, graph) {
     if (this.triples.length >= this.maxTriples) {
       if (!this.truncated) {
         this.truncated = true
@@ -301,7 +410,14 @@ class OntoRdfBuilder {
       )
       term = term.slice(0, this.maxLiteralLength)
     }
-    const triple = { s: subject, p: predicate, o: term, oKind: objectKind || 'iri' }
+    const triple = {
+      s: subject,
+      p: predicate,
+      o: term,
+      oKind: objectKind || 'iri',
+      graph: graph || this.currentGraph || ONTO_SHARED_DEFAULT_GRAPH,
+      location: null,
+    }
     if (literalTruncated) triple.literalTruncated = true
     if (datatype !== undefined) triple.dt = datatype
     if (language !== undefined) triple.lang = language
@@ -641,6 +757,9 @@ class OntoTurtleParser {
     this.builder.baseSource = initial.source
     this.depth = 0
     this.prefixes = this.builder.prefixes
+    /** Open TriG graph blocks; each entry is `{ term, index }`. */
+    this.graphStack = []
+    this.builder.currentGraph = ONTO_SHARED_DEFAULT_GRAPH
     if (opts.prefixes && typeof opts.prefixes === 'object') {
       const keys = Object.keys(opts.prefixes)
       for (let i = 0; i < keys.length; i++) {
@@ -843,15 +962,74 @@ class OntoTurtleParser {
     if (value !== '') this.builder.baseSource = 'document'
   }
 
-  /** Record that a TriG graph label was recognised and ignored. */
-  noteNamedGraph(label, index) {
-    const name = typeof label === 'string' && label !== '' ? label : 'anonymous graph'
+  /* ------------------------- graph context ------------------------- */
+
+  /** Open one TriG graph block and make its graph the current context. */
+  pushGraph(term, index) {
+    const graph = term && typeof term === 'object' ? term : ONTO_SHARED_DEFAULT_GRAPH
+    this.graphStack.push({ term: graph, index: index })
+    this.builder.currentGraph = graph
+  }
+
+  /** Close the innermost graph block; an unbalanced brace is diagnosed. */
+  popGraph(index) {
+    if (this.graphStack.length > 0) {
+      this.graphStack.pop()
+      this.builder.currentGraph = this.graphStack.length > 0
+        ? this.graphStack[this.graphStack.length - 1].term
+        : ONTO_SHARED_DEFAULT_GRAPH
+      return
+    }
     this.builder.diagnose(
-      'named-graph-ignored',
+      'named-graph-context',
       'warning',
-      'named graph "' + name + '" was ignored; its triples were kept in the default graph',
+      'closing "}" without an open graph block was ignored',
+      this.lineAt(index === undefined ? this.pos : index),
+    )
+    this.builder.currentGraph = ONTO_SHARED_DEFAULT_GRAPH
+  }
+
+  /** Resolve one graph IRI through the current base and prefixes. */
+  graphTermFromIri(iri, index) {
+    if (!ontoRdfIsAbsoluteIri(iri)) {
+      if (!this.base) {
+        this.builder.diagnose(
+          'base-unavailable',
+          'warning',
+          'graph IRI "' + iri + '" is relative and no base is available',
+          this.lineAt(index),
+        )
+        return ONTO_SHARED_UNKNOWN_GRAPH
+      }
+      return { kind: 'iri', value: resolveIri(this.base, iri) }
+    }
+    return { kind: 'iri', value: iri }
+  }
+
+  /**
+   * Resolve a prefixed-name graph label without aborting the document when
+   * the prefix is unknown: the label is reported and kept as unknown.
+   */
+  graphTermFromNameToken(token) {
+    const value = token && typeof token.value === 'string' ? token.value : ''
+    const colon = value.indexOf(':')
+    if (colon < 0) return null
+    const prefix = value.slice(0, colon)
+    const local = value.slice(colon + 1)
+    const namespace = ontoRdfHas(this.prefixes, prefix) ? this.prefixes[prefix] : undefined
+    if (typeof namespace !== 'string') return null
+    return this.graphTermFromIri(namespace + local, token.start)
+  }
+
+  /** Diagnose one graph label that could not be resolved, then keep unknown. */
+  noteUnresolvedGraph(label, index) {
+    this.builder.diagnose(
+      'named-graph-context',
+      'warning',
+      'graph label "' + label + '" could not be resolved; its statements keep an unknown graph context',
       this.lineAt(index),
     )
+    return ONTO_SHARED_UNKNOWN_GRAPH
   }
 
   /** Skip one balanced bracket construct without recursing (depth-limit escape). */
@@ -1087,7 +1265,15 @@ class OntoTurtleParser {
     while (!this.atEnd()) {
       if (this.builder.truncated) break
       const character = this.peek()
-      if (character === '{' || character === '}') {
+      if (character === '{') {
+        // An anonymous block is TriG's default graph.
+        this.pushGraph(ONTO_SHARED_DEFAULT_GRAPH, this.pos)
+        this.pos++
+        this.skipWhitespace()
+        continue
+      }
+      if (character === '}') {
+        this.popGraph(this.pos)
         this.pos++
         this.skipWhitespace()
         continue
@@ -1110,11 +1296,21 @@ class OntoTurtleParser {
         continue
       }
       if (this.peek() === '}') {
+        this.popGraph(this.pos)
         this.pos++
         this.skipWhitespace()
         continue
       }
       this.fatal("expected '.' after the triples", this.pos)
+    }
+    if (!this.builder.truncated && this.graphStack.length > 0) {
+      this.builder.diagnose(
+        'named-graph-context',
+        'warning',
+        'a graph block was not closed before the end of the document',
+      )
+      this.graphStack.length = 0
+      this.builder.currentGraph = ONTO_SHARED_DEFAULT_GRAPH
     }
   }
 
@@ -1123,10 +1319,11 @@ class OntoTurtleParser {
     if (this.peek() === '<') {
       const end = this.findIriEnd(save)
       if (end < 0) return false
-      this.pos = end + 1
+      this.pos = save
+      const iri = this.readIriReference()
       this.skipWhitespace()
       if (this.peek() === '{') {
-        this.noteNamedGraph(this.source.slice(save, end + 1), save)
+        this.pushGraph(this.graphTermFromIri(iri, save), save)
         this.pos++
         return true
       }
@@ -1137,9 +1334,10 @@ class OntoTurtleParser {
       this.pos += 2
       const labelStart = save
       while (!this.atEnd() && !this.isNameDelimiter(this.peek())) this.pos++
+      const labelText = this.source.slice(labelStart, this.pos)
       this.skipWhitespace()
       if (this.peek() === '{') {
-        this.noteNamedGraph(this.source.slice(labelStart, this.pos).trim(), save)
+        this.pushGraph({ kind: 'blank', value: this.builder.useBlank(labelText.slice(2)) }, save)
         this.pos++
         return true
       }
@@ -1150,32 +1348,36 @@ class OntoTurtleParser {
     if (word.toLowerCase() === 'graph' && ontoRdfIsWhitespace(this.source[this.pos + word.length])) {
       this.pos += word.length
       this.skipWhitespace()
-      let label = ''
+      let graph
+      let labelText
       if (this.peek() === '<') {
         const labelStart = this.pos
-        const end = this.findIriEnd(labelStart)
-        if (end < 0) {
+        if (this.findIriEnd(labelStart) < 0) {
           this.pos = save
           return false
         }
-        this.readIriReference()
-        label = this.source.slice(labelStart, end + 1)
+        const iri = this.readIriReference()
+        labelText = iri
+        graph = this.graphTermFromIri(iri, save)
       } else if (this.peek() === '_' && this.peek(1) === ':') {
         const labelStart = this.pos
         this.pos += 2
         while (!this.atEnd() && !this.isNameDelimiter(this.peek())) this.pos++
-        label = this.source.slice(labelStart, this.pos)
+        labelText = this.source.slice(labelStart, this.pos)
+        graph = { kind: 'blank', value: this.builder.useBlank(labelText.slice(2)) }
       } else {
         const labelToken = this.readNameToken()
         if (!labelToken.value) {
           this.pos = save
           return false
         }
-        label = labelToken.value
+        labelText = labelToken.value
+        graph = this.graphTermFromNameToken(labelToken) ||
+          this.noteUnresolvedGraph(labelText, save)
       }
       this.skipWhitespace()
       if (this.peek() === '{') {
-        this.noteNamedGraph(label, save)
+        this.pushGraph(graph, save)
         this.pos++
         return true
       }
@@ -1185,7 +1387,8 @@ class OntoTurtleParser {
     const token = this.readNameToken()
     this.skipWhitespace()
     if (token.value && this.peek() === '{') {
-      this.noteNamedGraph(token.value, save)
+      this.pushGraph(this.graphTermFromNameToken(token) ||
+        this.noteUnresolvedGraph(token.value, save), save)
       this.pos++
       return true
     }
@@ -1212,6 +1415,8 @@ class OntoTurtleParser {
     const subject = this.parseSubject()
     this.skipWhitespace()
     if (this.peek() === '{') {
+      // A block opened after a subject is tolerated as a default-graph block.
+      this.pushGraph(ONTO_SHARED_DEFAULT_GRAPH, this.pos)
       this.pos++
       return
     }
@@ -1557,10 +1762,10 @@ class OntoNTriplesParser {
       else fail('expected an object')
 
       skip()
-      let graphLabel
+      let graphTerm = ONTO_SHARED_DEFAULT_GRAPH
       if (line[pos] === '<' || (line[pos] === '_' && line[pos + 1] === ':')) {
-        if (line[pos] === '<') graphLabel = readIri()
-        else graphLabel = readBlank()
+        if (line[pos] === '<') graphTerm = { kind: 'iri', value: readIri() }
+        else graphTerm = { kind: 'blank', value: readBlank() }
         skip()
       }
 
@@ -1571,15 +1776,7 @@ class OntoNTriplesParser {
         builder.warn('extra content after the statement was ignored', lineNumber)
       }
 
-      if (graphLabel !== undefined) {
-        builder.diagnose(
-          'named-graph-ignored',
-          'warning',
-          'graph term "' + graphLabel + '" was ignored; N-Quads datasets are not supported',
-          lineNumber,
-        )
-      }
-      builder.add(subject, predicate, object.term, object.kind, object.dt, object.lang)
+      builder.add(subject, predicate, object.term, object.kind, object.dt, object.lang, graphTerm)
     } catch (error) {
       if (error && error.ontoRdfFatal) return
       builder.error(
@@ -2744,11 +2941,25 @@ class OntoJsonLdParser {
       if (key === '@context' || key === '@id' || key === '@type' || key === '@index') continue
       if (key === '@graph') {
         if (graphWithoutId) continue
-        const graph = node[key]
-        const items = Array.isArray(graph) ? graph : [graph]
-        for (let g = 0; g < items.length; g++) {
-          if (this.builder.truncated) break
-          this.processNode(items[g], context)
+        // A @graph sibling of @id names a graph. This subset keeps the
+        // statements but cannot express the graph term, so they are marked
+        // unknown instead of being silently promoted to the default graph.
+        this.builder.diagnose(
+          'named-graph-unavailable',
+          'warning',
+          'JSON-LD named graphs are not supported; statements were kept with an unknown graph context',
+        )
+        const previousGraph = this.builder.currentGraph
+        this.builder.currentGraph = ONTO_SHARED_UNKNOWN_GRAPH
+        try {
+          const graph = node[key]
+          const items = Array.isArray(graph) ? graph : [graph]
+          for (let g = 0; g < items.length; g++) {
+            if (this.builder.truncated) break
+            this.processNode(items[g], context)
+          }
+        } finally {
+          this.builder.currentGraph = previousGraph
         }
         continue
       }
@@ -3036,6 +3247,25 @@ export function parseJsonLd(text, options) {
   return new OntoJsonLdParser(text, options).parse()
 }
 
+/* ------------------------------------------------------------------ */
+/* Identity helpers shared with the workspace and host adapters        */
+/* ------------------------------------------------------------------ */
+
+/** True when a value is a DSH session file route (authorization, not RDF). */
+export function isDshResourceAddress(value) {
+  return ontoRdfIsDshResourceAddress(value)
+}
+
+/** Split a DSH session route into `{ authority, sessionId, path }`, or null. */
+export function parseDshResourceAddress(value) {
+  return ontoRdfParseDshResourceAddress(value)
+}
+
+/** The single host-path → file-URI conversion used by every entry point. */
+export function fileUriFromPath(value) {
+  return ontoRdfFileUriFromPath(value)
+}
+
 /** Detect the RDF serialization from a file name and/or the document text. */
 export function detectFormat(text, fileName) {
   const source = ontoRdfNormalizeText(text)
@@ -3084,7 +3314,10 @@ function ontoRdfEmptyDocument(format, text, options) {
  * Parse any supported serialization. Never throws.
  * options: {
  *   fileName?: string,          // display name, used for format detection only
- *   resourceAddress?: string,   // real resource address, used for the base IRI
+ *   resourceAddress?: string,   // legacy real resource address (never a DSH route)
+ *   navigationAddress?: string, // DSH session route: navigation only, never a base
+ *   absolutePath?: string,      // host-confirmed absolute file path (the base)
+ *   rdfBase?: string,           // explicit trusted base IRI
  *   format?: string,
  *   maxTriples?: number,
  *   maxLiteralLength?: number,
@@ -3102,6 +3335,9 @@ export function parseOntology(text, options) {
   const parserOptions = {
     fileName: opts.fileName,
     resourceAddress: opts.resourceAddress,
+    navigationAddress: opts.navigationAddress,
+    absolutePath: opts.absolutePath,
+    rdfBase: opts.rdfBase,
     maxTriples: opts.maxTriples,
     maxLiteralLength: opts.maxLiteralLength,
     maxDepth: opts.maxDepth,

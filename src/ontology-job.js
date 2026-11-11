@@ -162,41 +162,52 @@ function ontologyJobWorkerSource(explicit) {
  */
 function ontologyJobImpls(override) {
   const provided = override && typeof override === 'object' ? override : {}
-  const resolved = { parseOntology: null, buildGraph: null, layoutGraph: null, createLayoutTask: null }
-  if (typeof provided.parseOntology === 'function') {
-    resolved.parseOntology = provided.parseOntology
-  } else {
-    try {
-      if (typeof parseOntology === 'function') resolved.parseOntology = parseOntology
-    } catch (error) {
-      // no parser in this scope
-    }
+  const resolved = {
+    parseOntology: null,
+    buildGraph: null,
+    layoutGraph: null,
+    createLayoutTask: null,
+    createWorkspace: null,
+    addSource: null,
+    removeSource: null,
+    replaceSource: null,
+    workspaceAdmission: null,
+    composeWorkspaceGraph: null,
+    identity: provided.identity || null,
   }
-  if (typeof provided.buildGraph === 'function') {
-    resolved.buildGraph = provided.buildGraph
-  } else {
-    try {
-      if (typeof buildGraph === 'function') resolved.buildGraph = buildGraph
-    } catch (error) {
-      // no graph model in this scope
-    }
+  const names = [
+    'parseOntology', 'buildGraph', 'layoutGraph', 'createLayoutTask',
+    'createWorkspace', 'addSource', 'removeSource', 'replaceSource',
+    'workspaceAdmission', 'composeWorkspaceGraph',
+  ]
+  // Resolve the concatenated Client bundle's function declarations without
+  // eval (CSP-safe). `typeof` on an undeclared identifier is safe.
+  const globalResolvers = {
+    parseOntology: function () { return typeof parseOntology === 'function' ? parseOntology : null },
+    buildGraph: function () { return typeof buildGraph === 'function' ? buildGraph : null },
+    layoutGraph: function () { return typeof layoutGraph === 'function' ? layoutGraph : null },
+    createLayoutTask: function () { return typeof createLayoutTask === 'function' ? createLayoutTask : null },
+    createWorkspace: function () { return typeof createWorkspace === 'function' ? createWorkspace : null },
+    addSource: function () { return typeof addSource === 'function' ? addSource : null },
+    removeSource: function () { return typeof removeSource === 'function' ? removeSource : null },
+    replaceSource: function () { return typeof replaceSource === 'function' ? replaceSource : null },
+    workspaceAdmission: function () {
+      return typeof workspaceAdmission === 'function' ? workspaceAdmission : null
+    },
+    composeWorkspaceGraph: function () {
+      return typeof composeWorkspaceGraph === 'function' ? composeWorkspaceGraph : null
+    },
   }
-  if (typeof provided.layoutGraph === 'function') {
-    resolved.layoutGraph = provided.layoutGraph
-  } else {
-    try {
-      if (typeof layoutGraph === 'function') resolved.layoutGraph = layoutGraph
-    } catch (error) {
-      // no layout in this scope
+  for (const name of names) {
+    if (typeof provided[name] === 'function') {
+      resolved[name] = provided[name]
+      continue
     }
-  }
-  if (typeof provided.createLayoutTask === 'function') {
-    resolved.createLayoutTask = provided.createLayoutTask
-  } else {
     try {
-      if (typeof createLayoutTask === 'function') resolved.createLayoutTask = createLayoutTask
+      const candidate = globalResolvers[name]()
+      if (typeof candidate === 'function') resolved[name] = candidate
     } catch (error) {
-      // chunked layout not available; one-shot layout is still used
+      // helper not available in this scope
     }
   }
   return resolved
@@ -854,6 +865,16 @@ export function createOntologyRunner(handlers) {
   let fallbackUsed = false
   let layoutSeq = 0
   let disposed = false
+  /** Local L0 workspace (source records + parsed statements). */
+  let workspaceState = null
+  /** Pending workspace request handle (parse/compose). */
+  let workspaceRequest = null
+  /**
+   * One background worker for the whole workspace session: parse-source fills
+   * its cache and compose reuses it, so switching views never re-parses and a
+   * source is never sent twice. Released on failure and disposal.
+   */
+  let workspaceWorker = null
 
   function emitEvent(event) {
     if (disposed) return
@@ -1157,10 +1178,556 @@ export function createOntologyRunner(handlers) {
 
   function cancel() {
     cancelActiveJob()
+    cancelWorkspaceRequest()
+  }
+
+  /* ---------------------- workspace operations ---------------------- */
+
+  /** Local workspace state, created on first use. */
+  function ensureWorkspace() {
+    if (workspaceState) return workspaceState
+    if (typeof impls.createWorkspace !== 'function') return null
+    try {
+      workspaceState = impls.createWorkspace({
+        buildGraph: impls.buildGraph || undefined,
+        identity: impls.identity || undefined,
+      })
+    } catch (error) {
+      workspaceState = null
+    }
+    return workspaceState
+  }
+
+  function cancelWorkspaceRequest() {
+    const request = workspaceRequest
+    workspaceRequest = null
+    if (request && typeof request.cancel === 'function') {
+      try { request.cancel() } catch (error) { /* ignored */ }
+    }
+  }
+
+  function emitWorkspaceEvent(event) {
+    if (disposed) return
+    try { onEvent(Object.assign({}, event, { scope: 'workspace' })) } catch (error) { /* consumer callback errors must not break the job */ }
+  }
+
+  function ensureWorkspaceWorker() {
+    if (workspaceWorker) return workspaceWorker
+    workspaceWorker = ontologyJobCreateWorker({ workerFactory: workerFactory, workerSource: workerSource })
+    if (workspaceState) {
+      for (const source of workspaceState.sources) {
+        workspaceWorker.worker.postMessage({ type: 'cache-source', source: source })
+      }
+    }
+    return workspaceWorker
+  }
+
+  function releaseWorkspaceWorker() {
+    const handle = workspaceWorker
+    workspaceWorker = null
+    if (handle && typeof handle.release === 'function') {
+      try { handle.release() } catch (error) { /* ignored */ }
+    }
+  }
+
+  function byteSizeOfText(text) {
+    if (typeof text !== 'string') return 0
+    try {
+      if (typeof TextEncoder === 'function') return new TextEncoder().encode(text).length
+    } catch (error) {
+      // fall through to code units
+    }
+    return text.length
+  }
+
+  /** One source summary for the source panel (never the parsed triples). */
+  function sourceSummaryOf(source) {
+    if (!source || typeof source !== 'object') return null
+    const parsed = source.parsed && typeof source.parsed === 'object' ? source.parsed : {}
+    const diagnostics = Array.isArray(parsed.diagnostics) ? parsed.diagnostics : []
+    return {
+      sourceId: source.sourceId,
+      origin: source.origin,
+      displayName: source.displayName,
+      navigationAddress: source.navigationAddress || null,
+      absolutePath: source.absolutePath || null,
+      format: source.format || '',
+      revision: source.revision,
+      status: source.status,
+      byteSize: source.byteSize,
+      tripleCount: source.occurrenceCount,
+      errorCount: Array.isArray(parsed.errors) ? parsed.errors.length : 0,
+      warningCount: Array.isArray(parsed.warnings) ? parsed.warnings.length : 0,
+      truncated: !!(parsed.stats && parsed.stats.truncated),
+      stale: !!source.stale,
+      base: parsed.base || '',
+      truncation: parsed.stats && parsed.stats.truncation ? parsed.stats.truncation : null,
+      diagnostics: diagnostics,
+    }
+  }
+
+  function workspaceSummaries() {
+    if (!workspaceState) return []
+    return workspaceState.sources.map(sourceSummaryOf).filter(Boolean)
+  }
+
+  function workspaceTotalsState() {
+    if (!workspaceState) return { files: 0, bytes: 0, occurrences: 0 }
+    let bytes = 0
+    let occurrences = 0
+    for (const source of workspaceState.sources) {
+      bytes += Number(source.byteSize) || 0
+      occurrences += Number(source.occurrenceCount) || 0
+    }
+    return { files: workspaceState.sources.length, bytes: bytes, occurrences: occurrences }
+  }
+
+  /** Admit one parsed source into the local workspace and emit the summary. */
+  function commitSource(id, request, parsed, byteSize) {
+    const state = ensureWorkspace()
+    if (!state) {
+      emitWorkspaceEvent({ type: 'error', generation: id, message: 'workspace is unavailable' })
+      return null
+    }
+    const input = {
+      origin: request.origin,
+      displayName: request.displayName,
+      navigationAddress: request.navigationAddress,
+      absolutePath: request.absolutePath,
+      rdfBase: request.rdfBase,
+      format: request.format,
+      sourceId: request.sourceId,
+      revision: request.revision,
+      text: request.text,
+      byteSize: byteSize,
+      parsed: parsed,
+      error: request.error,
+    }
+    let result
+    if (request.replace === true && typeof impls.replaceSource === 'function' && request.sourceId) {
+      result = impls.replaceSource(state, request.sourceId, input)
+    } else if (typeof impls.addSource === 'function') {
+      result = impls.addSource(state, input)
+    } else {
+      emitWorkspaceEvent({ type: 'error', generation: id, message: 'workspace helpers are unavailable' })
+      return null
+    }
+    if (!result || result.status === 'rejected' || result.status === 'missing') {
+      emitWorkspaceEvent({
+        type: 'source',
+        generation: id,
+        sourceId: request.sourceId || null,
+        revision: result && result.source ? result.source.revision : 0,
+        status: 'rejected',
+        reason: result ? result.reason : 'unavailable',
+        summary: null,
+      })
+      return null
+    }
+    workspaceState = result.workspace
+    const summary = sourceSummaryOf(result.source)
+    emitWorkspaceEvent({
+      type: 'source',
+      generation: id,
+      sourceId: result.source.sourceId,
+      revision: result.source.revision,
+      status: result.status,
+      reason: null,
+      summary: summary,
+      sources: workspaceSummaries(),
+      totals: workspaceTotalsState(),
+    })
+    return result
+  }
+
+  /** Parse on the main thread (degraded path or worker failure). */
+  function parseSourceLocally(id, request, text, byteSize, admission) {
+    if (typeof impls.parseOntology !== 'function') {
+      emitWorkspaceEvent({ type: 'error', generation: id, message: 'parser is unavailable' })
+      return
+    }
+    let parsed
+    try {
+      parsed = impls.parseOntology(text, {
+        fileName: request.displayName,
+        format: request.format,
+        navigationAddress: request.navigationAddress,
+        absolutePath: request.absolutePath,
+        rdfBase: request.rdfBase,
+        maxTriples: admission.maxTriples,
+      })
+    } catch (error) {
+      emitWorkspaceEvent({ type: 'error', generation: id, message: ontologyJobErrorMessage(error) })
+      return
+    }
+    commitSource(id, request, parsed, byteSize)
+  }
+
+  /**
+   * Parse one source and admit it into the workspace. With a worker the parse
+   * happens off the main thread; the parsed result still comes back so the
+   * workspace keeps a recoverable L0 snapshot.
+   */
+  function parseSource(input) {
+    if (disposed) return 0
+    cancelWorkspaceRequest()
+    generation += 1
+    const id = generation
+    const request = input && typeof input === 'object' ? input : {}
+    const text = typeof request.text === 'string' ? request.text : ''
+    const byteSize = typeof request.byteSize === 'number' && Number.isFinite(request.byteSize)
+      ? Math.max(0, request.byteSize)
+      : byteSizeOfText(text)
+    const state = ensureWorkspace()
+    if (!state) {
+      emitWorkspaceEvent({ type: 'error', generation: id, message: 'workspace is unavailable' })
+      return id
+    }
+    // Allocate identity on the controller, not independently from Worker map
+    // size (removing a source otherwise reuses/overwrites a different cache id).
+    if (!request.sourceId) request.sourceId = 'src' + state.nextSourceNumber
+    if (request.replace === true) {
+      const previous = state.sources.find(source => source.sourceId === request.sourceId)
+      if (previous) request.revision = previous.revision + 1
+    }
+    const admission = typeof impls.workspaceAdmission === 'function'
+      ? impls.workspaceAdmission(state, byteSize)
+      : { allowed: true, maxTriples: 120000, reason: null }
+    if (!admission.allowed) {
+      emitWorkspaceEvent({
+        type: 'source',
+        generation: id,
+        sourceId: request.sourceId || null,
+        revision: 0,
+        status: 'rejected',
+        reason: admission.reason,
+        summary: null,
+      })
+      return id
+    }
+    const useWorker = ontologyJobWorkerEnabled({
+      workerFactory: workerFactory,
+      workerSource: workerSource,
+      forceMainThread: forceMainThread,
+    })
+    if (useWorker && !fallbackUsed) {
+      let handle = null
+      try {
+        handle = ensureWorkspaceWorker()
+      } catch (error) {
+        fallbackUsed = true
+        emitWorkspaceEvent({
+          type: 'state', status: 'parsing', generation: id, degraded: true,
+          message: 'Background parse unavailable: ' + ontologyJobErrorMessage(error),
+        })
+        parseSourceLocally(id, request, text, byteSize, admission)
+        return id
+      }
+      const workerMessage = {
+        type: 'parse-source',
+        origin: request.origin,
+        id: id,
+        sourceId: typeof request.sourceId === 'string' ? request.sourceId : '',
+        revision: Number.isFinite(request.revision) ? request.revision : 1,
+        text: text,
+        byteSize: byteSize,
+        displayName: typeof request.displayName === 'string' ? request.displayName : '',
+        format: typeof request.format === 'string' ? request.format : '',
+        navigationAddress: typeof request.navigationAddress === 'string' ? request.navigationAddress : '',
+        absolutePath: typeof request.absolutePath === 'string' ? request.absolutePath : '',
+        rdfBase: typeof request.rdfBase === 'string' ? request.rdfBase : '',
+        maxTriples: admission.maxTriples,
+      }
+      workspaceRequest = ontologyJobSendWorkerMessage(handle, workerMessage, {
+        id: id,
+        timeoutMs: timeoutMs,
+        isCancelled: function () { return disposed },
+        onMessage: function (data) {
+          if (disposed) return true
+          if (data.type === 'source') {
+            const parsed = data.parsed && typeof data.parsed === 'object' ? data.parsed : null
+            commitSource(id, request, parsed, byteSize)
+            return true
+          }
+          if (data.type === 'error') {
+            releaseWorkspaceWorker()
+            fallbackUsed = true
+            emitWorkspaceEvent({
+              type: 'state', status: 'parsing', generation: id, degraded: true,
+              message: 'Background parse unavailable: ' +
+                (typeof data.message === 'string' ? data.message : 'worker error'),
+            })
+            parseSourceLocally(id, request, text, byteSize, admission)
+            return true
+          }
+          return false
+        },
+        onFailure: function (reason) {
+          if (disposed) return
+          releaseWorkspaceWorker()
+          fallbackUsed = true
+          emitWorkspaceEvent({
+            type: 'state', status: 'parsing', generation: id, degraded: true,
+            message: 'Background parse unavailable: ' + reason,
+          })
+          parseSourceLocally(id, request, text, byteSize, admission)
+        },
+      })
+      return id
+    }
+    parseSourceLocally(id, request, text, byteSize, admission)
+    return id
+  }
+
+  /** Compose the selected sources into the L1 graph on the main thread. */
+  function composeLocally(id, request) {
+    const state = ensureWorkspace()
+    if (!state || typeof impls.composeWorkspaceGraph !== 'function') {
+      emitWorkspaceEvent({ type: 'error', generation: id, message: 'graph composition is unavailable' })
+      return
+    }
+    const composed = impls.composeWorkspaceGraph(state, {
+      sourceIds: request.sourceIds,
+      maxNodes: request.maxNodes,
+      maxEdges: request.maxEdges,
+      maxLiteralsPerNode: request.maxLiteralsPerNode,
+      maxLiteralLength: request.maxLiteralLength,
+    })
+    if (!composed || !composed.graph || composed.error) {
+      emitWorkspaceEvent({
+        type: 'error', generation: id,
+        message: 'graph composition failed: ' + String(composed && composed.error ? composed.error : 'unknown'),
+      })
+      return
+    }
+    lastGraph = composed.graph
+    lastMeta = { base: '', baseSource: 'none', prefixes: {}, diagnostics: [], stats: composed.graph.stats, truncation: null }
+    emitWorkspaceEvent({ type: 'state', status: 'layout', generation: id, degraded: true })
+    emitWorkspaceEvent({
+      type: 'graph',
+      generation: id,
+      graph: composed.graph,
+      statements: composed.statements,
+      occurrences: composed.occurrences,
+      sourceIds: composed.sourceIds,
+      base: '',
+      baseSource: 'none',
+      prefixes: {},
+      diagnostics: [],
+      stats: composed.graph.stats,
+      truncation: composed.graph.truncation || null,
+      timing: {},
+      degraded: true,
+    })
+    const layoutOptions = ontologyJobNormalizeLayout(request.layout)
+    const settings = {
+      impls: impls,
+      scheduler: scheduler,
+      isCancelled: function () { return disposed || id !== generation },
+      onProgress: function () {
+        // Workspace composition layout has no per-chunk status contract.
+      },
+    }
+    ontologyJobSteppedLayout(composed.graph, layoutOptions, settings).then(function (outcome) {
+      if (!outcome || outcome.cancelled || disposed || id !== generation) return
+      emitWorkspaceEvent({
+        type: 'layout',
+        generation: id,
+        positions: ontologyJobNormalizePositions(outcome.positions),
+        timing: { layout: outcome.timing },
+        degraded: true,
+      })
+      emitWorkspaceEvent({ type: 'state', status: 'ready', generation: id, degraded: true })
+    }).catch(function (error) {
+      if (disposed || id !== generation) return
+      emitWorkspaceEvent({
+        type: 'error', generation: id,
+        message: 'layout failed: ' + ontologyJobErrorMessage(error),
+      })
+    })
+  }
+
+  /**
+   * Compose the current workset into one graph. The worker path reuses the
+   * parsed sources it cached during `parseSource`; the local path uses the L0
+   * snapshot the runner keeps for recovery.
+   */
+  function compose(input) {
+    if (disposed) return 0
+    cancelWorkspaceRequest()
+    generation += 1
+    const id = generation
+    const request = input && typeof input === 'object' ? input : {}
+    const state = ensureWorkspace()
+    if (!state) {
+      emitWorkspaceEvent({ type: 'error', generation: id, message: 'workspace is unavailable' })
+      return id
+    }
+    emitWorkspaceEvent({ type: 'state', status: 'modeling', generation: id, degraded: false })
+    const layoutOptions = ontologyJobNormalizeLayout(request.layout)
+    const useWorker = ontologyJobWorkerEnabled({
+      workerFactory: workerFactory,
+      workerSource: workerSource,
+      forceMainThread: forceMainThread,
+    })
+    if (useWorker && !fallbackUsed) {
+      let handle = null
+      try {
+        handle = ensureWorkspaceWorker()
+      } catch (error) {
+        fallbackUsed = true
+        emitWorkspaceEvent({
+          type: 'state', status: 'modeling', generation: id, degraded: true,
+          message: 'Background composition unavailable: ' + ontologyJobErrorMessage(error),
+        })
+        composeLocally(id, request)
+        return id
+      }
+      workspaceRequest = ontologyJobSendWorkerMessage(handle, {
+        type: 'compose',
+        id: id,
+        sourceIds: Array.isArray(request.sourceIds) ? request.sourceIds : [],
+        maxNodes: request.maxNodes,
+        maxEdges: request.maxEdges,
+        maxLiteralsPerNode: request.maxLiteralsPerNode,
+        maxLiteralLength: request.maxLiteralLength,
+        layout: layoutOptions,
+      }, {
+        id: id,
+        timeoutMs: timeoutMs,
+        isCancelled: function () { return disposed },
+        onMessage: function (data) {
+          if (disposed) return true
+          if (data.type === 'graph') {
+            lastGraph = data.graph || null
+            lastMeta = {
+              base: '',
+              baseSource: 'none',
+              prefixes: {},
+              diagnostics: [],
+              stats: data.graph && data.graph.stats ? data.graph.stats : {},
+              truncation: data.graph && data.graph.truncation ? data.graph.truncation : null,
+            }
+            emitWorkspaceEvent({
+              type: 'graph',
+              generation: id,
+              graph: data.graph || null,
+              statements: data.statements,
+              occurrences: data.occurrences,
+              sourceIds: data.sourceIds,
+              base: '',
+              baseSource: 'none',
+              prefixes: {},
+              diagnostics: [],
+              stats: data.graph && data.graph.stats ? data.graph.stats : {},
+              truncation: data.graph && data.graph.truncation ? data.graph.truncation : null,
+              timing: data.timing && typeof data.timing === 'object' ? data.timing : {},
+              degraded: false,
+            })
+            return false
+          }
+          if (data.type === 'layout') {
+            emitWorkspaceEvent({
+              type: 'layout',
+              generation: id,
+              positions: ontologyJobDecodePositions(lastGraph, data.positions),
+              timing: data.timing && typeof data.timing === 'object' ? data.timing : { layout: 0 },
+              degraded: false,
+            })
+            emitWorkspaceEvent({ type: 'state', status: 'ready', generation: id, degraded: false })
+            return true
+          }
+          if (data.type === 'error') {
+            releaseWorkspaceWorker()
+            fallbackUsed = true
+            emitWorkspaceEvent({
+              type: 'state', status: 'modeling', generation: id, degraded: true,
+              message: 'Background composition unavailable: ' +
+                (typeof data.message === 'string' ? data.message : 'worker error'),
+            })
+            composeLocally(id, request)
+            return true
+          }
+          return false
+        },
+        onFailure: function (reason) {
+          if (disposed) return
+          releaseWorkspaceWorker()
+          fallbackUsed = true
+          emitWorkspaceEvent({
+            type: 'state', status: 'modeling', generation: id, degraded: true,
+            message: 'Background composition unavailable: ' + reason,
+          })
+          composeLocally(id, request)
+        },
+      })
+      return id
+    }
+    composeLocally(id, request)
+    return id
+  }
+
+  /** Drop one source from the local workspace and the worker cache. */
+  function dropSource(sourceId) {
+    if (disposed) return
+    const state = ensureWorkspace()
+    if (!state || typeof impls.removeSource !== 'function') return
+    const result = impls.removeSource(state, sourceId)
+    if (!result || !result.removed) return
+    workspaceState = result.workspace
+    const worker = workspaceWorker
+    if (worker && worker.worker && typeof worker.worker.postMessage === 'function') {
+      try {
+        worker.worker.postMessage({ type: 'drop-source', id: -1, sourceId: sourceId })
+      } catch (error) {
+        // ignored: a missing cache entry is not an error
+      }
+    }
+    emitWorkspaceEvent({
+      type: 'sources',
+      generation: generation,
+      sources: workspaceSummaries(),
+      totals: workspaceTotalsState(),
+      removedSourceId: sourceId,
+    })
+  }
+
+  function workspaceInfo() {
+    return { sources: workspaceSummaries(), totals: workspaceTotalsState() }
+  }
+
+  // Shared workspaces exchange the already bounded L0 snapshots, never source
+  // text or a reconstructed graph. Source records are immutable transactions.
+  function sourceSnapshots() {
+    return workspaceState ? workspaceState.sources.slice() : []
+  }
+
+  function importSource(input) {
+    if (disposed || !input || !input.parsed || !Array.isArray(input.parsed.triples)) return 0
+    cancelWorkspaceRequest()
+    generation += 1
+    // A subsequent compose hydrates this snapshot into the worker. Releasing
+    // here also prevents an older worker cache from restoring removed sources.
+    releaseWorkspaceWorker()
+    const request = Object.assign({}, input, { text: undefined })
+    commitSource(generation, request, input.parsed, Math.max(0, Number(input.byteSize) || 0))
+    return generation
+  }
+
+  function disposeWorkspace() {
+    cancelWorkspaceRequest()
+    workspaceState = null
+  }
+
+  function releasedWorkspace() {
+    disposeWorkspace()
   }
 
   function dispose() {
     cancelActiveJob()
+    cancelWorkspaceRequest()
+    releaseWorkspaceWorker()
+    releasedWorkspace()
     disposed = true
     lastGraph = null
     lastMeta = null
@@ -1170,6 +1737,12 @@ export function createOntologyRunner(handlers) {
     submit: submit,
     relayout: relayout,
     cancel: cancel,
+    parseSource: parseSource,
+    compose: compose,
+    dropSource: dropSource,
+    workspaceInfo: workspaceInfo,
+    sourceSnapshots: sourceSnapshots,
+    importSource: importSource,
     dispose: dispose,
   }
 }

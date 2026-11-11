@@ -132,3 +132,19 @@ window.__ModuleLoader__.load({
 | 换行/下拉框不出现 | `wrap: true` 才有换行；下拉框只在匹配到多个渲染器时出现 |
 
 本仓库中对应的实现：`src/main.js`（两个扩展点注册）、`src/graph-view.js`（视图与主题令牌）、`build/build.mjs`（单文件构建）。
+
+## 6. 多文件工作区与资源身份（add-ontology-multiview-workspace）
+
+DSH 的文件地址、真实路径与 RDF Base 是三种不同标识，不要混用：
+
+| 标识 | 来源 | 用途 |
+| --- | --- | --- |
+| `navigationAddress` | 原生预览的 `resourceAddress`（`dsh-resource://file/session/<sessionId>/<path>`） | 宿主访问、授权与导航；**不是** RDF Base |
+| `absolutePath` | 原生预览的 `useResource(tab.contentId).value.absolutePath`；better-sidebar 的 `props.path` | 唯一可信的文件身份，经 `fileUriFromPath` 转成 `file:` URI |
+| `rdfBase` | 文档内 `@base`/`xml:base`/JSON-LD `@base` 或 `absolutePath` 映射 | RDF 相对 IRI 的解析基准 |
+
+同一文件从两个入口打开时，必须先得到相同的 `absolutePath` 再解析；只拿到路由地址时不要删前缀猜路径，也不要拿 Session ID 拼路径。取不到真实路径时，相对 IRI 留在来源内部并产生 `base-unavailable` 诊断。
+
+官方 `workspaceFiles`（`@deepseek-ai/dsh-api-workspace-files`，0.2.2-rc.1）提供 Client `remote.workspaceFiles.list/stat/readBytes/changes`，`stat`/`readBytes` 返回 `absolutePath`。其中 `list` 只列当前目录、受 `maxEntries` 限制并且只在工作区内；它不是自动扫描 API。**这些是接口与文档证据，不是本插件在真实 DSH 页面的运行结果**：A 方案的 Client 授权/取消/读取行为仍需真机验证；验证前多文件入口使用浏览器 File API（方案 B），且不从 `name`/`webkitRelativePath` 伪造绝对路径。
+
+导出与下载没有已确认的 DSH 导出服务：导出在浏览器内完成，SVG 用静态白名单 + 文本转义，PNG 由同一 SVG 在 Canvas 栅格化（分配前检查像素上限），下载通过 `<a download>` 发起；浏览器无法报告文件是否落盘，失败时提供 SVG/复制回退。
