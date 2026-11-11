@@ -1,6 +1,6 @@
 # 接入笔记：DSH 里做"文件预览"类插件
 
-这份笔记记录 `dsh-ontology-viewer` 实际用到的宿主扩展点、契约和踩过的坑，方便写同类插件时少走弯路。以下 API 以 DSH 0.2.1-rc 系列（`ui-sidebar-documentpreview` / `dsh-better-sidebar` 0.28）为准，具体版本请以你环境里的实现为准。
+本文件记录 `dsh-ontology-viewer` 实际用到的宿主扩展点、契约和踩过的坑，方便编写同类插件。当前发布验证基线为 DSH Desktop **0.2.2-rc.1（Windows x64）** 与可选的 `dsh-better-sidebar` **0.30.1**；Node.js 在该次运行环境为 24.21.0。`package.json` 仅声明 Node.js >= 22。其它 DSH 版本、Web 部署、操作系统 / 架构以及未列出的插件交互未由该验收覆盖；接入前请核对目标环境的实际 API。
 
 ## 1. 宿主自带右侧栏预览：`ctx.documentPreviews`
 
@@ -145,6 +145,6 @@ DSH 的文件地址、真实路径与 RDF Base 是三种不同标识，不要混
 
 同一文件从两个入口打开时，必须先得到相同的 `absolutePath` 再解析；只拿到路由地址时不要删前缀猜路径，也不要拿 Session ID 拼路径。取不到真实路径时，相对 IRI 留在来源内部并产生 `base-unavailable` 诊断。
 
-官方 `workspaceFiles`（`@deepseek-ai/dsh-api-workspace-files`，0.2.2-rc.1）提供 Client `remote.workspaceFiles.list/stat/readBytes/changes`，`stat`/`readBytes` 返回 `absolutePath`。其中 `list` 只列当前目录、受 `maxEntries` 限制并且只在工作区内；它不是自动扫描 API。**这些是接口与文档证据，不是本插件在真实 DSH 页面的运行结果**：A 方案的 Client 授权/取消/读取行为仍需真机验证；验证前多文件入口使用浏览器 File API（方案 B），且不从 `name`/`webkitRelativePath` 伪造绝对路径。
+官方 `workspaceFiles`（`@deepseek-ai/dsh-api-workspace-files`，0.2.2-rc.1）在该版本接口文档中列出 Client `remote.workspaceFiles.list/stat/readBytes/changes`，`stat`/`readBytes` 可返回 `absolutePath`。但本插件在当前验收环境的运行时探针未发现 `remote.workspaceFiles`，因此逐目录授权/读取入口未启用，实际多文件添加使用浏览器 File API；接口文档不是该能力在目标 profile 可用的证据。
 
 导出与下载没有已确认的 DSH 导出服务：导出在浏览器内完成，SVG 用静态白名单 + 文本转义，PNG 由同一 SVG 在 Canvas 栅格化（分配前检查像素上限），下载通过 `<a download>` 发起；浏览器无法报告文件是否落盘，失败时提供 SVG/复制回退。

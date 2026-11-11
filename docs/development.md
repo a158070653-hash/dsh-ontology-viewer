@@ -102,7 +102,7 @@ ctx.inject(['betterSidebar'], (inner) => {
 5. **Worker 探针（新增能力）**：在真实页面确认 client.js 被加载（Network rev / 刷新）、主文档 CSP（含 `worker-src` / `default-src` 回退）、classic Blob Worker 构造与 `postMessage` 往返、worker 内真实解析结果与主线程一致、`terminate()` 与 `revokeObjectURL` 后无残留且可重建。**其它插件的 Worker 先例不构成可用性证据**；未通过则必须走降级路线。
 6. **真实 UI 验收**：在 DSH 页面点开 `examples/` 中的文件，检查明暗主题、窗口宽度、过滤/多跳/详情/搜索、悬停/拖拽/缩放/适配、错误与截断提示等。视觉与交互无法由 Node 测试替代。
 
-**验证边界**：仓库现有证据是当前全部 Node 测试（数量随演进，不是契约）+ 构建一致性 + i18n 覆盖 + VM 级 bundle 接线 + 性能基准；README 的“验证状态”也明确说明作者环境未做浏览器视觉验收。因此：
+**验证边界**：1.1.0 已保留 DSH Desktop 0.2.2-rc.1（Windows x64）的真实页面记录、原生预览与 better-sidebar 0.30.1 的选定路径、SVG/PNG 样例，以及 Node 测试、构建一致性、i18n、VM 接线与基准。详细证据见 [验收归档](../openspec/changes/archive/2026-11-11-add-ontology-multiview-workspace/verification.md)；平台与版本范围见 [兼容说明](compatibility.md)。后续改动仍需按范围重新验证：
 
 - 不得把“注册成功 / 测试通过”写成“UI 已验证”；
 - 视觉或交互改动需在真实 DSH 页面验证，并在 PR 描述中给出步骤或截图；
@@ -128,11 +128,11 @@ ctx.inject(['betterSidebar'], (inner) => {
 - **搜索排序**：`matchNodes` 的“前缀匹配”层只覆盖 label / local 前缀；IRI 前缀命中落在最低的“local/IRI 子串”层。
 - **断开分量的布局**：按连通分量网格播种加弱重力，只保证“分散、不全部挤在中心”，不保证任意节点互不重叠。
 - **预算默认值**：解析器默认 `maxTriples=100000`（宿主传 120000）、`buildGraph` 默认 `maxNodes=1200`（宿主传 1500）、绘制边 6000、降级模式 60000/800/3000、`layoutGraph` 默认 320 次迭代（上限 2000）。这些是可被调用方覆盖的当前默认值，不是永久契约；数字以 `npm run bench` 的测量结果为依据调整。
-- **Worker 可用性**：Worker 路线依赖真实 DSH 页面探针结果；本仓库当前没有该探针的运行时证据，未通过时必须走降级路线，不得把源码中的其它 Worker 先例当成通过证据。工作区的 `parse-source` / `compose` 协议同样只由 Node 测试与打包后的 VM 测试覆盖，真实页面行为未验证。
+- **Worker 可用性**：1.1.0 的真实 DSH 探针记录了 Blob Worker 构造/通信/终止/URL 回收与工作区导入组合；证据只适用于已验收环境。新宿主或 CSP 改动后需重新探测；不可用时走降级路径，不以其它插件的 Worker 先例推断可用。
 - **多文件入口**：方案 A（官方 `remote.workspaceFiles` 逐目录复选）的客户端授权、取消与读取尚未在真实运行环境验证，因此当前 UI 只用方案 B（浏览器本地文件选择）；A 的实现保留为后续启用项，不能把 README/Inspect 的接口存在当作已验收。
 - **bundle 体积**：含内嵌 Worker 源与多视图模块后 `client.js` 约 8.8×10^5 字符（构建产物以 `npm run build` 输出为准），比 V1.0.0 的约 1.96×10^5 字符显著增大；这是保持单文件加载契约的代价。
 - **测试数量**：`npm test` 的数量随功能演进，验证要求是“仓库当前全部测试通过”，不要把具体数字写成门槛。
-- **发布包内容**：`package.json` 的 `files` 不含 `tests/`、`examples/`、`docs/`、`.github/`、`openspec/`，这是 npm 安装包与仓库的区别，不是遗漏。
+- **发布包内容**：`package.json.files` 包含运行文件、README、CHANGELOG 与 `docs/compatibility.md`；不含测试、示例、其余开发文档、CI 与 OpenSpec 验收归档。安装包与完整仓库用途不同；发版时必须核对实际 tarball 清单。
 
 ## 7. OpenSpec
 

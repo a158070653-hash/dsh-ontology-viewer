@@ -18,7 +18,7 @@
 
 ---
 
-**相关文档**：[接入笔记（如何写同类插件）](docs/integration.md) · [参与贡献](CONTRIBUTING.md) · [更新日志](CHANGELOG.md)
+**当前版本：1.1.0** · **相关文档**：[DSH 兼容、依赖与升级](docs/compatibility.md) · [接入笔记](docs/integration.md) · [参与贡献](CONTRIBUTING.md) · [更新日志](CHANGELOG.md)
 
 ## 目录
 
@@ -46,7 +46,7 @@
 - **两个入口，随装随用**
   - DSH 自带右侧栏文档预览（Files 页签）：本体文件默认渲染为图谱，仍可下拉切回宿主纯文本。
   - [dsh-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) 已安装时：它的文件树里点这些文件直接打开图谱页签，并显示图谱文件图标。
-- **四种序列化本地解析**：Turtle / N-Triples / RDF-XML(OWL) / JSON-LD，按后缀判断 + 内容嗅探；坏文件保留已解析部分，诊断按类型聚合（命名图被忽略、远程上下文跳过、RDF/XML 具体化未实现等），不再静默丢语义。
+- **四种序列化本地解析**：Turtle / N-Triples / RDF-XML(OWL) / JSON-LD，按后缀判断 + 内容嗅探；坏文件保留已解析部分，诊断按类型聚合（无法保留的命名图标为 unknown、远程上下文跳过、RDF/XML 具体化未实现等），不再静默丢语义。
 - **为"看本体"设计的建模**：字面量不进图（挂在节点详情里）、平行边合并计数、`rdf:first/rest` 列表管道不画成边、节点按类/属性/个体/空白节点/外部引用着色区分。
 - **可探索的图谱**：按节点类型 / 关系类型 / 关系方向过滤；从选中节点做 1–5 跳邻域探索（出边/入边/双向，支持预算截断后继续展开）；一键回到完整视图；所有过滤只影响显示，不改 RDF 数据。
 - **可交互**：缩放、平移、拖拽节点、悬停高亮邻居、搜索结果列表选择、按谓词分组的入/出边详情、一键重新布局 / 适配视图；点击关系端点可在图内定位。
@@ -57,18 +57,18 @@
 
 ## 安装
 
-> 前置：DSH 的 Web 类 profile（标准 `web` 部署或桌面版）。插件是标准 bundle：安装会同时写入依赖与 `dsh.profile.bundles`，装完刷新页面生效。
+> 发布验证基线：**DSH Desktop 0.2.2-rc.1（Windows x64）**；该次运行使用 Node.js 24.21.0。包声明的 Node.js 要求仍是 `>=22`，不把 24.21.0 当成最低版本。可选 `dsh-better-sidebar` 入口已在 0.30.1 验收。其它 DSH 版本、Web 部署、操作系统/架构未由本次发布证据覆盖。插件是标准 bundle：安装会同时写入依赖与 `dsh.profile.bundles`，装完刷新页面生效。
 
 **方式一：从 GitHub 安装（推荐）**
 
-`<profile>` 换成你正在用的 profile 名：标准 Web 部署通常是 `web`，DSH 桌面版通常是 `desktop`（`~/.dsh/profiles/` 下能看到已有名字）。
+`<profile>` 换成你正在用的 profile 名（`~/.dsh/profiles/` 下能看到已有名字）。本次 1.1.0 真实页面验收使用 DSH Desktop 的 `desktop` profile；Web 部署与其它 profile/宿主版本不在已验证兼容范围内。
 
 ```bash
 # 跟随 main
 dsh plugin --profile <profile> add https://github.com/a158070653-hash/dsh-ontology-viewer.git
 
 # 或锁定发布版本
-dsh plugin --profile <profile> add https://github.com/a158070653-hash/dsh-ontology-viewer.git#v1.0.0
+dsh plugin --profile <profile> add https://github.com/a158070653-hash/dsh-ontology-viewer.git#v1.1.0
 ```
 
 这条命令会 clone 仓库、按 `files` 打包安装，并把 `dsh-ontology-viewer` 追加进该 profile 的 `dsh.profile.bundles`——不需要再手动改 profile 配置。
@@ -195,7 +195,7 @@ flowchart LR
 - `npm run bench` 提供小型/中型/接近上限/高密度/异常五类夹具的分阶段基准（解析、建图、320/1000 次迭代布局、图规模、内存、序列化成本），并输出多文件 compose/树/分层投影的一组基准；仓库内记录的基准结果见 `openspec/changes/archive/2026-11-10-enhance-ontology-graph-core/verification.md`。
 - 导出：SVG 使用静态元素白名单与文本转义，不包含脚本、外部资源、事件属性或 DTD；PNG 在浏览器内由同一 SVG 栅格化，分配前检查总像素与单边上限（16M 像素 / 8192 单边），失败时回退 SVG。导出文本会剥离控制字符与内部分隔标记，界面与可访问名称同样不会出现这些字符。下载只能确认「已发起」，浏览器不会报告文件是否保存成功；「复制 SVG」失败时会显示只读文本框，可手动全选复制。
 
-> 导出文件在哪里：DSH（Electron）会在系统「下载」目录里先生成 `<uuid>.tmp`，并弹出原生「另存为」对话框（可能出现在其他显示器或被主窗口挡住）。在对话框中确认后才会改名为 `<源文件名>.svg/.png`；若没有看到对话框，下载目录里会留下 `*.tmp`，把它重命名为 `.svg`/`.png` 即可打开。最稳妥的方式是「复制 SVG」后粘贴到文本编辑器另存。
+> 导出文件在哪里：保存位置和对话框由宿主决定。验收时 DSH Desktop 在系统「下载」目录先生成 `<uuid>.tmp`，确认原生「另存为」后变为最终文件；对话框曾出现在其他显示器。请检查系统下载目录或保存窗口，不要仅凭“已发起下载”判断保存成功，也不要给未知或未完成的 `.tmp` 文件随意改后缀。可用「复制 SVG」后在文本编辑器另存作为回退。
 - 不做：`.omn`（Manchester 语法）、RDFa、远程 `@context`；JSON-LD 的 `@reverse`/`@included`/`@nest` 等结构不展开（给分类诊断），带 `@id` 的命名 `@graph` 标为 `unknown`；RDF/XML 的 `rdf:ID` 具体化未实现（给诊断）；不做 OWL 推理、SPARQL、`owl:imports` 联网加载或自动扫描工作区。
 
 ## 目录结构
@@ -291,25 +291,27 @@ npm run pack:release # 生成发版用 dsh-ontology-viewer.tgz（固定文件名
 - 从 Release 的预构建 tarball 安装（隔离的临时 profile 实测）：`dsh plugin --profile <p> add https://github.com/a158070653-hash/dsh-ontology-viewer/releases/latest/download/dsh-ontology-viewer.tgz` 成功，bundle 同样自动登记；
 - 在真实 DSH 实例中安装后：Host 行 `fiberPhase: active`，Client 侧 `sidebar.right.tab.document` 槽位出现 `dsh-ontology-viewer/graph` 且 `active: true`——说明 Client 模块确实在浏览器中加载并执行了。
 
-尚未验证（作者环境无浏览器控制权限，无法截图）：
+1.1.0 的真实页面验收在 DSH Desktop 0.2.2-rc.1（Windows x64）完成，覆盖的功能与限制分别列在下方。宿主注册成功与 Node 测试通过不替代视觉/交互验收，也不代表其它 DSH 版本已通过。
 
-- 图谱在页面中的实际视觉呈现、深/浅主题下的对比度、不同窗口宽度下的布局；
-- 点到真实文件时的最终画面；
-- 本次 `enhance-ontology-graph-core` 改造中新增的过滤、多跳探索、详情分组、搜索列表、Worker 真机路径与降级提示——这些只完成了代码与自动化测试，**未做真实 DSH 页面验收**，验收步骤见 Change 的 `verification.md`。
-
-`add-ontology-multiview-workspace` 新增能力的验证边界（规划与逐条证据见 `openspec/changes/add-ontology-multiview-workspace/`）：
+逐项记录见 [多视图工作区验收归档](openspec/changes/archive/2026-11-11-add-ontology-multiview-workspace/verification.md)：
 
 - 已用 Node 测试覆盖：双入口 Base 适配与路径编码、跨文件合并/移除/重载、空白节点隔离、命名图保留、类层级（多重继承/循环/预算）、分层图（SCC/布局/预算）、来源贡献过滤、SVG 安全与 PNG 像素预检、Worker 协议（解析/组合/缓存复用）、共享注册表隔离与生命周期、视图状态矩阵、导出场景一致性、组件级状态与可访问名称；
 - 已在真实 DSH 页面取得证据：多文件合并与来源过滤、来源面板与共享开关、类树搜索/键盘/属性模式/展开、分层方向图例/关系标签/空态/循环组成员面板（鼠标与键盘）、关系详情与“显示更多”分页、跨视图共享搜索、SVG（网络/类树/分层）与 PNG 实际栅格化并发起下载、浅色/深色主题、中英文切换、575px 窄栏详情抽屉与焦点恢复、导出产物字节校验（PNG 签名/IHDR/IEND；样例另存于 Change 的 `evidence/`）、500 类压力下的导入/内存/长任务采样；导出期间无外部请求；
 - **better-sidebar 双入口已真机验收**：`dsh-better-sidebar@0.30.1` 生效后，其文件树双击 `pizza.ttl` 会以本插件的 viewer 渲染（`data-ontology-source`），节点/边/三元组与原生预览一致（25/25、35/35、73），并验证了三视图切换、多文件 A/B 合并与移除、5/12 MiB 上限提示；
-- **未验证 / 未启用**：DSH `workspaceFiles` 逐目录复选的多文件入口（能力不存在，已禁用并走浏览器本地文件选择）、持续内存的泄漏定论（仅采样与峰值）。better-sidebar 入口中同名异目录、空/错文件、纯文本切换、更新/重载、缩放/拖拽/搜索/快捷键未逐项重复走查（共享组件已在原生入口与自动化测试覆盖）。这些项目保持未完成，不能据代码或 Node 测试声称已通过。
+- **未验证 / 未启用**：DSH `workspaceFiles` 逐目录复选的多文件入口（该验收 profile 能力不可用，使用浏览器本地文件选择）、持续内存泄漏定论（目前只有峰值与有限时间窗采样）。better-sidebar 入口中的同名异目录、空/错文件、纯文本切换、更新/重载、缩放/拖拽/搜索/快捷键未逐项重复走查；共享组件的原生入口与自动化覆盖不等于这些 better-sidebar 组合均已验收。
 - **导出下载链路已真机闭环**：三视图 SVG/PNG 共 6 个文件通过原生「另存为」确认保存到系统下载目录并逐一核对尺寸与内容（网络 575×1133/575×1154、类层级 102×98、分层 521×621），样例见 Change 的 `evidence/`；并记录宿主行为——确认前文件以 `<uuid>.tmp` 形式留在下载目录。
 
 如果你发现视觉问题，欢迎提 issue，附上文件片段和截图；改 `src/graph-view.js` 的 `CSS` 常量后 `npm run build` 即可。
 
 ## English
 
-**dsh-ontology-viewer** is a plugin for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). Open `.ttl`, `.owl`, `.rdf`, `.jsonld`, `.nt`, `.n3` files from the file tree and the right-sidebar preview renders their RDF triples as an interactive force-directed graph instead of raw text.
+**dsh-ontology-viewer** is a plugin for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). Open `.ttl`, `.owl`, `.rdf`, `.jsonld`, `.nt`, `.n3` files from the file tree and the right-sidebar preview renders their RDF triples as an interactive graph instead of raw text.
+
+### Compatibility
+
+- Release verification baseline: **DSH Desktop 0.2.2-rc.1 on Windows x64**. The recorded run used Node.js 24.21.0; the package requirement remains Node.js `>=22`.
+- Optional `dsh-better-sidebar` integration was verified with version **0.30.1**. It is not a required dependency.
+- This evidence does not establish compatibility with other DSH versions, web deployments, operating systems, or architectures. Check the target host before deployment.
 
 - Two surfaces: DSH's built-in document preview (`ctx.documentPreviews` + `sidebar.right.tab.document`) and [dsh-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) file viewers (optional).
 - Parsers for Turtle / N-Triples / RDF-XML / JSON-LD, with no runtime dependencies and no network access; semantic losses are reported as grouped diagnostics instead of being silently dropped.
@@ -317,7 +319,7 @@ npm run pack:release # 生成发版用 dsh-ontology-viewer.tgz（固定文件名
 - Layer-aware budgets (triples / nodes / literals / drawn edges) are always visible; parse, model and layout prefer a Blob Web Worker and degrade to chunked main-thread layout with a clear notice and tighter budgets when unavailable.
 - Deterministic layout (fixed seed, mulberry32), host theme tokens only, zh/en UI.
 
-Install: `dsh plugin --profile <profile> add https://github.com/a158070653-hash/dsh-ontology-viewer.git` (`web` for the standard web deployment, `desktop` for the desktop app), then refresh the DSH page. Try the files in [`examples/`](examples).
+Install the pinned release: `dsh plugin --profile <profile> add https://github.com/a158070653-hash/dsh-ontology-viewer/releases/download/v1.1.0/dsh-ontology-viewer.tgz`, then reload the Client (restart Desktop if the old module is retained). Use your existing profile; `desktop` was used in the recorded verification. See [compatibility and upgrade notes](docs/compatibility.md) and try the files in [`examples/`](examples).
 
 ## 参与贡献
 

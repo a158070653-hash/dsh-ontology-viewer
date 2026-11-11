@@ -13,7 +13,7 @@
 ```bash
 git clone https://github.com/a158070653-hash/dsh-ontology-viewer.git
 cd dsh-ontology-viewer
-npm test            # 46 个单元测试
+npm test            # 当前全部单元测试（数量随演进）
 npm run build       # 改过 src/ 后重新生成 client.js
 npm run check       # 语法 + 构建一致性 + 测试（提交前必跑）
 npm run i18n        # 视图文案 key 与 zh/en 词典是否对齐
@@ -57,18 +57,18 @@ test: 覆盖 N-Quads 图名
 
 ## 发版流程
 
-1. 更新 `CHANGELOG.md` 与 `package.json` 的 `version`。
-2. `npm run check`，然后提交并打 tag：`git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin main vX.Y.Z`。
-3. 生成预构建包并挂到 Release（资产名固定为不带版本号的 `dsh-ontology-viewer.tgz`，否则 `latest/download/` 链接下次发版就会 404）：
+1. 以 `package.json.version` 为包版本唯一来源，遵循 SemVer；将本次 Unreleased 归入带日期的版本条目，保留旧版本历史，并更新 README 固定 tag 安装示例、`docs/compatibility.md` 的已验证 DSH/可选集成版本与限制。不根据单个测试版本猜测 `engines.dsh` 范围。
+2. 执行 `npm run check`、`npm run i18n`、`npm run stats` 与 `openspec validate --all --strict`；打包并核对 tarball 内的版本、Client、patch、图标、locale、兼容说明与零依赖声明。仅暂存本次发布文件。提交后创建不可变的 annotated tag：`git tag -a vX.Y.Z -m "vX.Y.Z"`，确认远端目标后推送 `git push origin main vX.Y.Z`；已有发布 tag 不覆盖。
+3. 为本次版本编写 `docs/release-vX.Y.Z.md`（功能、兼容基线、安装与验证限制），生成预构建包并挂到 Release（资产名固定为不带版本号的 `dsh-ontology-viewer.tgz`，否则 `latest/download/` 链接下次发版就会 404；已发布资产不覆盖）：
 
    ```bash
    npm run pack:release
-   gh release create vX.Y.Z --title "vX.Y.Z" --notes-file CHANGELOG.md
-   gh release upload vX.Y.Z dsh-ontology-viewer.tgz --clobber
+   gh release create vX.Y.Z --verify-tag --title "vX.Y.Z" --notes-file docs/release-vX.Y.Z.md
+   gh release upload vX.Y.Z dsh-ontology-viewer.tgz
    ```
 
 4. 若插件市场条目的 `tarball:` 指向 `releases/latest/download/dsh-ontology-viewer.tgz`，无需改动。
 
 ## 视觉验证说明
 
-本项目作者环境没有浏览器控制能力，界面截图无法自动生成。视觉类改动请在 PR 中附截图（明暗主题各一张更好），这会直接帮助维护者 review。
+视觉类改动须在实际 DSH 页面验证并记录宿主版本、入口、主题、语言和窗口宽度；Node 测试不能替代该验收。1.1.0 的记录见 OpenSpec 归档。提交 PR 时附截图或可复现步骤，未验证的组合明确注明。

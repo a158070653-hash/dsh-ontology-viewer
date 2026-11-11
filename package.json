@@ -1,6 +1,6 @@
 {
   "name": "dsh-ontology-viewer",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Ontology graph viewer for DeepSeek Harness: open .ttl / .owl / .rdf / .jsonld / .nt files and see the RDF graph as an interactive node-link diagram.",
   "type": "module",
   "main": "index.js",
@@ -19,6 +19,8 @@
     "locale/*.json",
     "icon.svg",
     "README.md",
+    "CHANGELOG.md",
+    "docs/compatibility.md",
     "LICENSE"
   ],
   "scripts": {
