@@ -30,6 +30,8 @@ const ONTO_XSD_BOOLEAN = ONTO_XSD_NS + 'boolean'
 const ONTO_XML_NS = 'http://www.w3.org/XML/1998/namespace'
 const ONTO_DEFAULT_MAX_TRIPLES = 100000
 const ONTO_DEFAULT_MAX_LITERAL_LENGTH = 16384
+const ONTO_DEFAULT_MAX_LITERAL_IDENTITY_LENGTH = 65536
+const ONTO_DEFAULT_MAX_LITERAL_IDENTITY_BYTES = 256 * 1024
 const ONTO_DEFAULT_MAX_DEPTH = 256
 const ONTO_DEFAULT_MAX_DIAGNOSTICS = 200
 const ONTO_DIAGNOSTIC_SAMPLE_LIMIT = 3
@@ -311,6 +313,15 @@ class OntoRdfBuilder {
     this.text = typeof text === 'string' ? text : ''
     this.maxTriples = ontoRdfMaxTriples(opts.maxTriples)
     this.maxLiteralLength = ontoRdfLimit(opts.maxLiteralLength, ONTO_DEFAULT_MAX_LITERAL_LENGTH)
+    this.maxLiteralIdentityLength = Math.min(
+      ontoRdfLimit(opts.maxLiteralIdentityLength, ONTO_DEFAULT_MAX_LITERAL_IDENTITY_LENGTH),
+      ONTO_DEFAULT_MAX_LITERAL_IDENTITY_LENGTH,
+    )
+    this.maxLiteralIdentityBytes = Math.min(
+      ontoRdfLimit(opts.maxLiteralIdentityBytes, ONTO_DEFAULT_MAX_LITERAL_IDENTITY_BYTES),
+      ONTO_DEFAULT_MAX_LITERAL_IDENTITY_BYTES,
+    )
+    this.literalIdentityBytes = 0
     this.maxDepth = ontoRdfLimit(opts.maxDepth, ONTO_DEFAULT_MAX_DEPTH)
     this.maxDiagnostics = ontoRdfLimit(opts.maxDiagnostics, ONTO_DEFAULT_MAX_DIAGNOSTICS)
     this.triples = []
@@ -399,16 +410,38 @@ class OntoRdfBuilder {
     }
     let term = object
     let literalTruncated = false
+    let literalOriginalLength = null
+    let literalIdentity = null
     if ((objectKind || 'iri') === 'literal' && typeof term === 'string' &&
-      term.length > this.maxLiteralLength) {
+      this.maxLiteralLength > 0 && term.length >= this.maxLiteralLength) {
       literalTruncated = true
-      this.diagnose(
-        'literal-limit',
-        'warning',
-        'literal value of ' + term.length + ' characters was truncated to ' +
-          this.maxLiteralLength + ' characters',
-      )
-      term = term.slice(0, this.maxLiteralLength)
+      const original = term
+      literalOriginalLength = original.length
+      const identityBytes = original.length * 2
+      if (original.length <= this.maxLiteralIdentityLength &&
+        this.literalIdentityBytes + identityBytes <= this.maxLiteralIdentityBytes) {
+        literalIdentity = { version: 1, reliability: 'reliable', lexical: original }
+        this.literalIdentityBytes += identityBytes
+      } else {
+        const reason = original.length > this.maxLiteralIdentityLength
+          ? 'literal-identity-length-limit'
+          : 'literal-identity-budget'
+        literalIdentity = { version: 1, reliability: 'unknown', reason: reason }
+        this.diagnose(
+          'literal-identity-unknown',
+          'warning',
+          'literal identity is unknown because ' + reason + ' was reached',
+        )
+      }
+      if (original.length > this.maxLiteralLength) {
+        this.diagnose(
+          'literal-limit',
+          'warning',
+          'literal value of ' + original.length + ' characters was truncated to ' +
+            this.maxLiteralLength + ' characters',
+        )
+      }
+      term = original.slice(0, this.maxLiteralLength)
     }
     const triple = {
       s: subject,
@@ -419,6 +452,8 @@ class OntoRdfBuilder {
       location: null,
     }
     if (literalTruncated) triple.literalTruncated = true
+    if (literalOriginalLength !== null) triple.literalOriginalLength = literalOriginalLength
+    if (literalIdentity) triple.literalIdentity = literalIdentity
     if (datatype !== undefined) triple.dt = datatype
     if (language !== undefined) triple.lang = language
     this.triples.push(triple)
@@ -3321,6 +3356,8 @@ function ontoRdfEmptyDocument(format, text, options) {
  *   format?: string,
  *   maxTriples?: number,
  *   maxLiteralLength?: number,
+ *   maxLiteralIdentityLength?: number,
+ *   maxLiteralIdentityBytes?: number,
  *   maxDepth?: number,
  *   maxDiagnostics?: number
  * }
@@ -3340,6 +3377,8 @@ export function parseOntology(text, options) {
     rdfBase: opts.rdfBase,
     maxTriples: opts.maxTriples,
     maxLiteralLength: opts.maxLiteralLength,
+    maxLiteralIdentityLength: opts.maxLiteralIdentityLength,
+    maxLiteralIdentityBytes: opts.maxLiteralIdentityBytes,
     maxDepth: opts.maxDepth,
     maxDiagnostics: opts.maxDiagnostics,
   }

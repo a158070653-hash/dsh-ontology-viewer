@@ -4,6 +4,11 @@ import { readFileSync } from 'node:fs'
 import vm from 'node:vm'
 
 import { createOntologyRunner, computeOntology } from '../src/ontology-job.js'
+import {
+  createOntologyAnalysisSnapshot, createOntologyAnalysisIndex, createOntologyOverview,
+  diagnoseOntologyStructure, explainOntologyRestriction, explainOntologyClassExpression,
+  explainOntologyProperty,
+} from '../src/ontology-analysis.js'
 import { parseOntology } from '../src/rdf-parse.js'
 import { buildGraph, layoutGraph, createLayoutTask } from '../src/graph-model.js'
 import {
@@ -627,12 +632,25 @@ function createWorkerSandbox() {
     parseOntology,
     buildGraph,
     layoutGraph,
+    createWorkspace,
+    addSource,
+    removeSource,
+    replaceSource,
+    workspaceAdmission,
+    composeWorkspaceGraph,
+    createOntologyAnalysisSnapshot,
+    createOntologyAnalysisIndex,
+    createOntologyOverview,
+    diagnoseOntologyStructure,
+    explainOntologyRestriction,
+    explainOntologyClassExpression,
+    explainOntologyProperty,
     performance,
   }
   vm.createContext(sandbox)
   const source = readFileSync(new URL('../src/worker-entry.js', import.meta.url), 'utf8')
   vm.runInContext(source, sandbox, { filename: 'worker-entry.js' })
-  return { self, posted }
+  return { self, posted, sandbox }
 }
 
 test('the worker entry speaks the documented compute/relayout/error protocol', () => {
@@ -702,11 +720,137 @@ const WORKSPACE_IMPL = {
   replaceSource,
   workspaceAdmission,
   composeWorkspaceGraph,
+  createOntologyAnalysisSnapshot,
+  createOntologyAnalysisIndex,
+  createOntologyOverview,
+  diagnoseOntologyStructure,
+  explainOntologyRestriction,
+  explainOntologyClassExpression,
+  explainOntologyProperty,
   identity: { entityKeyForTerm, statementIdFor, graphIdentityFor },
 }
 
 const FILE_ONE = '@prefix ex: <http://e/> .\nex:a ex:p ex:shared .\n'
 const FILE_TWO = '@prefix ex: <http://e/> .\nex:b ex:q ex:shared .\n'
+
+test('workspace runner uses the same analysis result in Worker and forced main-thread paths', async () => {
+  async function run(forceMainThread) {
+    const events = []
+    const worker = createFakeWorker()
+    const runner = createOntologyRunner({
+      impl: WORKSPACE_IMPL,
+      forceMainThread,
+      workerFactory: forceMainThread ? undefined : () => worker,
+      workerSource: forceMainThread ? '' : 'worker-source',
+      onEvent: (event) => events.push(event),
+    })
+    runner.parseSource({ text: FILE_ONE, displayName: 'one.ttl' })
+    if (!forceMainThread) {
+      const parseMessage = worker.messages.find((message) => message.type === 'parse-source')
+      const parsed = parseOntology(FILE_ONE, { format: 'turtle' })
+      worker.emit({ type: 'source', id: parseMessage.id, sourceId: parseMessage.sourceId,
+        revision: parseMessage.revision, status: 'ready', parsed })
+    }
+    const resultPromise = runner.analyze({ operation: 'overview' })
+    if (!forceMainThread) {
+      const analyzeMessage = worker.messages.find((message) => message.type === 'analyze')
+      assert.ok(analyzeMessage, 'runner sends analysis to cached Worker sources')
+      const source = {
+        sourceId: analyzeMessage.sourceId || 'src1', revision: 1, status: 'ready', stale: false,
+        parsed: parseOntology(FILE_ONE, { format: 'turtle' }),
+      }
+      const snapshot = createOntologyAnalysisSnapshot({ revision: 1, sources: [source] })
+      const index = createOntologyAnalysisIndex(snapshot)
+      worker.emit({ type: 'analysis', id: analyzeMessage.id, workspaceRevision: 1,
+        snapshotId: snapshot.snapshotId, result: {
+          overview: createOntologyOverview(index),
+        } })
+    }
+    const result = await resultPromise
+    runner.dispose()
+    return result
+  }
+  const workerResult = await run(false)
+  const mainResult = await run(true)
+  assert.deepEqual(workerResult, mainResult)
+})
+
+test('workspace runner rejects analysis results after a source revision changes', async () => {
+  const worker = createFakeWorker()
+  const runner = createOntologyRunner({
+    impl: WORKSPACE_IMPL,
+    workerFactory: () => worker,
+    workerSource: 'worker-source',
+    onEvent() {},
+  })
+  runner.parseSource({ text: FILE_ONE, displayName: 'one.ttl' })
+  const parseMessage = worker.messages.find((message) => message.type === 'parse-source')
+  worker.emit({ type: 'source', id: parseMessage.id, sourceId: parseMessage.sourceId,
+    revision: 1, status: 'ready', parsed: parseOntology(FILE_ONE, { format: 'turtle' }) })
+  const pending = runner.analyze({ operation: 'overview' })
+  const analyzeMessage = worker.messages.find((message) => message.type === 'analyze')
+  runner.parseSource({ text: FILE_TWO, displayName: 'two.ttl' })
+  const parsedNew = worker.messages.find((message) => message.type === 'parse-source' && message.id !== parseMessage.id)
+  worker.emit({ type: 'source', id: parsedNew.id, sourceId: parsedNew.sourceId,
+    revision: 1, status: 'ready', parsed: parseOntology(FILE_TWO, { format: 'turtle' }) })
+  await assert.rejects(pending, /cancelled/)
+  assert.equal(worker.onmessage, null, 'cancelled analysis does not keep a Worker callback alive')
+  worker.emit({ type: 'analysis', id: analyzeMessage.id, workspaceRevision: 1,
+    snapshotId: JSON.stringify([1, [['src1', 1]]]), result: { overview: {} } })
+  runner.dispose()
+})
+
+test('workspace runner caches L0 analysis indexes by revision and invalidates without reparsing', () => {
+  let parseCalls = 0
+  const impl = {
+    ...WORKSPACE_IMPL,
+    parseOntology: (...args) => { parseCalls += 1; return parseOntology(...args) },
+  }
+  const runner = createOntologyRunner({ impl, forceMainThread: true })
+  runner.parseSource({ text: FILE_ONE, displayName: 'one.ttl' })
+  assert.equal(parseCalls, 1)
+  const first = runner.analysisIndex()
+  const repeated = runner.analysisIndex()
+  assert.equal(first, repeated, 'same revision and source selection reuse the index')
+  assert.equal(first.snapshot.scope.layer, 'L0')
+  assert.equal(first.index.bySubject.get('http://e/a').length, 1)
+  assert.equal(parseCalls, 1, 'index queries do not reparse accepted source text')
+
+  runner.parseSource({ text: FILE_TWO, displayName: 'two.ttl' })
+  const updated = runner.analysisIndex()
+  assert.notEqual(updated, first)
+  assert.equal(updated.snapshot.statements.length, 2)
+  assert.equal(parseCalls, 2, 'only the newly added source is parsed')
+  runner.dispose()
+})
+
+test('Worker analyze operation reads cached L0 sources for overview and diagnostics', () => {
+  const { self, posted } = createWorkerSandbox()
+  self.onmessage({ data: {
+    type: 'parse-source', id: 1, sourceId: 'src-list', revision: 1,
+    displayName: 'list.ttl', format: 'turtle', text:
+      '@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n' +
+      '@prefix owl: <http://www.w3.org/2002/07/owl#> .\n' +
+      '_:bad rdf:first <urn:A> .\n' +
+      '<urn:A> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <urn:B> .\n' +
+      '<urn:B> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <urn:A> .',
+  } })
+  const source = posted.pop().message
+  assert.equal(source.type, 'source')
+  assert.equal(source.parsed.triples.length, 3)
+
+  self.onmessage({ data: { type: 'analyze', id: 2, operation: 'overview' } })
+  const overview = posted.pop().message
+  assert.equal(overview.type, 'analysis')
+  assert.equal(overview.result.overview.counts.acceptedRelationships.value, 3)
+  assert.equal(overview.result.overview.completeness.status, 'complete')
+
+  self.onmessage({ data: { type: 'analyze', id: 3, operation: 'diagnostics' } })
+  const diagnostics = posted.pop().message
+  assert.equal(diagnostics.type, 'analysis')
+  assert.ok(diagnostics.result.diagnostics.diagnostics.some((item) => item.ruleId === 'rdf-list-missing-link'))
+  assert.ok(diagnostics.result.diagnostics.diagnostics.some((item) => item.ruleId === 'subclass-cycle'))
+})
 
 test('workspace main-thread composition discards a superseded layout', async () => {
   const events = []
@@ -845,6 +989,8 @@ test('workspace runner: worker path sends parse/compose and applies stale guards
   assert.equal(parseMessage.text, FILE_ONE)
   assert.equal(parseMessage.absolutePath, 'D:/one.ttl')
   assert.equal(parseMessage.maxTriples, 120000)
+  assert.equal(parseMessage.maxLiteralIdentityLength, 65536)
+  assert.equal(parseMessage.maxLiteralIdentityBytes, 262144)
 
   const parsed = parseOntology(FILE_ONE, { format: 'turtle', absolutePath: 'D:/one.ttl' })
   worker.emit({

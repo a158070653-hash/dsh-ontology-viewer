@@ -165,6 +165,25 @@ test('clear invalidates old handles and subscriptions; later acquires cannot rev
   assert.equal(registry.sessions.size, 0)
 })
 
+test('shared snapshots preserve bounded literal identity metadata', () => {
+  const handle = registryAcquire(createSessionRegistry(), 'session')
+  const literal = {
+    s: 'urn:s', p: 'urn:p', o: 'prefix', oKind: 'literal', literalTruncated: true,
+    literalOriginalLength: 9,
+    literalIdentity: { version: 1, reliability: 'reliable', lexical: 'prefix-A' },
+    graph: { kind: 'default' },
+  }
+  handle.publish(source('literal', 1, 1, [literal]))
+  literal.literalIdentity.lexical = 'mutated'
+  const shared = handle.list()[0].parsed.triples[0]
+  assert.deepEqual(shared.literalIdentity, {
+    version: 1, reliability: 'reliable', lexical: 'prefix-A',
+  })
+  assert.equal(shared.literalOriginalLength, 9)
+  assert.equal(shared.literalTruncated, true)
+  handle.release()
+})
+
 test('published snapshots are isolated from caller mutation and subscriber mutation', () => {
   const handle = registryAcquire(createSessionRegistry(), 'session')
   const input = source('a', 1, 1, [{ s: 'before', graph: { kind: 'default' } }])

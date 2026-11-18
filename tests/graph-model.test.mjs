@@ -586,6 +586,23 @@ test('per-node literal truncation reports literalsTruncated and graph-level tota
   assert.ok(graph.warnings.some((warning) => /truncated to 2 per node/u.test(warning)))
 })
 
+test('buildGraph preserves bounded literal truncation identity and occurrence provenance', () => {
+  const graph = buildGraph({ triples: [
+    { s: EX + 'note', p: EX + 'tag', o: 'prefix', oKind: 'literal',
+      literalTruncated: true, literalOriginalLength: 9, literalIdentity: { version: 1, reliability: 'unknown' },
+      sourceId: 'src-a', statementId: 'stmt-a' },
+    { s: EX + 'note', p: EX + 'tag', o: 'prefix', oKind: 'literal',
+      literalTruncated: true, literalOriginalLength: 9, literalIdentity: { version: 1, reliability: 'unknown' },
+      sourceId: 'src-b', statementId: 'stmt-b' },
+  ] })
+  const node = nodeById(graph, EX + 'note')
+  assert.equal(node.literals.length, 2)
+  assert.ok(node.literals.every((literal) => literal.truncated))
+  assert.ok(node.literals.every((literal) => literal.identityReliability === 'unknown'))
+  assert.deepEqual(node.literals.map((literal) => literal.sourceIds), [['src-a'], ['src-b']])
+  assert.deepEqual(node.literals.map((literal) => literal.statementIds), [['stmt-a'], ['stmt-b']])
+})
+
 test('maxLiteralLength truncates values, marks the literal and counts them', () => {
   const triples = [
     { s: EX + 'note', p: EX + 'tag', o: 'abcdefghij', oKind: 'literal' },

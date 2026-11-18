@@ -40,6 +40,14 @@ import {
   graphIdentityFor,
 } from '../src/ontology-identity.js'
 import { buildHierarchy, layoutLayeredGraph } from '../src/ontology-views.js'
+import {
+  createOntologyAnalysisSnapshot,
+  createOntologyAnalysisIndex,
+  inspectOntologyRdfList,
+  explainOntologyRestriction,
+  createOntologyOverview,
+  diagnoseOntologyStructure,
+} from '../src/ontology-analysis.js'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 
@@ -412,6 +420,21 @@ function printHumanReport(report) {
     if (fixture.failure) console.log([fixture.name, '-', 'failure', fixture.failure].join('\t'))
     console.log('')
   }
+  if (report.analysis) {
+    console.log('analysis: bounded L0 semantic pipeline')
+    console.log([
+      'analysis', `accepted=${report.analysis.acceptedOccurrences}`,
+      `classes=${report.analysis.resultCounts.classes}`,
+      `diagnostics=${report.analysis.resultCounts.diagnostics}`,
+      `json=${report.analysis.serialization.jsonBytes}`,
+    ].join('\t'))
+    for (const [stage, summary] of Object.entries(report.analysis.stages)) {
+      console.log(['analysis', '-', stage, formatNumber(summary.p50), formatNumber(summary.p95),
+        formatNumber(summary.min), formatNumber(summary.max)].join('\t'))
+    }
+    console.log('analysis heap delta: ' + report.analysis.memory.heapDeltaMiB + ' MiB')
+    console.log('')
+  }
   if (report.workspace) {
     const workspace = report.workspace
     console.log('workspace: multi-file compose')
@@ -533,17 +556,102 @@ function measureWorkspace() {
   }
 }
 
+function createAnalysisFixture() {
+  const prefixes = TURTLE_PREFIXES
+  const triples = [
+    'ex:Restriction rdf:type owl:Restriction ; owl:onProperty ex:member ; owl:minCardinality "2"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger> .',
+    'ex:ClassA owl:intersectionOf _:list1 .',
+    '_:list1 rdf:first ex:ClassB ; rdf:rest _:list2 .',
+    '_:list2 rdf:first ex:ClassC ; rdf:rest rdf:nil .',
+    'ex:member rdf:type owl:ObjectProperty, owl:TransitiveProperty ; rdfs:domain ex:ClassA ; rdfs:range ex:ClassB .',
+  ]
+  for (let index = 0; index < 250; index += 1) {
+    triples.push(`ex:Class${index} rdfs:label "analysis class ${index}" .`)
+    triples.push(`ex:Class${index} rdfs:subClassOf ex:Class${(index + 1) % 250} .`)
+  }
+  triples.push('ex:LongLabel rdfs:label "' + 'x'.repeat(20000) + 'A" .')
+  triples.push('ex:LongLabel rdfs:label "' + 'x'.repeat(20000) + 'B" .')
+  return prefixes + triples.join('\n') + '\n'
+}
+
+function measureAnalysis() {
+  const text = createAnalysisFixture()
+  const parsed = parseOntology(text, Object.assign({}, PARSE_OPTIONS, { fileName: 'analysis.ttl' }))
+  const source = {
+    sourceId: 'analysis-source', revision: 1, status: parsed.stats.truncated ? 'partial' : 'ready',
+    stale: false, format: parsed.format, parsed,
+  }
+  const workspace = { revision: 1, sources: [source] }
+  const samples = { snapshot: [], index: [], list: [], restriction: [], overview: [], diagnostics: [], clone: [] }
+  let heapDeltaBytes = 0
+  let last = null
+  for (let rep = 0; rep < REPS + 1; rep += 1) {
+    const heapBefore = process.memoryUsage().heapUsed
+    let start = now()
+    const snapshot = createOntologyAnalysisSnapshot(workspace)
+    const snapshotMs = now() - start
+    start = now()
+    const index = createOntologyAnalysisIndex(snapshot)
+    const indexMs = now() - start
+    start = now()
+    const list = inspectOntologyRdfList(index, '_:list1')
+    const listMs = now() - start
+    start = now()
+    const restriction = explainOntologyRestriction(index, 'http://example.org/Restriction')
+    const restrictionMs = now() - start
+    start = now()
+    const overview = createOntologyOverview(index)
+    const overviewMs = now() - start
+    start = now()
+    const diagnostics = diagnoseOntologyStructure(index)
+    const diagnosticsMs = now() - start
+    const payload = { snapshot, list, restriction, overview, diagnostics }
+    start = now()
+    if (typeof structuredClone === 'function') structuredClone(payload)
+    const cloneMs = now() - start
+    heapDeltaBytes = Math.max(heapDeltaBytes, process.memoryUsage().heapUsed - heapBefore)
+    if (rep > 0) {
+      samples.snapshot.push(snapshotMs)
+      samples.index.push(indexMs)
+      samples.list.push(listMs)
+      samples.restriction.push(restrictionMs)
+      samples.overview.push(overviewMs)
+      samples.diagnostics.push(diagnosticsMs)
+      samples.clone.push(cloneMs)
+    }
+    last = { snapshot, list, restriction, overview, diagnostics, payload }
+  }
+  return {
+    sourceBytes: Buffer.byteLength(text, 'utf8'),
+    acceptedOccurrences: last.snapshot.counts.acceptedOccurrences,
+    resultCounts: {
+      listMembers: last.list.members.length,
+      restrictionEvidence: last.restriction.evidence.length,
+      classes: last.overview.counts.classes.value,
+      diagnostics: last.diagnostics.total,
+    },
+    stages: Object.fromEntries(Object.entries(samples).map(([key, values]) => [key, roundSummary(summarize(values))])),
+    memory: { heapDeltaBytes, heapDeltaMiB: round(heapDeltaBytes / (1024 * 1024)) },
+    serialization: {
+      jsonBytes: Buffer.byteLength(JSON.stringify(last.payload), 'utf8'),
+      structuredCloneMs: roundSummary(summarize(samples.clone)),
+    },
+  }
+}
+
 function main() {
   const report = {
     tool: 'scripts/bench.mjs',
     environment: environment(),
     layout: { layout320: LAYOUT_320, layout1000: LAYOUT_1000 },
     fixtures: [],
+    analysis: null,
   }
   for (const fixture of createFixtures()) {
     report.fixtures.push(measureFixture(fixture))
   }
   report.workspace = measureWorkspace()
+  report.analysis = measureAnalysis()
   if (JSON_OUTPUT) {
     process.stdout.write(JSON.stringify(report, null, 2) + '\n')
   } else {

@@ -154,6 +154,21 @@ test('apply registers the document preview metadata and its slot body', () => {
   assert.equal(typeof body.component, 'function')
 })
 
+test('registered preview body and workspace component execute inside their hook scope', () => {
+  const definition = loadBundle()
+  const plugin = definition.factory(() => fakeReact())
+  const { ctx, record } = recordingContext()
+  plugin.apply(ctx)
+  const body = record.slots.find((entry) => entry.options.key === 'dsh-ontology-viewer/graph').component
+  const rendered = body({ content: { kind: 'bytes', data: new TextEncoder().encode('<urn:s> <urn:p> <urn:o> .') },
+    resourceAddress: 'file:///D:/sample.ttl' })
+  let element = rendered
+  for (let step = 0; step < 8 && element && typeof element.type === 'function'; step++) {
+    element = element.type(element.props || {})
+  }
+  assert.ok(element, 'workspace renders an initial state without free state references')
+})
+
 test('apply registers the better-sidebar viewer, icon, and locale dictionaries', () => {
   const definition = loadBundle()
   const plugin = definition.factory(() => fakeReact())

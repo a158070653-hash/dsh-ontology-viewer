@@ -46,6 +46,9 @@ function add(workspace, text, options) {
     absolutePath: opts.absolutePath,
     navigationAddress: opts.navigationAddress,
     fileName: opts.displayName,
+    maxLiteralLength: opts.maxLiteralLength,
+    maxLiteralIdentityLength: opts.maxLiteralIdentityLength,
+    maxLiteralIdentityBytes: opts.maxLiteralIdentityBytes,
   })
   const result = addSource(workspace, {
     origin: opts.origin || 'host',
@@ -246,7 +249,7 @@ test('workspace: duplicate statements merge but keep every source', () => {
   const edge = graph.edges[0]
   assert.equal(edge.count, 3, 'occurrence count, not source count')
   assert.deepEqual(edge.sourceIds, [first.source.sourceId, second.source.sourceId])
-  assert.equal(edge.statementIds.length, 1, 'identical statements share one identity')
+  assert.equal(edge.statementIds.length, 3, 'merged relation retains every source-local occurrence id')
 })
 
 test('workspace: named graph identity keeps equal SPO distinct', () => {
@@ -477,4 +480,145 @@ test('workspace: replace counts the staged source, not both versions', () => {
   assert.equal(reloadedEdges.reduce((total, edge) => total + edge.count, 0), 2)
   assert.equal(graph.edges.some((edge) => edge.p === EX + 'p' &&
     (edge.source === EX + 'a1' || edge.source === EX + 'a2')), false)
+})
+
+test('workspace: truncated literals with equal prefixes retain separate semantic identities', () => {
+  let workspace = makeWorkspace()
+  const first = add(workspace, '<urn:s> <urn:p> "prefix-A" .', {
+    absolutePath: 'D:/one.ttl', maxLiteralLength: 6,
+  })
+  workspace = first.workspace
+  const second = add(workspace, '<urn:s> <urn:p> "prefix-B" .', {
+    absolutePath: 'D:/two.ttl', maxLiteralLength: 6,
+  })
+  workspace = second.workspace
+  const composed = graphFor(workspace)
+  assert.equal(composed.statements, 2)
+  assert.equal(composed.occurrences, 2)
+  const literals = composed.graph.nodes.find((node) => node.id === 'urn:s').literals
+  assert.equal(literals.length, 2)
+  assert.ok(literals.every((literal) => literal.value === 'prefix'))
+  assert.ok(literals.every((literal) => literal.truncated && literal.identityReliability === 'reliable'))
+  assert.deepEqual(new Set(literals.flatMap((literal) => literal.sourceIds)),
+    new Set([first.source.sourceId, second.source.sourceId]))
+  assert.equal(new Set(literals.flatMap((literal) => literal.statementIds)).size, 2)
+})
+
+test('workspace: identical reliable long literals merge but retain occurrence provenance', () => {
+  let workspace = makeWorkspace()
+  const body = '<urn:s> <urn:p> "prefix-A" .'
+  const first = add(workspace, body, { absolutePath: 'D:/one.ttl', maxLiteralLength: 6 })
+  workspace = first.workspace
+  const second = add(workspace, body, { absolutePath: 'D:/two.ttl', maxLiteralLength: 6 })
+  workspace = second.workspace
+  const composed = graphFor(workspace)
+  assert.equal(composed.statements, 1)
+  assert.equal(composed.occurrences, 2)
+  const literal = composed.graph.nodes.find((node) => node.id === 'urn:s').literals[0]
+  assert.deepEqual(literal.sourceIds, [first.source.sourceId, second.source.sourceId])
+  assert.equal(literal.statementIds.length, 2)
+  const subject = composed.graph.nodes.find((node) => node.id === 'urn:s')
+  assert.deepEqual(subject.provenance.bySource.map((item) => [item.sourceId, item.statementIds]), [
+    [first.source.sourceId, [statementIdFor(first.source.sourceId, 0)]],
+    [second.source.sourceId, [statementIdFor(second.source.sourceId, 0)]],
+  ])
+})
+
+test('workspace: unknown literal identities never deduplicate and preserve language/datatype', () => {
+  let workspace = makeWorkspace()
+  const first = add(workspace, '<urn:s> <urn:p> "prefix-A"@en .', {
+    absolutePath: 'D:/one.ttl', maxLiteralLength: 6, maxLiteralIdentityBytes: 0,
+  })
+  workspace = first.workspace
+  const second = add(workspace, '<urn:s> <urn:p> "prefix-A"@fr .', {
+    absolutePath: 'D:/two.ttl', maxLiteralLength: 6, maxLiteralIdentityBytes: 0,
+  })
+  workspace = second.workspace
+  const typed = add(workspace, '<urn:s> <urn:p> "prefix-A"^^<urn:type> .', {
+    absolutePath: 'D:/three.ttl', maxLiteralLength: 6, maxLiteralIdentityBytes: 0,
+  })
+  workspace = typed.workspace
+  const composed = graphFor(workspace)
+  assert.equal(composed.statements, 3)
+  const literals = composed.graph.nodes.find((node) => node.id === 'urn:s').literals
+  assert.equal(literals.length, 3)
+  assert.ok(literals.every((literal) => literal.identityReliability === 'unknown'))
+  assert.deepEqual(new Set(literals.map((literal) => literal.lang).filter(Boolean)), new Set(['en', 'fr']))
+  assert.equal(literals.filter((literal) => literal.dt === 'urn:type').length, 1)
+  assert.equal(new Set(literals.flatMap((literal) => literal.statementIds)).size, 3)
+})
+
+test('workspace: parser identity budget exhaustion remains unknown after composition', () => {
+  let workspace = makeWorkspace()
+  const body = '<urn:s> <urn:p> "' + 'a'.repeat(60000) + 'X", "' + 'a'.repeat(60000) + 'Y", "' + 'a'.repeat(60000) + 'Z" .'
+  const added = add(workspace, body, {
+    absolutePath: 'D:/budget.ttl', maxLiteralLength: 8,
+    maxLiteralIdentityLength: 65536, maxLiteralIdentityBytes: 256 * 1024,
+  })
+  workspace = added.workspace
+  const composed = graphFor(workspace)
+  assert.equal(composed.statements, 3)
+  assert.equal(composed.occurrences, 3)
+  const literals = composed.graph.nodes.find((node) => node.id === 'urn:s').literals
+  assert.equal(literals.length, 3)
+  assert.equal(literals.filter((literal) => literal.identityReliability === 'unknown').length, 1)
+  assert.ok(literals.every((literal) => literal.value === 'aaaaaaaa'))
+  const ambiguousIds = literals.filter((literal) => literal.identityReliability === 'unknown')
+    .flatMap((literal) => literal.statementIds)
+  assert.equal(new Set(ambiguousIds).size, 1)
+})
+
+test('workspace: imported identity descriptors are clamped at source admission', () => {
+  const workspace = makeWorkspace()
+  const oversized = 'x'.repeat(65537)
+  const parsed = {
+    format: 'turtle', prefixes: {}, triples: [{
+      s: 'urn:s', p: 'urn:p', o: 'prefix', oKind: 'literal', literalTruncated: true,
+      literalOriginalLength: oversized.length,
+      literalIdentity: { version: 1, reliability: 'reliable', lexical: oversized },
+      graph: { kind: 'default' },
+    }],
+    diagnostics: [], warnings: [], errors: [], stats: { tripleCount: 1, truncated: false, truncation: null },
+  }
+  const added = addSource(workspace, {
+    sourceId: 'imported', parsed, text: '', byteSize: 1,
+  })
+  assert.equal(added.status, 'ready')
+  const stored = added.source.parsed.triples[0].literalIdentity
+  assert.equal(stored.reliability, 'unknown')
+  assert.equal(stored.reason, 'literal-identity-length-limit')
+  assert.equal(Object.prototype.hasOwnProperty.call(stored, 'lexical'), false)
+  const literal = graphFor(added.workspace).graph.nodes.find((node) => node.id === 'urn:s').literals[0]
+  assert.equal(literal.identityReliability, 'unknown')
+})
+
+test('workspace: remove and reload rebuild long-literal statement identity without stale provenance', () => {
+  let workspace = makeWorkspace()
+  const first = add(workspace, '<urn:s> <urn:p> "prefix-A" .', {
+    absolutePath: 'D:/one.ttl', maxLiteralLength: 6,
+  })
+  workspace = first.workspace
+  const second = add(workspace, '<urn:s> <urn:p> "prefix-A" .', {
+    absolutePath: 'D:/two.ttl', maxLiteralLength: 6,
+  })
+  workspace = second.workspace
+  assert.equal(graphFor(workspace).statements, 1)
+
+  workspace = removeSource(workspace, first.source.sourceId).workspace
+  let composed = graphFor(workspace)
+  assert.equal(composed.statements, 1)
+  assert.deepEqual(composed.graph.nodes.find((node) => node.id === 'urn:s').literals[0].sourceIds,
+    [second.source.sourceId])
+
+  const reloaded = replaceSource(workspace, second.source.sourceId, {
+    parsed: parse('<urn:s> <urn:p> "prefix-B" .', { maxLiteralLength: 6 }),
+    text: 'reload', absolutePath: 'D:/two.ttl',
+  })
+  workspace = reloaded.workspace
+  composed = graphFor(workspace)
+  assert.equal(composed.statements, 1)
+  const literal = composed.graph.nodes.find((node) => node.id === 'urn:s').literals[0]
+  assert.ok(literal.statementIds.every((id) => id.includes(second.source.sourceId)))
+  assert.deepEqual(literal.sourceIds, [second.source.sourceId])
+  assert.equal(literal.value, 'prefix')
 })

@@ -10,6 +10,7 @@
 | `src/ontology-identity.js` | 跨文件实体键：绝对 IRI 自证身份；空白节点、未解析相对 IRI、unknown 图按来源隔离；内部键使用 U+0000 标记 + 长度前缀，不能被 RDF 字符串伪造。 |
 | `src/graph-model.js` | `buildGraph` 把语句转成 node-link 图（节点分类、字面量归属、平行边合并、列表管道过滤、分层预算与 truncation 元数据），并为节点/字面量/边附加 `sourceIds`/`statementIds`/`graphs` 来源；`layoutGraph` 确定性布局与可中断的 `createLayoutTask`；`matchNodes` / `subgraph` / `neighborhood`；`filterGraph` / `filterBySources` / `exploreNeighborhood` / `applyEdgeBudget` / `connectionGroups` 只读投影。 |
 | `src/ontology-workspace.js` | 多文件 L0：来源记录与准入预算（文件数/总字节/语句出现记录）、添加/移除/原子重载、合并索引（相同语句保留全部来源）、单/联合工作集组合为 L1 图、来源摘要。 |
+| `src/ontology-analysis.js` | 有界、只读的 L0 分析快照/结果契约：来源 revision、statement evidence、截断/身份可靠性与 completeness 元数据；不从 L1 图重建语义。 |
 | `src/ontology-views.js` | 类/属性层级投影（显式 `rdfs:subClassOf` / `rdfs:subPropertyOf`、根/孤立/多重继承/循环 SCC、惰性展示引用与预算）、分层关系图（谓词投影、SCC 收缩、确定性分层布局、内部边/组）。 |
 | `src/graph-export.js` | 显示场景快照（视口/完整布局两种范围）、白名单安全 SVG 渲染与转义、PNG 像素/单边预算预检、浏览器内栅格化与失败回退。 |
 | `src/ontology-job.js` | 计算任务：状态机、generation 过期识别、Worker 终止/重建、主线程分片布局降级；工作区协议：`parse-source` / `compose` / `drop-source`，一个 Workspace Worker 缓存已解析来源，组合不重新解析。 |

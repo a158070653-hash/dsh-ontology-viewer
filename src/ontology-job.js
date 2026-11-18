@@ -38,6 +38,8 @@ const ONTOLOGY_JOB_DEFAULT_LIMITS = Object.freeze({
   maxEdges: 6000,
   maxLiteralsPerNode: 60,
   maxLiteralLength: 16384,
+  maxLiteralIdentityLength: 65536,
+  maxLiteralIdentityBytes: 256 * 1024,
   maxDepth: 256,
 })
 
@@ -99,6 +101,8 @@ function ontologyJobNormalizeLimits(limits) {
     maxEdges: ontologyJobClampInteger(input.maxEdges, ONTOLOGY_JOB_DEFAULT_LIMITS.maxEdges, 0, 1000000),
     maxLiteralsPerNode: ontologyJobClampInteger(input.maxLiteralsPerNode, ONTOLOGY_JOB_DEFAULT_LIMITS.maxLiteralsPerNode, 0, 100000),
     maxLiteralLength: ontologyJobClampInteger(input.maxLiteralLength, ONTOLOGY_JOB_DEFAULT_LIMITS.maxLiteralLength, 1, 10000000),
+    maxLiteralIdentityLength: ontologyJobClampInteger(input.maxLiteralIdentityLength, ONTOLOGY_JOB_DEFAULT_LIMITS.maxLiteralIdentityLength, 1, ONTOLOGY_JOB_DEFAULT_LIMITS.maxLiteralIdentityLength),
+    maxLiteralIdentityBytes: ontologyJobClampInteger(input.maxLiteralIdentityBytes, ONTOLOGY_JOB_DEFAULT_LIMITS.maxLiteralIdentityBytes, 0, ONTOLOGY_JOB_DEFAULT_LIMITS.maxLiteralIdentityBytes),
     maxDepth: ontologyJobClampInteger(input.maxDepth, ONTOLOGY_JOB_DEFAULT_LIMITS.maxDepth, 1, 100000),
   }
 }
@@ -112,6 +116,8 @@ function ontologyJobDegradedLimits(limits) {
     maxEdges: Math.min(normalized.maxEdges, ONTOLOGY_JOB_DEGRADED_LIMITS.maxEdges),
     maxLiteralsPerNode: normalized.maxLiteralsPerNode,
     maxLiteralLength: normalized.maxLiteralLength,
+    maxLiteralIdentityLength: normalized.maxLiteralIdentityLength,
+    maxLiteralIdentityBytes: normalized.maxLiteralIdentityBytes,
     maxDepth: normalized.maxDepth,
   }
 }
@@ -173,12 +179,23 @@ function ontologyJobImpls(override) {
     replaceSource: null,
     workspaceAdmission: null,
     composeWorkspaceGraph: null,
+    createOntologyAnalysisSnapshot: null,
+    createOntologyAnalysisIndex: null,
+    setOntologyAnalysisIdentity: null,
+    createOntologyOverview: null,
+    diagnoseOntologyStructure: null,
+    explainOntologyRestriction: null,
+    explainOntologyClassExpression: null,
+    explainOntologyProperty: null,
     identity: provided.identity || null,
   }
   const names = [
     'parseOntology', 'buildGraph', 'layoutGraph', 'createLayoutTask',
     'createWorkspace', 'addSource', 'removeSource', 'replaceSource',
     'workspaceAdmission', 'composeWorkspaceGraph',
+    'createOntologyAnalysisSnapshot', 'createOntologyAnalysisIndex', 'setOntologyAnalysisIdentity',
+    'createOntologyOverview', 'diagnoseOntologyStructure',
+    'explainOntologyRestriction', 'explainOntologyClassExpression', 'explainOntologyProperty',
   ]
   // Resolve the concatenated Client bundle's function declarations without
   // eval (CSP-safe). `typeof` on an undeclared identifier is safe.
@@ -196,6 +213,30 @@ function ontologyJobImpls(override) {
     },
     composeWorkspaceGraph: function () {
       return typeof composeWorkspaceGraph === 'function' ? composeWorkspaceGraph : null
+    },
+    createOntologyAnalysisSnapshot: function () {
+      return typeof createOntologyAnalysisSnapshot === 'function' ? createOntologyAnalysisSnapshot : null
+    },
+    createOntologyAnalysisIndex: function () {
+      return typeof createOntologyAnalysisIndex === 'function' ? createOntologyAnalysisIndex : null
+    },
+    setOntologyAnalysisIdentity: function () {
+      return typeof setOntologyAnalysisIdentity === 'function' ? setOntologyAnalysisIdentity : null
+    },
+    createOntologyOverview: function () {
+      return typeof createOntologyOverview === 'function' ? createOntologyOverview : null
+    },
+    diagnoseOntologyStructure: function () {
+      return typeof diagnoseOntologyStructure === 'function' ? diagnoseOntologyStructure : null
+    },
+    explainOntologyRestriction: function () {
+      return typeof explainOntologyRestriction === 'function' ? explainOntologyRestriction : null
+    },
+    explainOntologyClassExpression: function () {
+      return typeof explainOntologyClassExpression === 'function' ? explainOntologyClassExpression : null
+    },
+    explainOntologyProperty: function () {
+      return typeof explainOntologyProperty === 'function' ? explainOntologyProperty : null
     },
   }
   for (const name of names) {
@@ -579,6 +620,8 @@ async function ontologyJobComputeMainThread(source, settings) {
       fileName: displayName || undefined,
       maxTriples: limits.maxTriples,
       maxLiteralLength: limits.maxLiteralLength,
+      maxLiteralIdentityLength: limits.maxLiteralIdentityLength,
+      maxLiteralIdentityBytes: limits.maxLiteralIdentityBytes,
       maxDepth: limits.maxDepth,
     })
   } catch (error) {
@@ -1324,7 +1367,9 @@ export function createOntologyRunner(handlers) {
       })
       return null
     }
+    cancelAnalysisRequest('analysis request cancelled by source update')
     workspaceState = result.workspace
+    analysisIndexCache = null
     const summary = sourceSummaryOf(result.source)
     emitWorkspaceEvent({
       type: 'source',
@@ -1355,6 +1400,9 @@ export function createOntologyRunner(handlers) {
         absolutePath: request.absolutePath,
         rdfBase: request.rdfBase,
         maxTriples: admission.maxTriples,
+        maxLiteralLength: ONTOLOGY_JOB_DEFAULT_LIMITS.maxLiteralLength,
+        maxLiteralIdentityLength: ONTOLOGY_JOB_DEFAULT_LIMITS.maxLiteralIdentityLength,
+        maxLiteralIdentityBytes: ONTOLOGY_JOB_DEFAULT_LIMITS.maxLiteralIdentityBytes,
       })
     } catch (error) {
       emitWorkspaceEvent({ type: 'error', generation: id, message: ontologyJobErrorMessage(error) })
@@ -1437,6 +1485,9 @@ export function createOntologyRunner(handlers) {
         absolutePath: typeof request.absolutePath === 'string' ? request.absolutePath : '',
         rdfBase: typeof request.rdfBase === 'string' ? request.rdfBase : '',
         maxTriples: admission.maxTriples,
+        maxLiteralLength: ONTOLOGY_JOB_DEFAULT_LIMITS.maxLiteralLength,
+        maxLiteralIdentityLength: ONTOLOGY_JOB_DEFAULT_LIMITS.maxLiteralIdentityLength,
+        maxLiteralIdentityBytes: ONTOLOGY_JOB_DEFAULT_LIMITS.maxLiteralIdentityBytes,
       }
       workspaceRequest = ontologyJobSendWorkerMessage(handle, workerMessage, {
         id: id,
@@ -1674,7 +1725,9 @@ export function createOntologyRunner(handlers) {
     if (!state || typeof impls.removeSource !== 'function') return
     const result = impls.removeSource(state, sourceId)
     if (!result || !result.removed) return
+    cancelAnalysisRequest('analysis request cancelled by source removal')
     workspaceState = result.workspace
+    analysisIndexCache = null
     const worker = workspaceWorker
     if (worker && worker.worker && typeof worker.worker.postMessage === 'function') {
       try {
@@ -1692,6 +1745,52 @@ export function createOntologyRunner(handlers) {
     })
   }
 
+  let analysisIndexCache = null
+  let analysisRequest = null
+  let analysisSequence = 0
+  function cancelAnalysisRequest(reason) {
+    const pending = analysisRequest
+    analysisRequest = null
+    if (!pending) return
+    if (pending.cancel) pending.cancel()
+    pending.reject(new Error(reason || 'analysis request cancelled'))
+  }
+
+  function analysisIndex(sourceIds) {
+    const state = workspaceState
+    if (!state || typeof impls.createOntologyAnalysisSnapshot !== 'function' ||
+      typeof impls.createOntologyAnalysisIndex !== 'function') return null
+    const selected = Array.isArray(sourceIds) ? sourceIds.filter((id) => typeof id === 'string') : null
+    const key = JSON.stringify([state.revision, selected])
+    if (analysisIndexCache && analysisIndexCache.key === key) return analysisIndexCache.value
+    if (impls.setOntologyAnalysisIdentity && impls.identity) impls.setOntologyAnalysisIdentity(impls.identity)
+    const snapshot = impls.createOntologyAnalysisSnapshot(state, { sourceIds: selected || undefined })
+    const value = { snapshot: snapshot, index: impls.createOntologyAnalysisIndex(snapshot) }
+    analysisIndexCache = { key: key, value: value }
+    return value
+  }
+
+  function analyzeLocally(operation, sourceIds, subjectId, options) {
+    const cached = analysisIndex(sourceIds)
+    if (!cached) throw new Error('ontology analysis is unavailable')
+    if (operation === 'overview' && impls.createOntologyOverview) {
+      return { overview: impls.createOntologyOverview(cached.index, options) }
+    }
+    if (operation === 'diagnostics' && impls.diagnoseOntologyStructure) {
+      return { diagnostics: impls.diagnoseOntologyStructure(cached.index, options) }
+    }
+    if (operation === 'restriction' && impls.explainOntologyRestriction) {
+      return { result: impls.explainOntologyRestriction(cached.index, subjectId) }
+    }
+    if (operation === 'class-expression' && impls.explainOntologyClassExpression) {
+      return { result: impls.explainOntologyClassExpression(cached.index, subjectId, options) }
+    }
+    if (operation === 'property' && impls.explainOntologyProperty) {
+      return { result: impls.explainOntologyProperty(cached.index, subjectId) }
+    }
+    throw new Error('unknown or unavailable analysis operation: ' + operation)
+  }
+
   function workspaceInfo() {
     return { sources: workspaceSummaries(), totals: workspaceTotalsState() }
   }
@@ -1700,6 +1799,82 @@ export function createOntologyRunner(handlers) {
   // text or a reconstructed graph. Source records are immutable transactions.
   function sourceSnapshots() {
     return workspaceState ? workspaceState.sources.slice() : []
+  }
+
+  function analyze(input) {
+    if (disposed) return Promise.reject(new Error('workspace runner is disposed'))
+    cancelAnalysisRequest('analysis request superseded')
+    const request = input && typeof input === 'object' ? input : {}
+    const operation = typeof request.operation === 'string' ? request.operation : ''
+    const sourceIds = Array.isArray(request.sourceIds) ? request.sourceIds : undefined
+    const subjectId = typeof request.subjectId === 'string' ? request.subjectId : ''
+    const options = request.options && typeof request.options === 'object' ? request.options : {}
+    const analysisGeneration = generation
+    const id = 'analysis:' + (++analysisSequence)
+    const analysisRevision = workspaceState ? workspaceState.revision : 0
+    const selectedSnapshotId = workspaceState && typeof impls.createOntologyAnalysisSnapshot === 'function'
+      ? impls.createOntologyAnalysisSnapshot(workspaceState, { sourceIds }).snapshotId
+      : ''
+    const isAnalysisStale = () => disposed || generation !== analysisGeneration ||
+      (workspaceState && workspaceState.revision !== analysisRevision)
+    if (!workspaceState || ontologyJobWorkerEnabled({ workerFactory, workerSource, forceMainThread }) && !fallbackUsed) {
+      if (!workspaceState) return Promise.resolve(analyzeLocally(operation, sourceIds, subjectId, options))
+      try {
+        const handle = ensureWorkspaceWorker()
+        return new Promise((resolve, reject) => {
+          let settled = false
+          const handleMessage = (data) => {
+            if (!data || data.type !== 'analysis') return false
+            if (isAnalysisStale() || data.snapshotId !== selectedSnapshotId ||
+              data.workspaceRevision !== analysisRevision) {
+              settled = true
+              analysisRequest = null
+              reject(new Error('analysis result is stale'))
+              return true
+            }
+            settled = true
+            analysisRequest = null
+            resolve(data.result)
+            return true
+          }
+          const fail = () => {
+            if (settled) return
+            analysisRequest = null
+            if (disposed) { settled = true; reject(new Error('workspace runner is disposed')); return }
+            fallbackUsed = true
+            try {
+              if (isAnalysisStale()) throw new Error('analysis result is stale')
+              settled = true
+              resolve(analyzeLocally(operation, sourceIds, subjectId, options))
+            }
+            catch (error) { settled = true; reject(error) }
+          }
+          const requestToken = {
+            cancel: null,
+            reject: (error) => { if (!settled) { settled = true; reject(error) } },
+          }
+          analysisRequest = requestToken
+          const pending = ontologyJobSendWorkerMessage(handle, {
+            type: 'analyze', id,
+            operation, sourceIds, subjectId, options,
+            workspaceRevision: analysisRevision,
+          }, {
+            id, timeoutMs, isCancelled: () => disposed || settled,
+            onMessage: handleMessage,
+            onFailure: fail,
+          })
+          if (!pending) fail()
+          else {
+            requestToken.cancel = pending.cancel
+            if (settled || analysisRequest !== requestToken) pending.cancel()
+          }
+        })
+      } catch (error) {
+        fallbackUsed = true
+        return Promise.resolve(analyzeLocally(operation, sourceIds, subjectId, options))
+      }
+    }
+    return Promise.resolve(analyzeLocally(operation, sourceIds, subjectId, options))
   }
 
   function importSource(input) {
@@ -1716,7 +1891,9 @@ export function createOntologyRunner(handlers) {
 
   function disposeWorkspace() {
     cancelWorkspaceRequest()
+    cancelAnalysisRequest('analysis request cancelled by workspace disposal')
     workspaceState = null
+    analysisIndexCache = null
   }
 
   function releasedWorkspace() {
@@ -1741,6 +1918,8 @@ export function createOntologyRunner(handlers) {
     compose: compose,
     dropSource: dropSource,
     workspaceInfo: workspaceInfo,
+    analysisIndex: analysisIndex,
+    analyze: analyze,
     sourceSnapshots: sourceSnapshots,
     importSource: importSource,
     dispose: dispose,

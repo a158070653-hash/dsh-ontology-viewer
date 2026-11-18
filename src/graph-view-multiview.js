@@ -217,6 +217,21 @@ export function readableNodeLabel(node) {
     ? (typeof node.label === 'string' && node.label ? node.label
       : (typeof node.id === 'string' ? node.id : ''))
     : ''
+  const scoped = String(source).match(/^(?:_:)?\u0000(?:blank|relative)\u0000/)
+  if (scoped) {
+    let rest = String(source).slice(scoped[0].length)
+    const terms = []
+    while (rest) {
+      const lengthMatch = rest.match(/^(\d+):/)
+      if (!lengthMatch) break
+      const length = Number(lengthMatch[1])
+      rest = rest.slice(lengthMatch[0].length)
+      if (!Number.isSafeInteger(length) || length > rest.length) break
+      terms.push(rest.slice(0, length))
+      rest = rest.slice(length)
+    }
+    if (!rest && terms.length === 2) return terms[1].replace(/[\u0000-\u001f\u007f]/g, '')
+  }
   const parts = String(source).split(/[\u0000-\u001f\u007f]+/).filter(Boolean)
   const meaningful = parts.filter((part) => part !== 'group' && part !== 'statement' && part !== 'entity')
   const chosen = meaningful.length > 0 ? meaningful[meaningful.length - 1] : (parts[0] || '')
@@ -380,11 +395,147 @@ export function createMultiview(React, deps) {
       onClick: props.onToggleSources,
     }, tr('workspace.sources', 'Sources') + (props.sourceCount ? ' ' + props.sourceCount : '')),
     iconButton({}, {
+      key: 'analysis',
+      'aria-expanded': !!props.analysisOpen,
+      'aria-label': tr('analysis.title', 'Analysis'),
+      onClick: props.onToggleAnalysis,
+    }, tr('analysis.title', 'Analysis')),
+    iconButton({}, {
       key: 'export',
       'aria-expanded': !!props.exportOpen,
       'aria-label': tr('export.title', 'Export'),
       onClick: props.onToggleExport,
     }, tr('export.title', 'Export')))
+  }
+
+  function AnalysisPanel(props) {
+    const tr = props.tr
+    const [filter, setFilter] = useState({ category: '', ruleId: '', sourceId: '', severity: '', entityId: '' })
+    const [groupBy, setGroupBy] = useState('category')
+    const panelRef = useRef(null)
+    useEffect(() => {
+      const previous = typeof document !== 'undefined' ? document.activeElement : null
+      if (panelRef.current) panelRef.current.focus()
+      return () => { if (previous && previous.isConnected && previous.focus) previous.focus() }
+    }, [])
+    const diagnostics = Array.isArray(props.diagnostics) ? props.diagnostics : []
+    const overview = props.overview || null
+    const analyzerOmitted = props.diagnosticSummary && Number.isSafeInteger(props.diagnosticSummary.omitted)
+      ? Math.max(0, props.diagnosticSummary.omitted) : 0
+    const explanationResults = Array.isArray(props.explanations) ? props.explanations :
+      (props.explanation && props.explanation.data ? [props.explanation] : [])
+    const explanations = explanationResults.filter((item) => item && item.data)
+      .flatMap((item) => Array.isArray(item.data.explanations) ? item.data.explanations : [item])
+      .filter((item) => item && item.data)
+    const visible = diagnostics.filter((item) =>
+      (!filter.category || item.category === filter.category) &&
+      (!filter.ruleId || item.ruleId === filter.ruleId) &&
+      (!filter.severity || item.severity === filter.severity) &&
+      (!filter.entityId || (item.entityIds || []).includes(filter.entityId)) &&
+      (!filter.sourceId || (item.evidence || []).some((evidence) => evidence.sourceId === filter.sourceId)))
+      .sort((a, b) => String(a[groupBy] || '').localeCompare(String(b[groupBy] || '')) || a.ruleId.localeCompare(b.ruleId))
+    const evidenceView = (evidence) => h('details', { style: { marginTop: 4, overflowWrap: 'anywhere' } },
+      h('summary', null, tr('analysis.evidence', 'Statement evidence')),
+      h('pre', { style: { whiteSpace: 'pre-wrap', fontSize: 11 } }, JSON.stringify(evidence || [], null, 2)))
+    const labelExplanation = (item) => {
+      const text = tr(item.explanationKey, item.explanationKey)
+      return text.replace(/\{(\w+)\}/g, (match, key) => item.explanationValues && item.explanationValues[key] !== undefined ? String(item.explanationValues[key]) : match)
+    }
+    const categories = [...new Set(diagnostics.map((item) => item.category).filter(Boolean))].sort()
+    const rules = [...new Set(diagnostics.map((item) => item.ruleId).filter(Boolean))].sort()
+    const sourceIds = [...new Set(diagnostics.flatMap((item) => (item.evidence || []).map((evidence) => evidence.sourceId)).filter(Boolean))].sort()
+    const selectOptions = (label, value, values, onChange) => h('label', {
+      style: { display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, color: THEME.textSecondary },
+    }, label, h('select', {
+      'aria-label': label,
+      value, onChange: (event) => onChange(event.target.value),
+      style: { maxWidth: 150, border: '1px solid ' + THEME.border, borderRadius: 4,
+        background: THEME.panel, color: THEME.text, font: 'inherit' },
+    }, [h('option', { key: 'all', value: '' }, tr('analysis.filterAll', 'All')),
+      ...values.map((item) => h('option', { key: item, value: item }, item))]))
+    const metricRow = (label, metric, entityId) => h('div', {
+      key: entityId ? label + ':' + entityId : label, style: { display: 'flex', alignItems: 'center', gap: 6, minHeight: 24 },
+    }, h('span', { style: { flex: '1 1 auto' } }, label),
+    h('span', { style: { color: metric && metric.complete ? THEME.text : THEME.warning, overflowWrap: 'anywhere', minWidth: 0 } },
+      metric ? (entityId ? readableNodeLabel({ id: entityId }) : String(metric.value)) + (metric.complete ? '' : ' · ' + tr('analysis.partial', 'partial')) : '—'),
+    entityId ? iconButton({ padding: '1px 5px' }, {
+      'aria-label': tr('analysis.locate', 'Locate entity') + ' ' + readableNodeLabel({ id: entityId }),
+      onClick: () => props.onSelectEntity(entityId),
+    }, tr('analysis.locate', 'Locate')) : null)
+    return h('section', {
+      ref: panelRef, tabIndex: -1,
+      onKeyDown: (event) => { if (event.key === 'Escape') { event.stopPropagation(); props.onClose() } },
+      role: 'region', 'aria-label': tr('analysis.title', 'Analysis'),
+      style: { flex: 'none', maxHeight: '48%', overflow: 'auto', padding: '8px 10px',
+        borderBottom: '1px solid ' + THEME.border, background: THEME.panel, color: THEME.text, fontSize: 12 },
+    },
+      h('div', { style: { display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' } }, [
+        h('strong', null, tr('analysis.title', 'Analysis')),
+        h('span', { style: { color: THEME.textSecondary } }, overview && overview.completeness
+          ? tr('analysis.scope', 'L0 · {count} accepted statements').replace('{count}', String(overview.counts.acceptedRelationships.value))
+          : tr('analysis.notReady', 'Analysis unavailable')),
+        props.scopeCounts ? h('span', { style: { color: THEME.textSecondary } }, tr('analysis.loadedScope', '{files} loaded sources; {occurrences} accepted L0 occurrences')
+          .replace('{files}', String(props.scopeCounts.files)).replace('{occurrences}', String(props.scopeCounts.occurrences))) : null,
+        props.scopeCounts ? h('span', { style: { color: THEME.textSecondary } },
+          tr('analysis.retained', 'L1 retained nodes') + ': ' + props.scopeCounts.retained + ' · ' +
+          tr('analysis.displayed', 'Currently displayed nodes') + ': ' + props.scopeCounts.displayed) : null,
+        h('span', { style: { flex: '1 1 auto' } }),
+        iconButton({ padding: '1px 5px' }, { 'aria-label': tr('analysis.exportMarkdown', 'Export Markdown'), onClick: props.onExportMarkdown }, 'Markdown'),
+        iconButton({ padding: '1px 5px' }, { 'aria-label': tr('analysis.exportJson', 'Export JSON'), onClick: props.onExportJson }, 'JSON'),
+        iconButton({ padding: '1px 5px' }, { 'aria-label': tr('workspace.close', 'Close'), onClick: props.onClose }, '×'),
+      ]),
+      props.error ? h('p', { role: 'status', style: { color: THEME.warning } }, props.error) : null,
+      props.reportMessage ? h('p', { role: 'status', style: { color: THEME.textSecondary } }, props.reportMessage) : null,
+      overview ? h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(100px,1fr))', gap: '2px 12px', marginTop: 6 } }, [
+        metricRow(tr('analysis.classes', 'Classes'), overview.counts.classes),
+        metricRow(tr('analysis.properties', 'Properties'), overview.counts.properties),
+        metricRow(tr('analysis.individuals', 'Individuals'), overview.counts.individuals),
+        metricRow(tr('analysis.relationships', 'Relationships'), overview.counts.acceptedRelationships),
+        metricRow(tr('analysis.literals', 'Literal statements'), overview.counts.literalOccurrences),
+        metricRow(tr('analysis.unknownIdentity', 'Unknown literal identity'), overview.counts.unknownLiteralIdentityOccurrences),
+        h('div', { key: 'hierarchy', style: { gridColumn: '1 / -1', display: 'flex', gap: 10, flexWrap: 'wrap' } }, [
+          ...overview.hierarchy.roots.items.map((id) => metricRow(tr('analysis.rootClass', 'Root class'), { value: id, complete: overview.completeness.status === 'complete' }, id)),
+          ...overview.hierarchy.isolated.items.map((id) => metricRow(tr('analysis.isolatedClass', 'Isolated class'), { value: id, complete: overview.completeness.status === 'complete' }, id)),
+          ...overview.hierarchy.highConnection.items.slice(0, 5).map((item) => metricRow(tr('analysis.connectedClass', 'Connected class') + ' · ' + item.degree, { value: item.entityId, complete: overview.completeness.status === 'complete' }, item.entityId)),
+        ]),
+        h('div', { key: 'distributions', style: { gridColumn: '1 / -1', display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(150px,1fr))', gap: 6 } }, [
+          h('div', { key: 'namespaces' }, h('strong', null, tr('analysis.namespaces', 'Namespaces')),
+            ...overview.namespaces.slice(0, 8).map((item) => h('div', { key: item.namespace, style: { color: THEME.textSecondary, overflowWrap: 'anywhere' } }, item.namespace + ' · ' + item.count))),
+          h('div', { key: 'relations' }, h('strong', null, tr('analysis.relationTypes', 'Relation types')),
+            ...overview.relationTypes.slice(0, 8).map((item) => h('div', { key: item.predicate, style: { color: THEME.textSecondary, overflowWrap: 'anywhere' } }, item.predicate + ' · ' + item.count))),
+        ]),
+      ]) : null,
+      explanations.length ? h('div', { style: { marginTop: 8, padding: 6, background: THEME.panelAlt, borderRadius: 4 } },
+        h('p', { style: { margin: '4px 0', color: THEME.textSecondary } }, tr('analysis.openWorld', 'Class axiom under open-world semantics; loaded individuals are not validated.')),
+        ...explanations.map((result, index) => h('div', { key: result.data.kind + ':' + index, style: { borderTop: index ? '1px solid ' + THEME.border : 'none', paddingTop: 4 } },
+          h('strong', null, labelExplanation(result.data)),
+          result.data.explanationValues ? h('pre', { style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', margin: '4px 0' } }, JSON.stringify(result.data.explanationValues, null, 2)) : null,
+          result.status !== 'complete' ? h('div', { style: { color: THEME.warning } }, tr('analysis.incomplete', 'Cannot reliably determine; analysis incomplete')) : null,
+          evidenceView(result.evidence)))) : null,
+      h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap', margin: '8px 0' } },
+        selectOptions(tr('analysis.category', 'Category'), filter.category, categories, (category) => setFilter((prev) => ({ ...prev, category }))),
+        selectOptions(tr('analysis.rule', 'Rule'), filter.ruleId, rules, (ruleId) => setFilter((prev) => ({ ...prev, ruleId }))),
+        selectOptions(tr('analysis.source', 'Source'), filter.sourceId, sourceIds, (sourceId) => setFilter((prev) => ({ ...prev, sourceId }))),
+        selectOptions(tr('analysis.severity', 'Severity'), filter.severity, [...new Set(diagnostics.map((item) => item.severity))].sort(), (severity) => setFilter((prev) => ({ ...prev, severity }))),
+        selectOptions(tr('analysis.entity', 'Entity'), filter.entityId, [...new Set(diagnostics.flatMap((item) => item.entityIds || []))].sort(), (entityId) => setFilter((prev) => ({ ...prev, entityId }))),
+        selectOptions(tr('analysis.groupBy', 'Group by'), groupBy, ['category', 'ruleId', 'severity', 'status'], setGroupBy),
+        h('span', { style: { color: THEME.textSecondary } }, tr('analysis.findingCount', '{shown} / {total} findings').replace('{shown}', String(Math.min(100, visible.length))).replace('{total}', String(diagnostics.length + analyzerOmitted)))),
+      h('div', { style: { display: 'grid', gap: 4 } }, [
+        ...visible.slice(0, 100).map((item, index) => h('article', {
+          key: item.id || item.ruleId + ':' + index, style: { borderTop: '1px solid ' + THEME.border, padding: '5px 0' },
+        }, [
+          index === 0 || item[groupBy] !== visible[index - 1][groupBy] ? h('h4', { style: { margin: '3px 0' } }, String(item[groupBy] || '')) : null,
+          h('strong', { style: { color: item.severity === 'error' ? THEME.danger : THEME.warning } }, item.ruleId),
+          h('span', null, ' · ' + tr(item.messageKey, item.messageKey) + ' · ' + (item.status || item.category)),
+          h('div', null, (item.entityIds || []).slice(0, 10).map((id) => iconButton({}, {
+            key: id, 'aria-label': tr('analysis.locate', 'Locate entity') + ' ' + readableNodeLabel({ id }),
+            onClick: () => props.onSelectEntity(id),
+          }, tr('analysis.locate', 'Locate') + ' ' + readableNodeLabel({ id })))),
+          evidenceView(item.evidence),
+        ])),
+        visible.length > 100 || analyzerOmitted > 0 ? h('div', { style: { color: THEME.textSecondary } },
+          tr('analysis.omitted', '{count} findings omitted').replace('{count}', String(Math.max(0, visible.length - 100) + analyzerOmitted))) : null,
+      ]))
   }
 
   /* ---------------------------- source panel --------------------------- */
@@ -1133,6 +1284,7 @@ export function createMultiview(React, deps) {
 
   return {
     WorkspaceToolbar: WorkspaceToolbar,
+    AnalysisPanel: AnalysisPanel,
     SourcePanel: SourcePanel,
     WorkspaceFilePicker: WorkspaceFilePicker,
     ExportMenu: ExportMenu,

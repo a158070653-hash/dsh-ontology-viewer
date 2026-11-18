@@ -2,12 +2,12 @@
  * Background compute entry (classic Blob Worker script).
  *
  * This file is NEVER concatenated into the main Client closure. `build/build.mjs`
- * reads it together with `src/rdf-parse.js` and `src/graph-model.js`, strips the
- * ES-module export syntax, wraps the three sources in an IIFE and embeds the
+ * reads it together with the parser, graph, workspace and analysis modules,
+ * strips their export syntax, wraps the sources in an IIFE and embeds the
  * result as the `ONTOLOGY_WORKER_SOURCE` string inside `client.js`. At runtime
  * the plugin creates a classic worker from a Blob URL, so this script must be
- * fully self-contained: `parseOntology`, `buildGraph` and `layoutGraph` are
- * resolved from the worker closure created by the build. No React, no DOM.
+ * fully self-contained: `parseOntology`, `buildGraph`, `layoutGraph` and the
+ * bounded L0 analysis helpers are resolved from the worker closure. No React, no DOM.
  *
  * Protocol (see `src/ontology-job.js` for the client side):
  *
@@ -57,6 +57,8 @@ function ontologyWorkerNormalizeLimits(limits) {
     maxEdges: Math.max(0, Math.floor(ontologyWorkerNumber(input.maxEdges, 6000))),
     maxLiteralsPerNode: Math.max(0, Math.floor(ontologyWorkerNumber(input.maxLiteralsPerNode, 60))),
     maxLiteralLength: Math.max(1, Math.floor(ontologyWorkerNumber(input.maxLiteralLength, 16384))),
+    maxLiteralIdentityLength: Math.max(1, Math.min(65536, Math.floor(ontologyWorkerNumber(input.maxLiteralIdentityLength, 65536)))),
+    maxLiteralIdentityBytes: Math.max(0, Math.min(262144, Math.floor(ontologyWorkerNumber(input.maxLiteralIdentityBytes, 262144)))),
     maxDepth: Math.max(1, Math.floor(ontologyWorkerNumber(input.maxDepth, 256))),
   }
 }
@@ -97,6 +99,7 @@ let ontologyWorkerCache = null
 
 /** Parsed sources known to this worker, keyed by source id. */
 const ontologyWorkerSources = new Map()
+let ontologyWorkerWorkspaceRevision = 0
 
 /** Copy one parse result into the bounded snapshot the workspace keeps. */
 function ontologyWorkerParsedSnapshot(parsed) {
@@ -127,7 +130,12 @@ function ontologyWorkerParseSource(id, message) {
   const revision = Number.isFinite(message.revision) && message.revision > 0
     ? Math.floor(message.revision)
     : 1
-  const limits = ontologyWorkerNormalizeLimits({ maxTriples: message.maxTriples })
+  const limits = ontologyWorkerNormalizeLimits({
+    maxTriples: message.maxTriples,
+    maxLiteralLength: message.maxLiteralLength,
+    maxLiteralIdentityLength: message.maxLiteralIdentityLength,
+    maxLiteralIdentityBytes: message.maxLiteralIdentityBytes,
+  })
   const startedAt = ontologyWorkerNow()
   const parsed = parseOntology(typeof message.text === 'string' ? message.text : '', {
     fileName: typeof message.displayName === 'string' ? message.displayName : undefined,
@@ -141,6 +149,8 @@ function ontologyWorkerParseSource(id, message) {
     rdfBase: typeof message.rdfBase === 'string' && message.rdfBase ? message.rdfBase : undefined,
     maxTriples: limits.maxTriples,
     maxLiteralLength: limits.maxLiteralLength,
+    maxLiteralIdentityLength: limits.maxLiteralIdentityLength,
+    maxLiteralIdentityBytes: limits.maxLiteralIdentityBytes,
     maxDepth: limits.maxDepth,
   }) || {}
   const snapshot = ontologyWorkerParsedSnapshot(parsed)
@@ -157,6 +167,7 @@ function ontologyWorkerParseSource(id, message) {
     navigationAddress: typeof message.navigationAddress === 'string' ? message.navigationAddress : '',
     absolutePath: typeof message.absolutePath === 'string' ? message.absolutePath : '',
   })
+  ontologyWorkerWorkspaceRevision += 1
   self.postMessage({
     type: 'source',
     id: id,
@@ -241,6 +252,8 @@ function ontologyWorkerCompute(id, message) {
     fileName: displayName || undefined,
     maxTriples: limits.maxTriples,
     maxLiteralLength: limits.maxLiteralLength,
+    maxLiteralIdentityLength: limits.maxLiteralIdentityLength,
+    maxLiteralIdentityBytes: limits.maxLiteralIdentityBytes,
     maxDepth: limits.maxDepth,
   }) || {}
   const parsedAt = ontologyWorkerNow()
@@ -294,6 +307,48 @@ function ontologyWorkerRelayout(id, message) {
   ontologyWorkerPostLayout(id, positions, ontologyWorkerNow() - startedAt)
 }
 
+let ontologyWorkerAnalysisCache = null
+function ontologyWorkerAnalyze(id, message) {
+  const selected = Array.isArray(message.sourceIds) ? new Set(message.sourceIds) : null
+  const sources = []
+  for (const source of ontologyWorkerSources.values()) {
+    if (selected && !selected.has(source.sourceId)) continue
+    const parsed = source.parsed || {}
+    const triples = Array.isArray(parsed.triples) ? parsed.triples : []
+    sources.push({
+      sourceId: source.sourceId, revision: source.revision, origin: source.origin,
+      displayName: source.displayName, absolutePath: source.absolutePath,
+      navigationAddress: source.navigationAddress, byteSize: source.byteSize,
+      status: triples.length === 0 ? 'empty' :
+        (parsed.stats && parsed.stats.truncated || parsed.errors && parsed.errors.length ? 'partial' : 'ready'),
+      stale: false, parsed: parsed,
+    })
+  }
+  const revision = Number.isSafeInteger(message.workspaceRevision) ? message.workspaceRevision : ontologyWorkerWorkspaceRevision
+  const key = JSON.stringify([revision, ontologyWorkerWorkspaceRevision, sources.map((source) => [source.sourceId, source.revision])])
+  if (!ontologyWorkerAnalysisCache || ontologyWorkerAnalysisCache.key !== key) {
+    if (typeof setOntologyAnalysisIdentity === 'function') {
+    setOntologyAnalysisIdentity({ entityKeyForTerm: entityKeyForTerm })
+  }
+  const snapshot = createOntologyAnalysisSnapshot({ revision, sources }, { sourceIds: message.sourceIds })
+    ontologyWorkerAnalysisCache = { key, snapshot, index: createOntologyAnalysisIndex(snapshot) }
+  }
+  const snapshot = ontologyWorkerAnalysisCache.snapshot
+  const analysisIndex = ontologyWorkerAnalysisCache.index
+  const operation = message.operation
+  let result
+  if (operation === 'overview') result = { overview: createOntologyOverview(analysisIndex, message.options) }
+  else if (operation === 'diagnostics') result = { diagnostics: diagnoseOntologyStructure(analysisIndex, message.options) }
+  else if (operation === 'restriction') result = { result: explainOntologyRestriction(analysisIndex, message.subjectId) }
+  else if (operation === 'class-expression') result = { result: explainOntologyClassExpression(analysisIndex, message.subjectId, message.options) }
+  else if (operation === 'property') result = { result: explainOntologyProperty(analysisIndex, message.subjectId) }
+  else throw new Error('unknown analysis operation')
+  self.postMessage({
+    type: 'analysis', id, workspaceRevision: revision,
+    snapshotId: snapshot.snapshotId, result,
+  })
+}
+
 /** Worker message entry point. */
 self.onmessage = function ontologyWorkerOnMessage(event) {
   const message = event && event.data ? event.data : null
@@ -316,6 +371,10 @@ self.onmessage = function ontologyWorkerOnMessage(event) {
       ontologyWorkerCompose(id, message)
       return
     }
+    if (message.type === 'analyze') {
+      ontologyWorkerAnalyze(id, message)
+      return
+    }
     if (message.type === 'cache-source') {
       const source = message.source
       if (source && typeof source.sourceId === 'string' && source.parsed && Array.isArray(source.parsed.triples)) {
@@ -325,11 +384,14 @@ self.onmessage = function ontologyWorkerOnMessage(event) {
           absolutePath: source.absolutePath, navigationAddress: source.navigationAddress,
           byteSize: source.byteSize, parsed: ontologyWorkerParsedSnapshot(source.parsed),
         })
+        ontologyWorkerWorkspaceRevision += 1
       }
       return
     }
     if (message.type === 'drop-source') {
-      if (typeof message.sourceId === 'string') ontologyWorkerSources.delete(message.sourceId)
+      if (typeof message.sourceId === 'string' && ontologyWorkerSources.delete(message.sourceId)) {
+        ontologyWorkerWorkspaceRevision += 1
+      }
       return
     }
   } catch (error) {

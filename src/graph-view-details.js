@@ -633,6 +633,7 @@ export function createGraphViewDetails(React) {
                 literal.lang ? h('span', { key: 'lang', className: 'dov-lit-meta' }, ' @' + literal.lang) : null,
                 literal.dt ? h('span', { key: 'dt', className: 'dov-lit-meta' }, ' ^^' + (detailsLocalName(literal.dt) || literal.dt)) : null,
                 literal.truncated ? h('span', { key: 'trunc', className: 'dov-lit-meta' }, ' ' + tr('viewer.literalValueTruncated', '值已截断')) : null,
+                literal.identityReliability === 'unknown' ? h('span', { key: 'identity', className: 'dov-lit-meta' }, ' ' + tr('viewer.literalIdentityUnknown', '身份无法可靠判定')) : null,
               ]
               return h('div', { key: 'lit-' + String(index), className: 'dov-lit-row' },
                 h('div', { className: 'dov-lit-p', title: literal.p || '' }, literal.pLabel || shortenIri(literal.p || '')),

@@ -143,6 +143,8 @@ export function createOntologyWorkspace(React) {
     const [orientation, setOrientation] = useState('down')
     const [predicates, setPredicates] = useState([])
     const [sourcesOpen, setSourcesOpen] = useState(false)
+    const [analysisOpen, setAnalysisOpen] = useState(false)
+    const [analysisState, setAnalysisState] = useState({ overview: null, diagnostics: [], explanation: null })
     const [exportOpen, setExportOpen] = useState(false)
     const [exportRange, setExportRange] = useState('viewport')
     const [exportScale, setExportScale] = useState(1)
@@ -325,6 +327,40 @@ export function createOntologyWorkspace(React) {
       }
       next()
     }, [filesApi, filesTarget, picker, t])
+    const analysisTokenRef = useRef(0)
+    function analysisSourceIds() {
+      return worksetRef.current.length ? worksetRef.current.slice() : undefined
+    }
+    const refreshAnalysis = useCallback(async () => {
+      const runner = runnerRef.current
+      const token = ++analysisTokenRef.current
+      if (!runner || statusRef.current !== 'ready') return
+      const sourceIds = analysisSourceIds()
+      try {
+        const overview = await runner.analyze({ operation: 'overview', sourceIds })
+        if (token !== analysisTokenRef.current) return
+        const diagnostics = await runner.analyze({ operation: 'diagnostics', sourceIds })
+        if (token !== analysisTokenRef.current) return
+        const explanations = []
+        if (selectedId) {
+          for (const operation of ['restriction', 'class-expression', 'property']) {
+            const response = await runner.analyze({ operation, sourceIds, subjectId: selectedId })
+            if (token !== analysisTokenRef.current) return
+            if (response.result && response.result.status !== 'unavailable') explanations.push(response.result)
+          }
+        }
+        const cached = runner.analysisIndex(sourceIds)
+        setAnalysisState({ overview: overview.overview,
+          diagnostics: diagnostics.diagnostics.diagnostics,
+          diagnosticSummary: diagnostics.diagnostics,
+          explanation: explanations[0] || null, explanations,
+          snapshot: cached && cached.snapshot })
+      } catch (error) {
+        if (token === analysisTokenRef.current) setAnalysisState({ overview: null, diagnostics: [], explanation: null,
+          error: error && error.message ? String(error.message) : 'analysis unavailable' })
+      }
+    }, [selectedId])
+
     const selectedNode = useMemo(() => {
       if (!graph || !selectedId) return null
       const nodes = Array.isArray(graph.nodes) ? graph.nodes : []
@@ -342,6 +378,10 @@ export function createOntologyWorkspace(React) {
       if (JSON.stringify(reconciled.explore) !== JSON.stringify(sharedExplore)) setSharedExplore(reconciled.explore)
       if (JSON.stringify(reconciled.filter) !== JSON.stringify(sharedFilter)) setSharedFilter(reconciled.filter)
     }, [graph])
+    useEffect(() => {
+      if (analysisOpen && status === 'ready' && graph) refreshAnalysis()
+      return () => { analysisTokenRef.current += 1 }
+    }, [analysisOpen, status, graph, selectedId, workset, refreshAnalysis])
 
     const projectedGraph = useMemo(() => {
       if (!graph) return graph
@@ -605,6 +645,9 @@ export function createOntologyWorkspace(React) {
       setSelectedId(id)
       setSharedAnchorId(id)
     }, [])
+    const selectAnalysisEntity = useCallback((entityId) => {
+      if (typeof entityId === 'string' && entityId) setWorkspaceSelection(entityId)
+    }, [setWorkspaceSelection])
 
     const setWorkspaceFilter = useCallback((next) => {
       setSharedFilter(normalizeFilterState(next))
@@ -786,6 +829,46 @@ export function createOntologyWorkspace(React) {
       })
     }, [buildScene, exportRange, exportScale, primaryName, t])
 
+    const handleAnalysisExport = useCallback((format) => {
+      const runner = runnerRef.current
+      if (!runner || typeof runner.analyze !== 'function') return
+      Promise.resolve().then(async () => {
+        const sourceIds = analysisSourceIds()
+        const cached = runner.analysisIndex(sourceIds)
+        if (!cached) throw new Error('analysis unavailable')
+        const overview = await runner.analyze({ operation: 'overview', sourceIds })
+        const diagnostics = await runner.analyze({ operation: 'diagnostics', sourceIds })
+        const explanations = []
+        if (selectedId) for (const operation of ['restriction', 'class-expression', 'property']) {
+          const response = await runner.analyze({ operation, subjectId: selectedId, sourceIds })
+          if (response.result && response.result.status !== 'unavailable') explanations.push(response.result)
+        }
+        if (runner.analysisIndex(sourceIds).snapshot.snapshotId !== cached.snapshot.snapshotId) throw new Error('stale analysis')
+        const report = {
+          schemaVersion: 1,
+          generatedAt: new Date().toISOString(),
+          scope: cached && cached.snapshot.scope,
+          completeness: cached && cached.snapshot.completeness,
+          overview: overview && overview.overview,
+          explanations: explanations,
+          diagnostics: diagnostics && diagnostics.diagnostics,
+          sources: cached && cached.snapshot.sources,
+          statements: cached.snapshot.statements,
+        }
+        const isJson = format === 'json'
+        const serialized = serializeOntologyAnalysisReport(report, { format: isJson ? 'json' : 'markdown' })
+        if (!serialized.ok) throw new Error(serialized.reason)
+        const baseName = (primaryName || 'ontology').replace(/[^\w.-]+/g, '_')
+        const result = downloadBlob(new Blob([serialized.text], { type: serialized.mime }), baseName + '-analysis.' + (isJson ? 'json' : 'md'))
+        setExportMessage(result.ok
+          ? { key: 'export.started', fallback: 'Download started. Browsers do not report whether the file was saved.' }
+          : { key: 'export.failed', fallback: 'Download failed: {reason}', values: { reason: String(result.reason) } })
+      }).catch((error) => setExportMessage({
+        key: 'analysis.exportFailed', fallback: 'Analysis report unavailable: {reason}',
+        values: { reason: error && error.message ? String(error.message) : 'analysis' },
+      }))
+    }, [primaryName, selectedId, t])
+
     // --- status screens (kept identical to the single-file contract) --------
     const styleHost = {
       height: '100%', minHeight: 0, display: 'flex', flexDirection: 'column',
@@ -943,11 +1026,32 @@ export function createOntologyWorkspace(React) {
       onViewType: switchView,
       selectedLabel: selectedNode ? (selectedNode.label || selectedNode.local || selectedNode.id) : '',
       sourceCount: sources.length,
+      analysisOpen: analysisOpen,
+      onToggleAnalysis: () => {
+        const next = !analysisOpen
+        setAnalysisOpen(next)
+      },
       sourcesOpen: sourcesOpen,
       onToggleSources: () => setSourcesOpen((previous) => !previous),
       exportOpen: exportOpen,
       onToggleExport: () => setExportOpen((previous) => !previous),
     }),
+    analysisOpen ? h(Multiview.AnalysisPanel, {
+      tr: t,
+      overview: analysisState.overview,
+      scopeCounts: { files: sources.length, occurrences: totals.occurrences,
+        retained: graph.nodes.length, displayed: projectedGraph.nodes.length },
+      error: analysisState.error,
+      reportMessage: exportMessage ? messageText(exportMessage) : '',
+      diagnosticSummary: analysisState.diagnosticSummary,
+      diagnostics: analysisState.diagnostics,
+      explanation: analysisState.explanation,
+      explanations: analysisState.explanations,
+      onClose: () => setAnalysisOpen(false),
+      onSelectEntity: selectAnalysisEntity,
+      onExportMarkdown: () => handleAnalysisExport('markdown'),
+      onExportJson: () => handleAnalysisExport('json'),
+    }) : null,
     sourcesOpen ? h(Multiview.SourcePanel, {
       tr: t,
       sources: sources,

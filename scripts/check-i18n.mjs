@@ -57,6 +57,27 @@ for (const code of [
   'diagnostics-truncated',
 ]) staticKeys.add('diag.' + code)
 
+for (const form of [
+  'someValuesFrom', 'allValuesFrom', 'hasValue', 'cardinality', 'minCardinality',
+  'maxCardinality', 'qualifiedCardinality', 'minQualifiedCardinality', 'maxQualifiedCardinality',
+]) staticKeys.add('analysis.restriction.' + form)
+for (const form of ['intersectionOf', 'unionOf', 'oneOf', 'equivalentClass', 'disjointWith']) {
+  staticKeys.add('analysis.expression.' + form)
+}
+for (const key of [
+  'restriction.incomplete', 'restriction.incompleteCardinality', 'notRestriction',
+  'expression.notFound', 'expression.conflicting', 'expression.incomplete', 'expression.multiple',
+  'property.notFound', 'property.partial', 'property.asserted',
+  'diag.rdfListMultiple', 'diag.rdfListMissing', 'diag.rdfListInvalidRest', 'diag.rdfListCycle',
+  'diag.cycleBudget', 'diag.subclassCycle', 'diag.possiblyUnused', 'diag.emptyLabel',
+  'diag.labelUnknown', 'diag.duplicateUnknown', 'diag.duplicateStatement',
+]) staticKeys.add('analysis.' + key)
+for (const key of ['title', 'filterAll', 'partial', 'scope', 'notReady', 'locate', 'incomplete',
+  'category', 'rule', 'source', 'findingCount', 'omitted', 'classes', 'properties', 'individuals',
+  'relationships', 'literals', 'rootClass', 'isolatedClass', 'connectedClass', 'reportTitle', 'exportFailed']) {
+  staticKeys.add('analysis.' + key)
+}
+
 const zhBlock = main.slice(main.indexOf('const ZH = {'), main.indexOf('const EN = {'))
 const enBlock = main.slice(main.indexOf('const EN = {'), main.indexOf('/**\n * Translate'))
 const keysOf = (block) => new Set([...block.matchAll(/'([a-zA-Z0-9_.-]+)':/g)].map((match) => match[1]))

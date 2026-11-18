@@ -43,6 +43,8 @@ const MODULES = [
   'src/ontology-file-queue.js',
   'src/graph-model.js',
   'src/ontology-workspace.js',
+  'src/ontology-analysis.js',
+  'src/ontology-analysis-report.js',
   'src/ontology-views.js',
   'src/graph-export.js',
   'src/ontology-job.js',
@@ -64,6 +66,7 @@ const WORKER_MODULES = [
   'src/ontology-identity.js',
   'src/graph-model.js',
   'src/ontology-workspace.js',
+  'src/ontology-analysis.js',
   'src/ontology-views.js',
   'src/worker-entry.js',
 ]

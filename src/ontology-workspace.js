@@ -31,6 +31,8 @@ export const WORKSPACE_LIMITS = Object.freeze({
   degradedMaxOccurrences: 60000,
 })
 
+const WORKSPACE_MAX_LITERAL_IDENTITY_BYTES = 4 * 1024 * 1024
+
 const WORKSPACE_STATUS = Object.freeze({
   READY: 'ready',
   PARTIAL: 'partial',
@@ -175,16 +177,45 @@ function workspaceSourceStatus(parsed, text) {
   return WORKSPACE_STATUS.READY
 }
 
-/** Copy only what L0 and the UI need from one parse result. */
+/** Copy and bound L0 parser data at the workspace admission boundary. */
 function workspaceParsedSnapshot(parsed) {
   const input = parsed && typeof parsed === 'object' ? parsed : {}
   const stats = input.stats && typeof input.stats === 'object' ? input.stats : {}
+  const sourceTriples = Array.isArray(input.triples) ? input.triples : []
+  let identityBytes = 0
+  const triples = sourceTriples.map((triple) => {
+    if (!triple || typeof triple !== 'object') return triple
+    const copy = Object.assign({}, triple)
+    const descriptor = triple.literalIdentity && typeof triple.literalIdentity === 'object'
+      ? triple.literalIdentity : null
+    if (triple.oKind === 'literal' && descriptor && descriptor.reliability === 'reliable' &&
+      typeof descriptor.lexical === 'string') {
+      const bytes = descriptor.lexical.length * 2
+      if (descriptor.lexical.length > 65536 || identityBytes + bytes > 256 * 1024) {
+        copy.literalIdentity = {
+          version: 1, reliability: 'unknown',
+          reason: descriptor.lexical.length > 65536
+            ? 'literal-identity-length-limit' : 'literal-identity-budget',
+        }
+      } else {
+        identityBytes += bytes
+        copy.literalIdentity = {
+          version: 1, reliability: 'reliable', lexical: descriptor.lexical,
+        }
+      }
+    } else if (triple.oKind === 'literal' && triple.literalTruncated && !descriptor) {
+      copy.literalIdentity = { version: 1, reliability: 'unknown', reason: 'missing-identity' }
+    } else if (triple.oKind === 'literal' && descriptor) {
+      copy.literalIdentity = { version: 1, reliability: 'unknown', reason: descriptor.reason || 'unknown' }
+    }
+    return copy
+  })
   return {
     format: typeof input.format === 'string' ? input.format : '',
     prefixes: input.prefixes && typeof input.prefixes === 'object' ? input.prefixes : {},
     base: typeof input.base === 'string' ? input.base : '',
     baseSource: typeof input.baseSource === 'string' ? input.baseSource : 'none',
-    triples: Array.isArray(input.triples) ? input.triples : [],
+    triples,
     diagnostics: Array.isArray(input.diagnostics) ? input.diagnostics : [],
     warnings: Array.isArray(input.warnings) ? input.warnings : [],
     errors: Array.isArray(input.errors) ? input.errors : [],
@@ -381,18 +412,29 @@ export function workspaceTotals(workspace) {
   }
 }
 
+/** Length-prefix key parts so arbitrary literal text cannot forge separators. */
+function workspaceKeyPart(value) {
+  const text = value === undefined || value === null ? '' : String(value)
+  return text.length + ':' + text
+}
+
 /** Statement key: every term identity plus the statement graph identity. */
-function workspaceStatementKey(identity, terms, graphKey) {
+function workspaceStatementKey(identity, terms, graphKey, sourceId, ordinal) {
+  const objectKey = terms.oKind === 'literal'
+    ? (terms.literalIdentityReliability === 'reliable'
+      ? (terms.literalIdentityLexical === undefined ? terms.o : terms.literalIdentityLexical)
+      : '\u0000unknown-literal:' + sourceId + ':' + ordinal)
+    : terms.o
   return [
     terms.s,
     terms.p,
     terms.oKind,
-    terms.o,
+    terms.literalIdentityReliability === 'unknown' ? 'unknown:' + objectKey : 'exact:' + objectKey,
+    terms.literalIdentityReliability || '',
     terms.dt || '',
     terms.lang || '',
     graphKey,
-    terms.literalTruncated ? 'truncated' : '',
-  ].join('\u0001')
+  ].map(workspaceKeyPart).join('')
 }
 
 /**
@@ -407,6 +449,24 @@ function workspaceMergeRecords(workspace, selectedIds) {
   const records = new Map()
   const order = []
   let occurrences = 0
+  let literalIdentityBytes = 0
+  {
+    for (const source of workspace.sources) {
+      if (selected && !selected.has(source.sourceId)) continue
+      const triples = source.parsed && Array.isArray(source.parsed.triples) ? source.parsed.triples : []
+      for (const triple of triples) {
+        const descriptor = triple && triple.literalIdentity
+        if (triple && triple.oKind === 'literal' && descriptor && descriptor.reliability === 'reliable' &&
+          typeof descriptor.lexical === 'string') {
+          literalIdentityBytes += descriptor.lexical.length * 2
+          if (literalIdentityBytes > WORKSPACE_MAX_LITERAL_IDENTITY_BYTES) break
+        }
+      }
+      if (literalIdentityBytes > WORKSPACE_MAX_LITERAL_IDENTITY_BYTES) break
+    }
+  }
+  const workspaceIdentityOverflow = literalIdentityBytes > WORKSPACE_MAX_LITERAL_IDENTITY_BYTES
+  literalIdentityBytes = 0
   for (const source of workspace.sources) {
     if (selected && !selected.has(source.sourceId)) continue
     const parsed = source.parsed
@@ -422,6 +482,34 @@ function workspaceMergeRecords(workspace, selectedIds) {
       const graph = triple.graph && typeof triple.graph === 'object'
         ? triple.graph
         : { kind: 'unknown' }
+      const literalIdentity = triple.literalIdentity && typeof triple.literalIdentity === 'object'
+        ? triple.literalIdentity
+        : null
+      const literalIdentityReliability = objectKind !== 'literal'
+        ? 'reliable'
+        : (literalIdentity && literalIdentity.reliability === 'unknown'
+          ? 'unknown'
+          : (workspaceIdentityOverflow && triple.literalTruncated
+            ? 'unknown'
+            : (triple.literalTruncated
+              ? (literalIdentity && literalIdentity.reliability === 'reliable' &&
+                typeof literalIdentity.lexical === 'string' ? 'reliable' : 'unknown')
+              : 'reliable')))
+      let literalIdentityLexical = objectKind === 'literal' && triple.literalTruncated &&
+        literalIdentityReliability === 'reliable' && literalIdentity &&
+        typeof literalIdentity.lexical === 'string'
+        ? literalIdentity.lexical
+        : undefined
+      if (literalIdentityLexical !== undefined) {
+        const identityBytes = literalIdentityLexical.length * 2
+        if (literalIdentityBytes + identityBytes > WORKSPACE_MAX_LITERAL_IDENTITY_BYTES) {
+          literalIdentityLexical = undefined
+        } else {
+          literalIdentityBytes += identityBytes
+        }
+      }
+      const effectiveLiteralIdentityReliability = objectKind === 'literal' && triple.literalTruncated &&
+        literalIdentityLexical === undefined ? 'unknown' : literalIdentityReliability
       const terms = {
         s: identity.entityKeyForTerm(triple.s, source.sourceId),
         p: identity.entityKeyForTerm(triple.p, source.sourceId),
@@ -432,9 +520,16 @@ function workspaceMergeRecords(workspace, selectedIds) {
         dt: typeof triple.dt === 'string' ? triple.dt : undefined,
         lang: typeof triple.lang === 'string' ? triple.lang : undefined,
         literalTruncated: !!triple.literalTruncated,
+        literalOriginalLength: Number.isFinite(triple.literalOriginalLength)
+          ? triple.literalOriginalLength : null,
+        literalIdentityReliability: effectiveLiteralIdentityReliability,
+        literalIdentity: effectiveLiteralIdentityReliability === 'unknown' && literalIdentityReliability === 'reliable'
+          ? { version: 1, reliability: 'unknown', reason: 'workspace-literal-identity-budget' }
+          : literalIdentity,
+        literalIdentityLexical: literalIdentityLexical,
       }
       const graphKey = identity.graphIdentityFor(source.sourceId, graph)
-      const key = workspaceStatementKey(identity, terms, graphKey)
+      const key = workspaceStatementKey(identity, terms, graphKey, source.sourceId, ordinal)
       let record = records.get(key)
       if (record === undefined) {
         record = Object.assign({ key: key, statementId: identity.statementIdFor(source.sourceId, ordinal), terms: terms }, {
@@ -446,6 +541,7 @@ function workspaceMergeRecords(workspace, selectedIds) {
       record.occurrences.push({
         sourceId: source.sourceId,
         revision: source.revision,
+        statementId: identity.statementIdFor(source.sourceId, ordinal),
         graph: graph,
       })
       occurrences += 1
@@ -483,9 +579,15 @@ export function composeWorkspaceGraph(workspace, options) {
         dt: record.terms.dt,
         lang: record.terms.lang,
         literalTruncated: record.terms.literalTruncated,
+        literalOriginalLength: record.terms.literalOriginalLength,
+        literalIdentityReliability: record.terms.literalIdentityReliability,
+        literalIdentity: record.terms.literalIdentityLexical === undefined
+          ? { reliability: record.terms.literalIdentityReliability }
+          : { version: 1, reliability: 'reliable', lexical: record.terms.literalIdentityLexical },
         graph: occurrence.graph,
         sourceId: occurrence.sourceId,
-        statementId: record.statementId,
+        statementId: occurrence.statementId,
+        statementIds: [occurrence.statementId],
       })
     }
   }

@@ -52,6 +52,9 @@ function snapshot(source, ownerId) {
       triples: parsed.triples.map((triple) => ({
         s: triple.s, p: triple.p, o: triple.o, oKind: triple.oKind,
         dt: triple.dt, lang: triple.lang, literalTruncated: triple.literalTruncated,
+        literalOriginalLength: triple.literalOriginalLength,
+        literalIdentity: triple.literalIdentity && typeof triple.literalIdentity === 'object'
+          ? { ...triple.literalIdentity } : triple.literalIdentity,
         graph: triple.graph && typeof triple.graph === 'object'
           ? { ...triple.graph } : triple.graph,
         location: triple.location,

@@ -211,6 +211,9 @@ function normalizeStatements(input, opts) {
       dt: triple.dt,
       lang: triple.lang,
       literalTruncated: triple.literalTruncated,
+      literalOriginalLength: triple.literalOriginalLength,
+      literalIdentity: triple.literalIdentity,
+      literalIdentityReliability: triple.literalIdentityReliability,
       graph: isObject(triple.graph) ? triple.graph : FALLBACK_STATEMENT_GRAPH,
       sourceId: typeof triple.sourceId === 'string' && triple.sourceId ? triple.sourceId : explicit,
       statementId: typeof triple.statementId === 'string' && triple.statementId
@@ -300,7 +303,7 @@ export function buildGraph(parsed, options) {
   function ensureRecord(id) {
     let record = records.get(id)
     if (record === undefined) {
-      record = { id, types: [], literals: [], out: 0, in: 0, label: '', labelRank: 99 }
+      record = { id, types: [], literals: [], literalIndex: new Map(), out: 0, in: 0, label: '', labelRank: 99 }
       records.set(id, record)
     }
     return record
@@ -322,9 +325,19 @@ export function buildGraph(parsed, options) {
       }
       contribution.roles.add(role)
       if (statement.statementId) contribution.statementIds.add(statement.statementId)
+      if (Array.isArray(statement.statementIds)) {
+        for (const statementId of statement.statementIds) {
+          if (typeof statementId === 'string' && statementId) contribution.statementIds.add(statementId)
+        }
+      }
     }
     if (typeof statement.statementId === 'string' && statement.statementId) {
       entry.statementIds.add(statement.statementId)
+    }
+    if (Array.isArray(statement.statementIds)) {
+      for (const statementId of statement.statementIds) {
+        if (typeof statementId === 'string' && statementId) entry.statementIds.add(statementId)
+      }
     }
     entry.roles.add(role)
   }
@@ -369,6 +382,31 @@ export function buildGraph(parsed, options) {
       const record = ensureRecord(subject)
       noteProvenance(subject, triple, 'subject')
       const rank = labelRank(predicate)
+      const literalIdentity = triple.literalIdentity && typeof triple.literalIdentity === 'object'
+        ? triple.literalIdentity : null
+      const reliableLexical = literalIdentity && literalIdentity.reliability === 'reliable' &&
+        typeof literalIdentity.lexical === 'string'
+        ? literalIdentity.lexical
+        : (!triple.literalTruncated && triple.literalIdentityReliability !== 'unknown' ? objectText : null)
+      const literalKey = reliableLexical === null ? null
+        : [predicate, reliableLexical, triple.dt || '', triple.lang || ''].map((part) => {
+            const value = String(part)
+            return value.length + ':' + value
+          }).join('')
+      const existingLiteral = literalKey === null ? null : record.literalIndex.get(literalKey)
+      if (existingLiteral) {
+        if (triple.sourceId && !existingLiteral.sourceIds.includes(triple.sourceId)) existingLiteral.sourceIds.push(triple.sourceId)
+        if (triple.statementId && !existingLiteral.statementIds.includes(triple.statementId)) existingLiteral.statementIds.push(triple.statementId)
+        if (triple.statementId && triple.sourceId) {
+          noteProvenance(subject, triple, 'subject')
+        }
+        if (Array.isArray(triple.statementIds)) {
+          for (const statementId of triple.statementIds) {
+            if (typeof statementId === 'string' && !existingLiteral.statementIds.includes(statementId)) existingLiteral.statementIds.push(statementId)
+          }
+        }
+        continue
+      }
       let value = objectText
       let valueTruncated = false
       if (maxLiteralLength > 0 && value.length > maxLiteralLength) {
@@ -382,14 +420,28 @@ export function buildGraph(parsed, options) {
         order: record.literals.length,
         rank,
         sourceIds: typeof triple.sourceId === 'string' && triple.sourceId ? [triple.sourceId] : [],
-        statementIds: typeof triple.statementId === 'string' && triple.statementId
-          ? [triple.statementId]
-          : [],
+        statementIds: Array.isArray(triple.statementIds)
+          ? triple.statementIds.filter((id) => typeof id === 'string' && id)
+          : (typeof triple.statementId === 'string' && triple.statementId ? [triple.statementId] : []),
+        literalTruncated: !!triple.literalTruncated,
+        literalOriginalLength: Number.isFinite(triple.literalOriginalLength)
+          ? triple.literalOriginalLength
+          : (valueTruncated ? objectText.length : null),
+        literalIdentityReliability: triple.literalIdentity && triple.literalIdentity.reliability === 'unknown'
+          ? 'unknown'
+          : (triple.literalIdentityReliability === 'reliable' || !triple.literalTruncated
+            ? 'reliable'
+            : 'unknown'),
       }
-      if (valueTruncated) literal.truncated = true
+      if (valueTruncated || triple.literalTruncated) literal.truncated = true
+      if (Number.isFinite(triple.literalOriginalLength)) literal.originalLength = triple.literalOriginalLength
+      if (triple.literalTruncated) {
+        literal.identityReliability = literal.literalIdentityReliability
+      }
       if (typeof triple.dt === 'string' && triple.dt) literal.dt = triple.dt
       if (typeof triple.lang === 'string' && triple.lang) literal.lang = triple.lang
       record.literals.push(literal)
+      if (literalKey !== null) record.literalIndex.set(literalKey, literal)
       // rdfs:comment is useful in the detail panel but must not become the
       // node label; only ranks 0..3 are label predicates.
       if (rank <= 3 && rank < record.labelRank) {
@@ -437,6 +489,11 @@ export function buildGraph(parsed, options) {
     if (typeof triple.sourceId === 'string' && triple.sourceId) draft.sourceIds.add(triple.sourceId)
     if (typeof triple.statementId === 'string' && triple.statementId) {
       draft.statementIds.add(triple.statementId)
+    }
+    if (Array.isArray(triple.statementIds)) {
+      for (const statementId of triple.statementIds) {
+        if (typeof statementId === 'string' && statementId) draft.statementIds.add(statementId)
+      }
     }
     noteDraftGraph(draft, triple)
   }
@@ -584,6 +641,9 @@ export function buildGraph(parsed, options) {
       if (literal.dt) item.dt = literal.dt
       if (literal.lang) item.lang = literal.lang
       if (literal.truncated) item.truncated = true
+      if (Number.isFinite(literal.originalLength)) item.originalLength = literal.originalLength
+      if (literal.literalTruncated) item.literalTruncated = true
+      if (literal.identityReliability) item.identityReliability = literal.identityReliability
       return item
     })
 

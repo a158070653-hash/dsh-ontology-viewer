@@ -25,7 +25,11 @@ const graph = {
 
 const node = {
   id: 'urn:s', label: 'Subject', kind: 'individual', iri: 'urn:s',
-  types: [], literals: [],
+  types: [], literals: [{
+    p: 'urn:label', pLabel: 'label', value: 'prefix', truncated: true,
+    originalLength: 9, identityReliability: 'unknown', sourceIds: ['src1'],
+    statementIds: ['literal\u0000src1\u0000label'],
+  }],
   provenance: { sourceIds: ['src1'], statementIds: ['statement\u0000src1\u00002'], roles: ['subject'] },
 }
 
@@ -58,6 +62,16 @@ test('DetailsPanel renders relation provenance with readable statement ids and s
   assert.match(statementLine, /statement\s+·\s+src1\s+·\s+2/)
   const sourceLine = codeTexts.find((text) => text === 'src1')
   assert.ok(sourceLine, 'the accepted source id is listed')
+})
+
+test('DetailsPanel labels truncated literals whose identity is unknown', () => {
+  const view = renderDetails()
+  const tree = view.render()
+  const texts = flattenReactTree(tree)
+    .map((element) => (Array.isArray(element.children) ? element.children : [element.children]))
+    .flat().filter((value) => typeof value === 'string').join(' ')
+  assert.match(texts, /身份无法可靠判定/)
+  assert.match(texts, /值已截断/)
 })
 
 test('DetailsPanel keeps the graph identity and null location text for a node', () => {

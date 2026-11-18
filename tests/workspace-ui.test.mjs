@@ -47,6 +47,125 @@ test('WorkspaceToolbar exposes the three views as a tablist with one selected ta
   assert.equal(exportButton.props['aria-expanded'], false)
 })
 
+test('WorkspaceToolbar exposes the compact analysis panel control', () => {
+  const { WorkspaceToolbar } = components()
+  const calls = []
+  const tree = WorkspaceToolbar({
+    tr, viewType: 'network', onViewType() {},
+    analysisOpen: true, onToggleAnalysis: () => calls.push('analysis'),
+    sourcesOpen: false, onToggleSources() {}, sourceCount: 0,
+    exportOpen: false, onToggleExport() {},
+  })
+  const analysis = byLabel(tree, 'Analysis')
+  assert.ok(analysis)
+  assert.equal(analysis.props['aria-expanded'], true)
+  analysis.props.onClick()
+  assert.deepEqual(calls, ['analysis'])
+})
+
+test('AnalysisPanel shows L0 counts, supports diagnostic filters/navigation and report exports', () => {
+  const harness = createReactHarness()
+  const { AnalysisPanel } = createMultiview(harness.React)
+  const calls = []
+  const props = {
+    tr, scopeCounts: { files: 2, occurrences: 4, retained: 3, displayed: 2 }, overview: {
+      completeness: { status: 'partial' },
+      counts: {
+        classes: { value: 2, complete: false }, properties: { value: 1, complete: false },
+        individuals: { value: 0, complete: false }, acceptedRelationships: { value: 4, complete: false },
+        literalOccurrences: { value: 1, complete: false }, unknownLiteralIdentityOccurrences: { value: 1, complete: false },
+      },
+      hierarchy: { roots: { items: ['urn:root'] }, isolated: { items: [] }, highConnection: { items: [] } },
+      namespaces: [{ namespace: 'urn:', count: 4 }], relationTypes: [{ predicate: 'urn:p', count: 4 }],
+    },
+    diagnostics: [{
+      ruleId: 'list-cycle', category: 'structural', severity: 'error', status: 'complete',
+      messageKey: 'analysis.diag.rdfListCycle', entityIds: ['urn:root'], evidence: [{ sourceId: 'src1' }],
+    }],
+    explanation: { status: 'incomplete', data: { explanationKey: 'analysis.incomplete', explanationValues: {} } },
+    onSelectEntity: (id) => calls.push(['select', id]),
+    onExportMarkdown: () => calls.push(['export', 'md']), onExportJson: () => calls.push(['export', 'json']), onClose() {},
+  }
+  const tree = harness.render(AnalysisPanel, props)
+  const flat = flattenReactTree(tree)
+  const region = flat.find((element) => element.props && element.props.role === 'region' && element.props['aria-label'] === 'Analysis')
+  assert.ok(region)
+  assert.match(JSON.stringify(tree), /urn:/)
+  assert.match(JSON.stringify(tree), /Cannot reliably determine; analysis incomplete/)
+  const select = flat.find((element) => element.type === 'select')
+  assert.ok(select)
+  const filterLabels = flat.filter((element) => element.type === 'select').map((element) => element.props['aria-label'])
+  assert.deepEqual(filterLabels, ['Category', 'Rule', 'Source', 'Severity', 'Entity', 'Group by'])
+  const markdown = byLabel(tree, 'Export Markdown')
+  const json = byLabel(tree, 'Export JSON')
+  assert.ok(markdown)
+  assert.ok(json)
+  markdown.props.onClick()
+  json.props.onClick()
+  const locate = byLabel(tree, 'Locate entity urn:root')
+  assert.ok(locate)
+  locate.props.onClick()
+  assert.deepEqual(calls, [['export', 'md'], ['export', 'json'], ['select', 'urn:root']])
+  let closed = false
+  const closable = harness.render(AnalysisPanel, { ...props, onClose: () => { closed = true } })
+  const closableRegion = flattenReactTree(closable).find((element) => element.props && element.props.role === 'region')
+  assert.ok(closableRegion)
+  closableRegion.props.onKeyDown({ key: 'Escape', stopPropagation() {} })
+  assert.equal(closed, true, 'Escape closes the panel')
+})
+
+test('AnalysisPanel applies severity and entity filters without mutating diagnostic input', () => {
+  const harness = createReactHarness()
+  const { AnalysisPanel } = createMultiview(harness.React)
+  const diagnostics = [
+    { ruleId: 'one', category: 'structural', severity: 'error', status: 'complete', entityIds: ['urn:a'], evidence: [] },
+    { ruleId: 'two', category: 'suggestion', severity: 'warning', status: 'partial', entityIds: ['urn:b'], evidence: [] },
+  ]
+  const tree = harness.render(AnalysisPanel, { tr, diagnostics, onClose() {}, onSelectEntity() {} })
+  const selects = flattenReactTree(tree).filter((element) => element.type === 'select')
+  const severity = selects[3]
+  assert.ok(severity)
+  severity.props.onChange({ target: { value: 'warning' } })
+  const filtered = harness.render(AnalysisPanel, { tr, diagnostics, onClose() {}, onSelectEntity() {} })
+  const visibleRules = flattenReactTree(filtered).filter((element) => element.type === 'strong')
+    .map((element) => element.children && element.children[0]).filter((value) => typeof value === 'string' && ['one', 'two'].includes(value))
+  assert.deepEqual(visibleRules, ['two'])
+  const entity = flattenReactTree(filtered).filter((element) => element.type === 'select')[4]
+  assert.ok(entity)
+  entity.props.onChange({ target: { value: 'urn:b' } })
+  const entityFiltered = harness.render(AnalysisPanel, { tr, diagnostics, onClose() {}, onSelectEntity() {} })
+  const entityVisibleRules = flattenReactTree(entityFiltered).filter((element) => element.type === 'strong')
+    .map((element) => element.children && element.children[0]).filter((value) => typeof value === 'string' && ['one', 'two'].includes(value))
+  assert.deepEqual(entityVisibleRules, ['two'])
+  assert.equal(diagnostics.length, 2)
+})
+
+test('AnalysisPanel reports output caps and download feedback, without exposing scoped keys', () => {
+  const harness = createReactHarness()
+  const { AnalysisPanel } = createMultiview(harness.React)
+  const scopedId = '_:\u0000blank\u00004:src14:_:b0'
+  assert.equal(readableNodeLabel({ id: scopedId }), '_:b0')
+  const selected = []
+  const diagnostics = Array.from({ length: 120 }, (_, index) => ({
+    id: String(index), ruleId: 'rule-' + String(index).padStart(3, '0'),
+    category: 'suggestion', severity: 'warning', status: 'partial', entityIds: [scopedId], evidence: [],
+  }))
+  const tree = harness.render(AnalysisPanel, {
+    tr, diagnostics, diagnosticSummary: { total: 150, omitted: 30 },
+    reportMessage: 'Download started; save not confirmed.', onClose() {}, onSelectEntity: (id) => selected.push(id),
+  })
+  const flat = flattenReactTree(tree)
+  const texts = flat.flatMap((item) => item.children || []).filter((item) => typeof item === 'string')
+  assert.ok(texts.includes('100 / 150 findings'))
+  assert.ok(texts.includes('50 findings omitted'))
+  assert.ok(texts.includes('Download started; save not confirmed.'))
+  assert.equal(flat.filter((item) => item.type === 'article').length, 100)
+  const locate = byLabel(tree, 'Locate entity _:b0')
+  assert.ok(locate)
+  locate.props.onClick()
+  assert.deepEqual(selected, [scopedId])
+})
+
 test('WorkspaceToolbar marks the open panels and the selected entity label', () => {
   const { WorkspaceToolbar } = components()
   const tree = WorkspaceToolbar({

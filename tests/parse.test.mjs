@@ -850,6 +850,47 @@ test('literal limit truncates values and marks the triple', () => {
   assert.equal(defaultLimit.triples[0].literalTruncated, true)
 })
 
+test('literal identity is separate from display truncation and stays within budget', () => {
+  const samePrefix = parseTurtle('@prefix ex: <http://e/> . ex:s ex:p "prefix-A" ; ex:p "prefix-B" .', {
+    maxLiteralLength: 6,
+  })
+  assert.deepEqual(samePrefix.triples.map((triple) => triple.o), ['prefix', 'prefix'])
+  assert.deepEqual(samePrefix.triples.map((triple) => triple.literalIdentity.reliability), ['reliable', 'reliable'])
+  assert.deepEqual(samePrefix.triples.map((triple) => triple.literalIdentity.lexical), ['prefix-A', 'prefix-B'])
+  assert.deepEqual(samePrefix.triples.map((triple) => triple.literalOriginalLength), [8, 8])
+
+  const identical = parseTurtle('@prefix ex: <http://e/> . ex:s ex:p "prefix-A", "prefix-A" .', {
+    maxLiteralLength: 6,
+  })
+  assert.equal(identical.triples[0].literalIdentity.lexical, identical.triples[1].literalIdentity.lexical)
+
+  const atIdentityLimit = parseTurtle('<urn:s> <urn:p> "12345678" .', {
+    maxLiteralLength: 4, maxLiteralIdentityLength: 8,
+  })
+  assert.equal(atIdentityLimit.triples[0].literalIdentity.reliability, 'reliable')
+  assert.equal(atIdentityLimit.triples[0].literalOriginalLength, 8)
+
+  const overIdentityLimit = parseTurtle('<urn:s> <urn:p> "123456789" .', {
+    maxLiteralLength: 4, maxLiteralIdentityLength: 8,
+  })
+  assert.equal(overIdentityLimit.triples[0].literalIdentity.reliability, 'unknown')
+  assert.equal(diagnosticsWithCode(overIdentityLimit, 'literal-identity-unknown').count, 1)
+  assert.equal(overIdentityLimit.triples[0].o, '1234')
+
+  const aggregateBudget = parseTurtle('<urn:s> <urn:p> "12345678", "abcdefgh" .', {
+    maxLiteralLength: 4, maxLiteralIdentityLength: 8, maxLiteralIdentityBytes: 16,
+  })
+  assert.equal(aggregateBudget.triples[0].literalIdentity.reliability, 'reliable')
+  assert.equal(aggregateBudget.triples[1].literalIdentity.reliability, 'unknown')
+  assert.equal(aggregateBudget.triples[1].literalIdentity.reason, 'literal-identity-budget')
+
+  const exactDisplayBoundary = parseTurtle('<urn:s> <urn:p> "1234" .', { maxLiteralLength: 4 })
+  assert.equal(exactDisplayBoundary.triples[0].o, '1234')
+  assert.equal(exactDisplayBoundary.triples[0].literalTruncated, true)
+  assert.equal(exactDisplayBoundary.triples[0].literalOriginalLength, 4)
+  assert.equal(diagnosticsWithCode(exactDisplayBoundary, 'literal-limit'), undefined)
+})
+
 test('diagnostics aggregate by code and respect the caps', () => {
   let rows = ''
   for (let i = 0; i < 20; i++) rows += 'bad line ' + i + '\n'
